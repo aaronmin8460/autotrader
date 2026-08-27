@@ -40,8 +40,8 @@ app = typer.Typer(
 def cli() -> None:
     """Personal automated trading system.
 
-    Phase 2: historical market data and dataset validation only - no
-    strategies, no backtests, no broker connectivity, no live trading.
+    Phase 3: historical market data, dataset validation, and EMA crossover
+    signals only - no backtests, no broker connectivity, no live trading.
     """
 
 
