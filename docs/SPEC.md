@@ -1,6 +1,6 @@
 # autotrader - Project Specification (v0.1)
 
-**Status:** Phase 2 - data validation.
+**Status:** Phase 3 - strategy complete. Next: Phase 4 backtesting.
 **Last updated:** 2026-08-27
 
 This document is the authoritative scope definition for this repository. When
@@ -86,9 +86,9 @@ next begins.
 ```
 Phase 0  Repository Foundation          <- done
 Phase 1  Historical Market Data         <- done
-Phase 2  Data Validation                <- current
-Phase 3  Strategy
-Phase 4  Backtesting
+Phase 2  Data Validation                <- done
+Phase 3  Strategy                       <- done
+Phase 4  Backtesting                    <- next
 Phase 5  Risk Engine
 Phase 6  SQLite Trading State
 Phase 7  Alpaca Paper Trading
@@ -292,7 +292,7 @@ timestamps, OHLC relationships, missing bars, session continuity, anomalous
 prices, quality reports - all Phase 2), indicators, strategies, backtesting,
 risk, SQLite, order models, and every trading endpoint.
 
-### Phase 2 - Data Validation (current)
+### Phase 2 - Data Validation (complete)
 
 Validate a Parquet bar dataset that Phase 1 already wrote, and answer one
 question: is it structurally and internally valid enough for future
@@ -355,6 +355,61 @@ traceback, and the command is non-interactive.
 input unmodified, the CLI honours those exit codes, and `pytest`, `ruff check
 .`, and `ruff format --check .` all pass with every test offline.
 
+### Phase 3 - Strategy (complete)
+
+The EMA 20 / EMA 50 crossover signal generator, `autotrader.strategies.ema_cross`.
+It is a pure domain module: canonical bars in, signals out. There is no CLI
+command, no broker client, and no import of one (section 6A).
+
+**Purpose.** This strategy validates the engineering pipeline. It is a test
+fixture, not an edge, and **no claim of profitability is made or implied.**
+
+**Indicator.** Two EMAs of the **`close`** column, periods **20** and **50**,
+both computed with pandas `ewm(span=period, adjust=False)` - the recursive
+form seeded with the first observation, `ema[i] = ema[i-1] + alpha *
+(close[i] - ema[i-1])` with `alpha = 2 / (period + 1)`. The periods are fixed
+for V0.1 and deliberately not configurable.
+
+**Warm-up.** `min_periods=period`, so `ema_20` is undefined for the first 19
+bars and `ema_50` for the first 49. A crossover also needs the previous bar's
+relation, so the earliest bar that can carry a signal is the 51st.
+
+**Crossover semantics.** Long only, two signal types:
+
+| Signal | Condition |
+| --- | --- |
+| `BUY` | fast EMA was `<=` slow EMA on the previous bar and is strictly `>` on this bar |
+| `EXIT` | fast EMA was `>=` slow EMA on the previous bar and is strictly `<` on this bar |
+
+Any other bar produces nothing. Because the rule reads the previous bar's
+relation, a crossover yields at most one signal and neither signal repeats
+while the relation merely persists. There are no short signals, no stop loss,
+no take profit, and no additional indicators or filters.
+
+**Signal model.** A frozen dataclass of `timestamp`, `symbol`, `type`
+(`BUY`/`EXIT`), and `reason`. `reason` is a stable machine string -
+`EMA20_CROSS_ABOVE_EMA50` or `EMA20_CROSS_BELOW_EMA50` - never a
+natural-language explanation. Signals are returned ascending by timestamp.
+
+**Signal timestamp is not an execution timestamp.** The timestamp is the bar
+whose close made the crossover knowable. The signal carries no price and
+asserts no trade. When and at what price a signal could be acted on is Phase 4
+backtesting's decision, bound by section 6F: a decision at bar *t* uses only
+information available at the close of *t*, and fills occur at *t+1* or later.
+
+**Input contract.** Exactly one symbol, timestamps ascending, and the
+`timestamp`, `symbol`, and `close` columns present. Violations raise
+`StrategyInputError`. The supplied DataFrame is never modified and is never
+sorted in place - silently reordering would mask an upstream data-contract
+violation. Empty input yields no signals. These checks are the minimum needed
+to avoid obscure pandas errors; full data-quality validation is Phase 2 and is
+not duplicated here.
+
+**Explicitly out of scope for Phase 3:** trade simulation, execution prices,
+fills, position sizing, portfolio or P&L calculation, risk management, order
+creation, broker connectivity, multi-symbol grouped processing, configurable
+periods, additional indicators, parameter optimization, a strategy-plugin
+framework, and any strategy CLI command.
 ### Later phases
 
 Each later phase is specified when it is reached. A phase may not begin until
