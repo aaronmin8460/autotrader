@@ -6,20 +6,21 @@ as a local Python CLI process against an Alpaca **paper** account.
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Phase 3 complete - EMA crossover strategy. Next: Phase 4 backtesting
+## Status: Phase 4 complete - deterministic backtesting. Next: Phase 5 risk engine
 
 There is **no trading in this repository, and none is planned within the
 current milestone** - no live trading and no paper trading. No order is ever
 submitted, and no Alpaca trading client is constructed anywhere in the code.
 
-What exists today are three read-only capabilities: downloading historical
-15-minute US-equity bars from Alpaca's IEX feed and storing them locally as
-Parquet, validating a stored dataset against that canonical schema, and the
-EMA 20 / EMA 50 signal generator, an offline domain module that turns those
-bars into BUY/EXIT signals and nothing more. Validation never downloads,
-modifies, or repairs data, and the strategy emits signals only - no execution
-price, no position, and no P&L. Backtesting (Phase 4) and risk logic belong to
-later phases and are not implemented.
+What exists today are four capabilities: downloading historical 15-minute
+US-equity bars from Alpaca's IEX feed and storing them locally as Parquet,
+validating a stored dataset against that canonical schema, the EMA 20 / EMA 50
+signal generator that turns those bars into BUY/EXIT signals, and a
+deterministic backtester that simulates what those signals would have done.
+Validation never downloads, modifies, or repairs data; the strategy emits
+signals only; and the backtester is local arithmetic over a DataFrame - it
+creates no order and contacts no broker. Risk logic (Phase 5) and everything
+after it are not implemented.
 
 ## Scope summary
 
@@ -143,7 +144,7 @@ and `2` when the file cannot be read at all. Nothing is written, and neither
 an invalid dataset nor a missing file produces a traceback.
 
 The `autotrader` console script is installed as an equivalent entry point.
-There are no strategy, backtest, or trading commands.
+There is no trading command.
 
 ## Strategy signals (Phase 3)
 
@@ -171,6 +172,91 @@ requires no credentials or network access. See
 [docs/SPEC.md](docs/SPEC.md) section 8, "Phase 3 - Strategy", for the full
 contract.
 
+## Backtesting (Phase 4)
+
+The backtester connects the pipeline that already exists - stored Parquet bars
+-> Phase 2 validation -> Phase 3 signals -> execution simulation -> portfolio
+accounting - and reports how it would have performed.
+
+**This is engineering validation, not a profitability claim.** It exists to
+prove the pipeline accounts correctly. Its results are not a reason to trade
+anything, and they are not investment advice. Nothing is downloaded, written,
+or ordered: the whole simulation is local arithmetic.
+
+```bash
+python -m autotrader.cli backtest data/raw/SPY_15m_2025-01-01_2025-12-31.parquet
+```
+
+`--initial-cash` overrides the starting balance; it defaults to `100000` and
+must be positive.
+
+```
+AUTO TRADER BACKTEST
+
+Symbol:                SPY
+Strategy:              EMA20 / EMA50
+Rows:                  7318
+
+Initial Cash:          $100,000.00
+Final Cash:            $99,398.68
+Final Equity:          $99,398.68
+
+Total Return:          -0.60%
+Max Drawdown:          -16.53%
+
+Signals:               117
+BUY Executions:        58
+SELL Executions:       58
+Completed Round Trips: 58
+Ending Position:       0 shares
+```
+
+The equivalent Python API is `run_backtest(bars, initial_cash=100_000.0)`,
+returning a `BacktestResult`.
+
+### The rules it simulates
+
+**Next-bar-open execution - no look-ahead.** A crossover on bar *t* is knowable
+only once bar *t* has closed, so the earliest it can be acted on is the open
+of bar *t+1*. A signal is **never** filled on its own bar, neither at that
+bar's open nor at its close, and every execution's timestamp is strictly later
+than its signal's. A signal on the **final** bar is left unexecuted rather
+than filled at an invented price.
+
+**$100,000 initial capital, long only.** One symbol, at most one position, no
+leverage, no borrowing, and no short selling.
+
+**Whole-share, all-cash sizing.** A `BUY` while flat spends all available cash
+on `floor(cash / price)` shares. Cash never goes negative, and fractional
+shares are out of scope. An `EXIT` while long sells the entire position. An
+`EXIT` while flat and a `BUY` while already long are both no-ops - the real
+signal sequence often opens with an `EXIT` while the portfolio is still flat.
+
+**Zero fees and zero slippage.** Fills happen at exactly the next bar's open
+with no commission, no fees, no slippage, and no market impact. This is a
+deliberate simplified baseline for V0.1, not a realistic execution model, and
+results should be read with that in mind.
+
+**Open positions are marked, not liquidated.** A position still open on the
+final bar is *not* force-sold and no closing trade is fabricated. It is marked
+to market at the final bar's close, so
+`final_equity = cash + quantity * final_close`.
+
+**Metrics.** `total_return` is `(final_equity / initial_cash) - 1` and
+`max_drawdown` is the worst peak-to-trough decline of the end-of-bar equity
+curve. Both are stored as decimal fractions - the CLI renders them as
+percentages - and there is no annualization, benchmark, or risk-adjusted
+metric. A *completed round trip* is a `BUY` followed later by a `SELL`; a
+position still open at the end is not one.
+
+Invalid data stops the run: the dataset is validated with Phase 2 first, and
+any finding aborts the backtest with a concise error rather than a silent
+repair. Exit codes are `0` for a completed simulation, `1` when the dataset or
+the starting cash is unusable, and `2` when the file cannot be read.
+
+See [docs/SPEC.md](docs/SPEC.md) section 8, "Phase 4 - Backtesting", for the
+full contract.
+
 ## Development
 
 Run the tests:
@@ -196,9 +282,9 @@ ruff format --check .
 ```
 src/autotrader/data/        Alpaca historical bars -> canonical Parquet (Phase 1),
                             stored-dataset validation (Phase 2)
-src/autotrader/cli/         Typer CLI (version, download, validate)
+src/autotrader/cli/         Typer CLI (version, download, validate, backtest)
 src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals (Phase 3)
-src/autotrader/backtest/    empty stub (Phase 4)
+src/autotrader/backtest/    deterministic next-bar-open backtester (Phase 4)
 src/autotrader/risk/        empty stub (Phase 5)
 tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)

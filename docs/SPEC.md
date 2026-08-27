@@ -1,6 +1,6 @@
 # autotrader - Project Specification (v0.1)
 
-**Status:** Phase 3 - strategy complete. Next: Phase 4 backtesting.
+**Status:** Phase 4 - backtesting complete. Next: Phase 5 risk engine.
 **Last updated:** 2026-08-27
 
 This document is the authoritative scope definition for this repository. When
@@ -88,8 +88,8 @@ Phase 0  Repository Foundation          <- done
 Phase 1  Historical Market Data         <- done
 Phase 2  Data Validation                <- done
 Phase 3  Strategy                       <- done
-Phase 4  Backtesting                    <- next
-Phase 5  Risk Engine
+Phase 4  Backtesting                    <- done
+Phase 5  Risk Engine                    <- next
 Phase 6  SQLite Trading State
 Phase 7  Alpaca Paper Trading
 Phase 8  Reconciliation / Crash Recovery
@@ -410,6 +410,123 @@ fills, position sizing, portfolio or P&L calculation, risk management, order
 creation, broker connectivity, multi-symbol grouped processing, configurable
 periods, additional indicators, parameter optimization, a strategy-plugin
 framework, and any strategy CLI command.
+
+### Phase 4 - Backtesting (complete)
+
+The deterministic long-only backtesting engine, `autotrader.backtest.engine`.
+It connects the phases that already exist - stored Parquet bars -> Phase 2
+validation -> Phase 3 signals -> execution simulation -> portfolio accounting
+-> metrics - and answers one question: does that pipeline hold together and
+account correctly?
+
+Phase 4 is **engineering validation**. It is not a claim that the EMA
+crossover is profitable, and its results must never be used to justify
+enabling any form of trading. The whole simulation is local arithmetic: no
+order is created, no broker is contacted, and no network access occurs.
+
+**Input.** The Phase 1 canonical bar frame in section 8, unchanged. There is
+no second bar schema. Bars are validated with the Phase 2 validator before any
+signal is generated; a dataset with any validation finding aborts the backtest
+with a controlled error. Nothing is repaired - no re-sorting, no column
+patching, no dropped rows - and the supplied DataFrame is never modified.
+Validation rules are not duplicated in the engine.
+
+**Strategy.** The existing Phase 3 public API, `generate_ema_cross_signals`.
+The engine computes no EMA and re-detects no crossover; it consumes Phase 3
+signals and does not alter their semantics. There is exactly one strategy and
+no strategy selection.
+
+**Execution timing (section 6F).** A crossover on bar *t* is knowable only
+once bar *t* has closed, so the earliest it can be acted on is the open of bar
+*t+1*:
+
+```
+signal on bar t  ->  fill at bar t+1 open
+```
+
+A signal is never filled on its own bar - not at that bar's open, not at its
+close - and `execution_timestamp` is always strictly greater than
+`signal_timestamp`. **A signal on the final bar is not executed**: there is no
+following bar, and no future price is invented or substituted. It is reported
+as pending historical information via
+`unexecuted_last_bar_signal_count`.
+
+**Execution price.** Exactly the next bar's `open`. Commission, fees, and
+slippage are all **zero**, and there is no market impact or partial fill. This
+is a deliberate engineering baseline for V0.1, not a realistic execution
+model, and there is deliberately no transaction-cost framework.
+
+**Portfolio.** $100,000.00 initial cash, long only, no leverage, no borrowing,
+no short selling, and at most one position in the single symbol being
+backtested. `initial_cash` must be positive and finite; anything else is a
+controlled error.
+
+**Sizing.** On a `BUY` while flat, all available cash buys the largest
+whole-share quantity possible at the fill price:
+`quantity = floor(cash / price)`. Cash never becomes negative. Fractional
+shares are out of scope. A `BUY` that cannot afford one whole share creates no
+execution.
+
+**Exit.** On an `EXIT` while long, the entire position is sold at the next
+bar's open. There are no partial exits.
+
+**No-op signals.** The real signal sequence may open with an `EXIT` while the
+simulated portfolio is flat. `EXIT` while flat and `BUY` while already long
+are both no-ops - never a short, a double-buy, a pyramid, or a duplicate
+holding - and neither produces an execution.
+
+**End of backtest.** An open position is **not** force-liquidated at the final
+bar and no closing `SELL` record is fabricated. It is marked to market at the
+final bar's `close`:
+`final_equity = cash + position_quantity * final_close`. This mark is not an
+execution.
+
+**Equity curve.** One end-of-bar equity value per bar,
+`equity = cash + position_quantity * bar.close`. When a fill occurs at a bar's
+open, that fill is processed *before* that same bar's close is marked. No
+future bar is consulted.
+
+**Max drawdown.** Peak-to-trough over that equity curve:
+`drawdown_t = equity_t / max(equity_0..equity_t) - 1`, and `max_drawdown` is
+the minimum observed. It is stored as a **decimal fraction** and is never
+positive (`-0.25` is a 25% drawdown); the CLI renders it as a percentage.
+
+**Total return.** `(final_equity / initial_cash) - 1`, a decimal fraction. No
+annualization, no benchmark, no alpha or beta, and no additional metrics.
+
+**Execution model.** A frozen `Execution` of `signal_timestamp`,
+`execution_timestamp`, `symbol`, `side`, `quantity`, `price`, and
+`cash_after`. `side` is `BUY` or `SELL`: an `EXIT` *signal* produces a `SELL`
+*execution*, and the two vocabularies are kept distinct so a signal is never
+mistaken for a trade.
+
+**Completed round trip.** A `BUY` execution followed later by a `SELL`
+execution. An open position at the end is **not** a completed round trip. The
+word "trade" is deliberately avoided for an individual execution.
+
+**Result model.** A frozen `BacktestResult` exposing `symbol`, `bar_count`,
+`initial_cash`, `final_cash`, `final_equity`, `total_return`, `max_drawdown`,
+`ending_position_quantity`, `ending_position_market_value`,
+`completed_round_trips`, `signal_count`, `unexecuted_last_bar_signal_count`,
+`executions`, `equity_curve`, and the derived `buy_execution_count` and
+`sell_execution_count`. The same input always produces the same result.
+
+**Public API.** `run_backtest(bars, initial_cash=100_000.0) -> BacktestResult`.
+
+**CLI.** `backtest <path> [--initial-cash 100000]` prints a concise summary -
+never a per-execution blotter - and exits `0` on a completed simulation, `1`
+when the dataset or the starting cash is unusable, and `2` when the file
+cannot be read. No expected failure produces a traceback.
+
+**Explicitly out of scope for Phase 4:** risk limits of any kind, position or
+exposure caps, daily loss limits, order intents, broker adapters, any trading
+client, paper or live orders, SQLite, execution persistence, reconciliation,
+crash recovery, monitoring, a frontend, deployment, multiple strategies or
+symbols, strategy selection, parameter or walk-forward optimization, Monte
+Carlo, Sharpe, Sortino, alpha, beta, benchmark comparison, fractional shares,
+transaction-cost modelling, an event bus, a plugin or broker-simulator
+framework, and vectorized optimization.
+
 ### Later phases
 
 Each later phase is specified when it is reached. A phase may not begin until
