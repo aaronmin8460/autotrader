@@ -1,11 +1,18 @@
 """Command-line entry point.
 
 Phase 1 exposes application metadata and a historical market-data download,
-Phase 2 read-only validation of an already-downloaded dataset, and Phase 4 a
-local backtest of the EMA crossover strategy over a stored dataset. There is
-no trading command and no broker order path (see docs/SPEC.md).
+Phase 2 read-only validation of an already-downloaded dataset, Phase 4 a local
+backtest of the EMA crossover strategy over a stored dataset, and Phase 7 a
+single, deliberately awkward **paper** order submission.
+
+`paper-submit` is the only command that can reach a broker, and it can only
+ever reach Alpaca **paper**. It requires an environment gate and an explicit
+confirmation token, both closed by default, and there is no `--live` option,
+no `--paper` option, and no way to ask for anything but paper (docs/SPEC.md
+section 8, Phase 7).
 """
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -31,6 +38,14 @@ from autotrader.data.validation import (
     read_bars,
     validate_parquet_file,
 )
+from autotrader.execution import paper as paper_execution
+from autotrader.execution.models import ExecutionError
+from autotrader.execution.paper import (
+    AmbiguousSubmissionError,
+    ExecutionOutcome,
+    PaperExecutionResult,
+)
+from autotrader.state.sqlite import DEFAULT_DATABASE_PATH, StateError, connect, initialize_database
 
 DEFAULT_OUTPUT_DIR = Path("data/raw")
 
@@ -41,6 +56,19 @@ UNREADABLE_INPUT_EXIT_CODE = 2
 #: `backtest` exit codes. 0 is a completed simulation; 2 is a shared
 #: unreadable-input failure.
 BACKTEST_INPUT_EXIT_CODE = 1
+
+#: `paper-submit` exit codes.
+#:
+#: 0  the order was submitted, already existed, or a dry run completed.
+#: 1  a controlled refusal - a closed gate, a wrong confirmation, a risk
+#:    rejection, an untradable account, no price, a broker rejection. Nothing
+#:    reached the broker, or the broker definitively refused it. No action is
+#:    required beyond fixing the cause.
+#: 2  the submission outcome is UNKNOWN. This is **not** an ordinary failure:
+#:    an order may exist at the broker. It has its own code so that a script
+#:    can never confuse it with a clean refusal.
+PAPER_SUBMIT_REFUSED_EXIT_CODE = 1
+PAPER_SUBMIT_UNKNOWN_EXIT_CODE = 2
 
 #: Width of the label column in the backtest report.
 _LABEL_WIDTH = 23
@@ -56,9 +84,14 @@ app = typer.Typer(
 def cli() -> None:
     """Personal automated trading system.
 
-    Phase 4: historical market data, dataset validation, EMA crossover
-    signals, and local backtesting only - no broker connectivity, no order
-    submission, and no live trading.
+    Historical market data, dataset validation, EMA crossover signals, local
+    backtesting, a deterministic risk engine, local SQLite state, and Alpaca
+    **paper** order submission.
+
+    There is no live trading. `paper-submit` talks to Alpaca's paper
+    environment only, behind an environment gate and an explicit confirmation
+    token; no command, flag, or environment variable can direct an order at a
+    real-money account.
     """
 
 
@@ -244,6 +277,157 @@ def backtest(
         raise typer.Exit(code=BACKTEST_INPUT_EXIT_CODE) from None
 
     _echo_backtest_report(result)
+
+
+def _echo_paper_preview(result: PaperExecutionResult, *, dry_run: bool) -> None:
+    """Print the pre-submission preview.
+
+    Deliberately contains no credential, no authorization header, and no
+    account number - only the numbers an operator needs to judge whether the
+    order about to be sent is the one they meant.
+    """
+    decision = result.risk_decision
+    typer.echo("AUTO TRADER - PAPER ORDER")
+    typer.echo("")
+    typer.echo(_field("Environment", "PAPER ONLY"))
+    typer.echo(_field("Market", "OPEN" if result.clock.is_open else "CLOSED"))
+    typer.echo(_field("Symbol", result.symbol))
+    typer.echo(_field("Side", result.side.value))
+    typer.echo(_field("Requested Qty", str(result.requested_quantity)))
+    typer.echo(_field("Reference Price", _money(result.reference_price)))
+    typer.echo("")
+    typer.echo(_field("Account Equity", _money(result.account.equity)))
+    typer.echo(_field("Account Cash", _money(result.account.cash)))
+    typer.echo(_field("Start-of-Day Equity", _money(result.account.start_of_day_equity)))
+    typer.echo(_field("Daily P&L", _money(result.account.daily_pnl)))
+    typer.echo("")
+    typer.echo(_field("Risk Decision", "APPROVED" if decision.approved else "REJECTED"))
+    typer.echo(_field("Risk Reason", decision.reason_code))
+    typer.echo(_field("Approved Qty", str(decision.approved_quantity)))
+    if result.intent is not None:
+        typer.echo(_field("Client Order ID", result.intent.client_order_id))
+    if dry_run:
+        typer.echo("")
+        typer.echo("DRY RUN - no order was submitted and nothing was persisted.")
+
+
+@app.command(name="paper-submit")
+def paper_submit(
+    symbol: str = typer.Option(
+        ...,
+        "--symbol",
+        help=f"Ticker to trade. One of: {', '.join(SUPPORTED_SYMBOLS)}.",
+    ),
+    side: str = typer.Option(..., "--side", help="BUY or SELL. Long only; no shorts."),
+    qty: int = typer.Option(..., "--qty", help="Whole shares to request. Must be > 0."),
+    confirm_paper: str = typer.Option(
+        "",
+        "--confirm-paper",
+        help=(
+            f"Type {paper_execution.CONFIRMATION_TOKEN} exactly to confirm a real paper "
+            "submission. Not required for --dry-run."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Evaluate everything and print the preview, but never submit.",
+    ),
+    database: Annotated[
+        Path,
+        typer.Option("--db", help="Local operational-state database."),
+    ] = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Submit one market order to the Alpaca **PAPER** account.
+
+    This is the only command that reaches a broker, and it can only reach the
+    paper environment. There is no live mode: no flag, option, or environment
+    variable selects one, and the trading client is constructed with
+    `paper=True` hardcoded.
+
+    A real submission needs **both** gates, which are independent and both
+    closed by default:
+
+    \b
+      1. AUTOTRADER_PAPER_TRADING_ENABLED=true in the environment
+      2. --confirm-paper PAPER on the command line
+
+    `--dry-run` needs neither, because it cannot submit: it reads the account,
+    positions, the clock, and the current price, runs the risk engine, prints
+    the preview, and stops without persisting an intent or calling the broker.
+    Running it first is the intended way to check an order.
+
+    The quantity sent to the broker is always the risk engine's approved
+    quantity, which may be smaller than `--qty`. If risk approves nothing, no
+    broker request is created at all.
+
+    Exits 0 when the order was submitted, already existed, or a dry run
+    completed; 1 on a controlled refusal; and 2 when the outcome is UNKNOWN -
+    meaning an order may exist at the broker and must be reconciled before
+    anything else is sent.
+    """
+    if not dry_run:
+        try:
+            paper_execution.require_paper_trading_enabled()
+            paper_execution.require_confirmation(confirm_paper)
+        except ExecutionError as error:
+            typer.secho(str(error), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=PAPER_SUBMIT_REFUSED_EXIT_CODE) from None
+
+    try:
+        initialize_database(database)
+    except StateError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=PAPER_SUBMIT_REFUSED_EXIT_CODE) from None
+
+    with connect(database) as connection:
+        try:
+            result = paper_execution.execute_paper_order(
+                connection,
+                symbol=symbol,
+                side=side,
+                requested_quantity=qty,
+                dry_run=dry_run,
+                now=datetime.now(UTC),
+            )
+        except AmbiguousSubmissionError as error:
+            # Its own exit code: an order may exist at the broker, which is a
+            # different situation from "nothing happened".
+            typer.secho(str(error), fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(code=PAPER_SUBMIT_UNKNOWN_EXIT_CODE) from None
+        except (ExecutionError, StateError) as error:
+            typer.secho(str(error), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=PAPER_SUBMIT_REFUSED_EXIT_CODE) from None
+
+    _echo_paper_preview(result, dry_run=dry_run)
+
+    if result.outcome is ExecutionOutcome.REJECTED_BY_RISK:
+        typer.echo("")
+        typer.secho("REJECTED BY RISK ENGINE", fg=typer.colors.RED)
+        typer.echo(result.message)
+        typer.echo("No order was created and no broker request was made.")
+        raise typer.Exit(code=PAPER_SUBMIT_REFUSED_EXIT_CODE)
+
+    if result.outcome is ExecutionOutcome.DRY_RUN:
+        return
+
+    snapshot = result.broker_order
+    typer.echo("")
+    if result.outcome is ExecutionOutcome.DUPLICATE:
+        typer.secho("ALREADY SUBMITTED", fg=typer.colors.YELLOW)
+        typer.echo("The broker already had an order under this client order ID.")
+    else:
+        typer.secho("SUBMITTED TO PAPER ACCOUNT", fg=typer.colors.GREEN)
+    if snapshot is not None:
+        typer.echo("")
+        typer.echo(_field("Broker Order ID", snapshot.broker_order_id))
+        typer.echo(_field("Client Order ID", snapshot.client_order_id))
+        typer.echo(_field("Submitted Qty", str(snapshot.quantity)))
+        typer.echo(_field("Broker Status", snapshot.status))
+        typer.echo(_field("Filled Qty", str(snapshot.filled_quantity)))
+    typer.echo("")
+    typer.echo("Accepted is not filled. Local positions are not updated from an")
+    typer.echo("accepted order; reconciliation against the broker is a later phase.")
 
 
 def main() -> None:

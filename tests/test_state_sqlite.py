@@ -64,16 +64,16 @@ from autotrader.state.sqlite import (
 T0 = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
 STEP = timedelta(minutes=15)
 
-#: Tables whose semantics belong to a broker this repository does not talk to.
-#: Phase 7/8 will define them; guessing them now would be worse than waiting.
+#: Tables whose semantics belong to a part of the broker relationship this
+#: repository still does not model. Phase 7 earned `order_intents` and
+#: `broker_orders` by actually reading the broker's vocabulary; these remain
+#: Phase 8's, and guessing them now would be worse than waiting.
 FORBIDDEN_BROKER_TABLES = (
-    "broker_orders",
     "fills",
     "executions",
     "broker_accounts",
     "reconciliation_runs",
     "orders",
-    "order_intents",
 )
 
 
@@ -125,9 +125,9 @@ def test_initialize_database_creates_the_file(tmp_path: Path) -> None:
     assert path.is_file()
 
 
-def test_schema_version_is_one(connection: sqlite3.Connection) -> None:
-    assert SCHEMA_VERSION == 1
-    assert get_schema_version(connection) == 1
+def test_schema_version_is_two(connection: sqlite3.Connection) -> None:
+    assert SCHEMA_VERSION == 2
+    assert get_schema_version(connection) == 2
 
 
 def test_initialization_is_idempotent(tmp_path: Path) -> None:
@@ -194,7 +194,8 @@ def test_unsupported_future_schema_version_fails(database_path: Path) -> None:
         assert get_schema_version(connection) == SCHEMA_VERSION + 1
 
 
-def test_older_schema_version_fails_without_migrating(database_path: Path) -> None:
+def test_schema_version_older_than_the_migration_path_fails(database_path: Path) -> None:
+    """v1 migrates (see test_state_migration.py); anything before it does not."""
     with connect(database_path) as connection, transaction(connection):
         connection.execute("UPDATE schema_metadata SET schema_version = 0")
 
@@ -1120,7 +1121,7 @@ def test_hostile_strategy_name_is_stored_verbatim(connection: sqlite3.Connection
 # --------------------------------------------------------------------------
 
 
-def test_no_phase_seven_broker_tables_exist(connection: sqlite3.Connection) -> None:
+def test_no_phase_eight_reconciliation_tables_exist(connection: sqlite3.Connection) -> None:
     present = table_names(connection)
     for forbidden in FORBIDDEN_BROKER_TABLES:
         assert forbidden not in present, forbidden

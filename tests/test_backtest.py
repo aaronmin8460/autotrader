@@ -734,13 +734,35 @@ def test_backtest_imports_no_broker_client() -> None:
     assert not any(name.startswith("alpaca") for name in imported)
 
 
-def test_no_trading_or_order_api_exists_anywhere_in_the_package() -> None:
+def test_the_order_api_exists_only_inside_the_paper_execution_boundary() -> None:
+    """Phase 7 added an order path; this pins it to the one place it may live.
+
+    Before Phase 7 no module could name these at all. That is no longer true,
+    so the guarantee is narrowed rather than dropped: the broker vocabulary
+    must appear **only** under `autotrader/execution/`, plus the CLI command
+    that drives it. If it ever leaks into a strategy, the backtester, the risk
+    engine, or the state layer, that is a violation of docs/SPEC.md section 6A
+    and this fails.
+    """
     forbidden = ("TradingClient", "submit_order", "OrderRequest", "MarketOrderRequest")
     source_root = Path(engine.__file__).resolve().parents[1]
+    allowed = {source_root / "execution", source_root / "cli"}
+
     for path in sorted(source_root.rglob("*.py")):
+        if any(parent in allowed for parent in path.parents):
+            continue
         text = path.read_text()
         for token in forbidden:
-            assert token not in text, f"{token} found in {path}"
+            assert token not in text, f"{token} found outside the execution boundary: {path}"
+
+
+def test_only_the_execution_package_imports_a_broker_trading_client() -> None:
+    """`TradingClient` is constructed in exactly one module."""
+    source_root = Path(engine.__file__).resolve().parents[1]
+    constructing = [
+        path for path in sorted(source_root.rglob("*.py")) if "TradingClient(" in path.read_text()
+    ]
+    assert constructing == [source_root / "execution" / "paper.py"], constructing
 
 
 def test_backtest_needs_no_credentials(monkeypatch: pytest.MonkeyPatch) -> None:

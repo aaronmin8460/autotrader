@@ -1,8 +1,8 @@
 # autotrader - Project Specification (v0.1)
 
-**Status:** Phase 6 complete - the risk engine (Phase 5) and the SQLite
-operational state (Phase 6) are both merged into `main`. Next: Phase 7 Alpaca
-paper execution.
+**Status:** Phase 7 complete - Alpaca **paper** order execution is merged into
+`main`. The system can now place an order, and only ever into Alpaca's paper
+environment. Next: Phase 8 reconciliation / crash recovery.
 **Last updated:** 2026-08-27
 
 This document is the authoritative scope definition for this repository. When
@@ -93,8 +93,8 @@ Phase 3  Strategy                       <- done
 Phase 4  Backtesting                    <- done
 Phase 5  Risk Engine                    <- done
 Phase 6  SQLite Operational State       <- done
-Phase 7  Alpaca Paper Trading           <- next
-Phase 8  Reconciliation / Crash Recovery
+Phase 7  Alpaca Paper Trading           <- done
+Phase 8  Reconciliation / Crash Recovery  <- next
 Phase 9  Monitoring
 Phase 10 Deployment
 ```
@@ -112,11 +112,11 @@ Phase 10 Deployment
   - Market data is **never committed**. The directories are tracked via
     `.gitkeep`; their contents are ignored.
 - **Operational trading state:** a local SQLite database, introduced in
-  Phase 6. Phase 6 stores strategy runs, signals, risk events, system events,
-  and local position snapshots. Broker orders, fills, and reconciliation
-  records are **not** stored yet - they describe an external system this
-  repository does not talk to, and their tables belong to Phase 7/8. Database
-  files are ignored by git.
+  Phase 6 and extended to schema **v2** in Phase 7. It stores strategy runs,
+  signals, risk events, system events, local position snapshots, order
+  intents, and broker-order snapshots. Fills, executions, and reconciliation
+  records are **not** stored yet - they belong to Phase 8. Database files are
+  ignored by git.
 - **Secrets:** environment variables loaded from a local `.env`, which is
   ignored by git. `.env.example` documents the variable names only and
   contains no values.
@@ -730,12 +730,13 @@ Nested use joins the outer transaction and leaves the commit to it, which lets
 several `record_*` calls be grouped into one atomic unit.
 
 **Schema versioning.** A `schema_metadata` table holds a single
-`schema_version` row. The current version is **1**. `initialize_database(path)`
-is idempotent: repeated calls create nothing twice and change nothing. A
-database written by a **newer** version is refused with
-`UnsupportedSchemaVersionError` and left untouched - never downgraded or
-overwritten. An older version is refused too; there is deliberately no
-migration framework.
+`schema_version` row. Phase 6 shipped version **1**; Phase 7 extended it to
+version **2** by one explicit additive migration, and the section below
+describes the schema as Phase 6 defined it. `initialize_database(path)` is
+idempotent: repeated calls create nothing twice and change nothing. A database
+written by a **newer** version is refused with `UnsupportedSchemaVersionError`
+and left untouched - never downgraded or overwritten. There is still no
+migration *framework*.
 
 **Damaged databases are not repaired.** If the schema metadata and the tables
 disagree - a missing table, a version marker without tables, tables without a
@@ -759,7 +760,8 @@ a local database identifier and must never be presented as a broker id.
 parameter. No SQL is ever built by string interpolation, and a test asserts
 that at the source level.
 
-**Tables.** Exactly six, and no others.
+**Tables.** Exactly six as of Phase 6; Phase 7 added `order_intents` and
+`broker_orders`.
 
 | Table | Purpose | Invariants |
 | --- | --- | --- |
@@ -779,11 +781,13 @@ Persistence is not orchestration.
 **Duplicate signal protection.** The same logical signal - same run, timestamp,
 symbol, type, and reason - cannot be stored twice; a repeat raises
 `DuplicateSignalError` rather than silently creating a second copy. This is a
-storage invariant only. The stable client-side order idempotency key required
-before any live trading (section 6E) is Phase 7's problem and is not attempted
-here.
+storage invariant only, and is unrelated to order idempotency: the stable
+client-side order key required by section 6E is `order_intents.client_order_id`,
+added in Phase 7.
 
-**Position invariants.** The system is long only (section 3), so `quantity`
+**Position invariants.** (Phase 7 note: this table is now written from
+positions *observed* at the broker, but still never from an order that was
+merely accepted.) The system is long only (section 3), so `quantity`
 must be a non-negative whole number. This is enforced twice - in Python and as
 a SQLite `CHECK` constraint - so a write that bypassed the module still cannot
 store a short position. `average_price` is NULL, the natural value for a flat
@@ -805,10 +809,12 @@ operational event occurred, and what local position snapshot was last stored.
 It does **not** yet support "what broker order resulted", because no broker
 order exists.
 
-**No tables are created for:** `broker_orders`, `fills`, `executions`,
+**No tables were created for:** `broker_orders`, `fills`, `executions`,
 `broker_accounts`, or `reconciliation_runs`. Their semantics are defined by an
-external system this repository does not talk to yet. Adding them later,
-correctly, is better than guessing now.
+external system this repository did not talk to yet. Adding them later,
+correctly, is better than guessing now - which is what happened:
+`order_intents` and `broker_orders` arrived in Phase 7 once the broker's actual
+vocabulary had been read, and the rest remain Phase 8's.
 
 **No CLI.** Phase 6 adds no `db-init`, `db-shell`, or migration command.
 Initialization will be driven by application startup in a later phase.
@@ -825,7 +831,212 @@ initialization is idempotent and refuses an unsupported version; every test is
 offline and writes only to a temporary directory; and `pytest`, `ruff check .`,
 and `ruff format --check .` all pass.
 
+### Phase 7 - Alpaca Paper Execution (complete)
+
+The first phase permitted to submit a broker order, and permitted to submit it
+**only** to Alpaca paper trading. `autotrader.execution` is the single boundary
+that speaks to a broker: it is the only place in the repository that constructs
+a trading client or calls `submit_order`, and a test asserts that the broker
+vocabulary appears nowhere outside it.
+
+**Live trading remains impossible, structurally.** This is the whole point of
+the phase's design, and it is enforced rather than documented:
+
+- `create_paper_trading_client()` builds `TradingClient(api_key, secret_key,
+  paper=True)` with `paper=True` written literally. It takes **no parameters**.
+- No public function in the package accepts a `paper` or `live` argument.
+- There is no `--live` flag, no `--paper` option, no `ALPACA_LIVE`, no
+  `LIVE_TRADING`, and no `BROKER_MODE`. Nothing selects an environment.
+- Tests assert that `paper=False` and `TRADING_LIVE` appear nowhere in the
+  executable source, that the client factory's signature is empty, and that no
+  live CLI option exists.
+
+Live trading is therefore not "off by default" - it cannot be expressed.
+Adding it is a scope change requiring an edit to this document (section 6C).
+
+**Two independent submission gates**, both closed by default, neither able to
+satisfy the other:
+
+1. **Environment:** `AUTOTRADER_PAPER_TRADING_ENABLED` must equal exactly
+   `true` after stripping surrounding whitespace. Missing, empty, `false`,
+   `TRUE`, `1`, `yes`, and any other value all leave submission disabled. One
+   canonical spelling means a typo always fails closed.
+2. **Explicit confirmation:** `--confirm-paper PAPER`, compared exactly.
+
+`--dry-run` requires neither, because it cannot submit. It performs the
+read-only work - account, positions, clock, current price, risk evaluation -
+prints the preview, and stops without persisting an intent or calling the
+broker. The confirmation token is deliberately *not* required for it, so
+typing `PAPER` never becomes a reflex.
+
+**Supported scope.** US equities; the five V0.1 symbols; BUY and SELL; positive
+whole shares; MARKET orders; DAY time in force; extended hours explicitly
+false. No fractional or notional orders, no limit/stop/stop-limit/trailing-stop
+orders, no bracket or OCO, no options, no crypto, and no shorts. None of these
+are generically supported "but disabled" - they are absent.
+
+**Credentials** are `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`. They are never
+printed, logged, persisted, written to SQLite, embedded in a `client_order_id`,
+or included in an exception message; errors name the *variables* only. Missing
+credentials fail clearly before any broker call.
+
+**The pipeline**, in a mandatory order:
+
+```
+current paper account + positions + current IEX reference price
+        -> RiskContext
+        -> evaluate_risk
+        -> RiskDecision              persisted to risk_events
+        -> OrderIntent               persisted AND COMMITTED
+        -> broker duplicate preflight
+        -> Alpaca PAPER market order
+        -> broker snapshot           persisted to broker_orders
+```
+
+**The risk engine is never bypassed.** Every submission is sized by Phase 5,
+and the quantity sent to the broker is `RiskDecision.approved_quantity` - never
+the caller's requested quantity. A request for 100 that risk clamps to 3 sends
+exactly 3. A rejected decision means no broker request is constructed at all.
+The risk decision is persisted explicitly by the caller; `evaluate_risk` was
+**not** modified to persist itself and remains a pure calculator.
+
+**Risk context mapping.** Built from current paper broker state:
+
+| `RiskContext` field | Source |
+| --- | --- |
+| `equity` | `TradeAccount.equity` |
+| `cash` | `TradeAccount.cash` |
+| `start_of_day_equity` | `TradeAccount.last_equity` (prior trading day's close) |
+| `daily_pnl` | `equity - last_equity`, derived rather than read separately |
+| `total_exposure` | sum of positive **long** position market values |
+| `symbol_exposure` | that symbol's long market value, else 0 |
+| `current_position_quantity` | that symbol's long share count, else 0 |
+| `trading_enabled` | caller-supplied kill switch (a parameter, not an env var) |
+
+`total_exposure` is summed from the positions themselves rather than read from
+`long_market_value`, so the total and the per-symbol figure it must contain
+cannot disagree. A missing or non-numeric account field is reported, never
+guessed. `trading_enabled` is deliberately not environment-driven: the paper
+gate is this phase's operational off switch, and a second env-driven switch
+would make it ambiguous which one stopped a trade.
+
+**SELL follows the same path.** Phase 5's contract is preserved exactly: a
+risk-reducing exit is still permitted when `trading_enabled` is false or the
+daily-loss halt is active, and is clamped to the position so it can flatten but
+never open a short. A SELL never exceeds the approved quantity.
+
+**Reference price.** The current latest IEX trade, via the existing Alpaca
+market-data client. A stored Parquet bar is never used to size a live order,
+and no CLI-supplied price can bypass the risk engine. A price that cannot be
+obtained, or that is not finite and positive, fails closed - no order.
+
+**Account safety.** The account must be tradable - an accepted status and none
+of `trading_blocked`, `account_blocked`, or `trade_suspended_by_user` - checked
+before any submission, for BUY *and* SELL. A short position in the account is
+refused outright rather than coerced into a long.
+
+**Market clock.** Read and reported, never used to gate a submission: Alpaca
+queues a DAY market order placed while closed. No fill expectation is inferred
+from it.
+
+**`client_order_id`.** `autotrader-<uuid4>`, generated **once** when the intent
+is created, committed before the broker call, and never regenerated. It is
+non-empty, bounded well under Alpaca's 128-character limit, unique locally by a
+UNIQUE constraint, and carries no secret and no account information.
+
+**Why the intent is persisted first.** A crash between the request and its
+response must still leave a durable anchor. Submitting first and recording
+afterwards would produce a real broker order with no local trace - exactly the
+orphan that reconciliation exists to resolve. A regression test proves the row
+is committed and visible to an independent connection at the moment
+`submit_order` is entered.
+
+**Duplicate preflight.** Before submitting, the broker is asked for an order
+under this `client_order_id`. If one exists, it is recorded and returned and
+**nothing is submitted**. A clear "not found" (`404`) proceeds. Any other
+failure - a `5xx`, a timeout, an unreadable status - **fails closed**. "Could
+not check" is never treated as "there is no duplicate".
+
+**Submission outcomes.** `submit_order` is called at most once, ever:
+
+| Outcome | Local state |
+| --- | --- |
+| Broker returned an order | `SUBMITTED`, snapshot persisted |
+| Broker definitively refused (a 4xx other than 408/429) | `REJECTED`, no order exists |
+| Timeout, reset, 5xx, 408, 429, or unreadable status | `UNKNOWN` |
+
+**An ambiguous outcome is never retried.** There is no automatic resubmission,
+no exponential backoff, and no new `client_order_id`. The intent is marked
+`UNKNOWN`, a system event records the ambiguity, and the attempt stops. Phase 8
+resolves it by asking the broker about that exact key. The SDK's own internal
+retry of `429`/`504` responses is disabled on the trading client, because a
+silently resubmitted `POST /orders` would defeat this rule.
+
+**Accepted is not filled.** A stored broker snapshot proves acceptance only.
+The local `positions` table is written **only** from a position actually
+observed at the broker, never inferred from an accepted order, and a successful
+submission never increments it.
+
+**Order status is opaque.** The broker's returned status is stored as
+normalized text. Phase 7 deliberately defines no local order state machine over
+it; formalizing transitions is Phase 8's job.
+
+**Schema v2.** The current schema version is **2**. A new database is created
+directly at v2; an existing v1 database is upgraded by one small explicit
+migration. There is still no migration framework. The migration is additive -
+it creates two tables and re-stamps the version, dropping, recreating, and
+rewriting nothing - runs in a single transaction so a failure rolls back to v1
+intact, and is idempotent through normal initialization. A database written by
+a newer version is still refused; one older than v1 has no path and is refused
+too. A test asserts a migrated v2 database is schema-identical to a fresh one.
+
+| Table | Purpose | Invariants |
+| --- | --- | --- |
+| `order_intents` | Durable pre-submission intent | `client_order_id` UNIQUE and non-empty; `side` is `BUY` or `SELL`; `requested_quantity > 0`; `0 < approved_quantity <= requested_quantity`; `reference_price > 0` and finite; `status` in `CREATED`, `SUBMITTING`, `SUBMITTED`, `UNKNOWN`, `REJECTED`. No broker order id. |
+| `broker_orders` | Latest broker snapshot | `order_intent_id` -> `order_intents.id`, UNIQUE; `broker_order_id` UNIQUE; `client_order_id` UNIQUE; `quantity > 0`; `filled_quantity >= 0`; `status` opaque non-empty text |
+
+One broker order per intent, by construction. **No `fills`, `executions`,
+`broker_accounts`, or `reconciliation_runs` table exists** - Phase 8 owns them.
+
+**CLI.** One command, `paper-submit`, with `--symbol`, `--side`, `--qty`,
+`--confirm-paper`, `--dry-run`, and `--db`. There is no `trade` command and no
+`live-submit` command. It prints a non-sensitive preview - environment, market
+open/closed, symbol, side, requested quantity, reference price, account equity
+and cash, risk decision, approved quantity, `client_order_id` - and never a
+credential or an authorization header. Expected operational failures are
+reported concisely without a traceback. Exit codes: `0` submitted, already
+existing, or dry run; `1` a controlled refusal; **`2` an `UNKNOWN` outcome**,
+given its own code so a script can never mistake it for a clean refusal.
+
+**Testing.** The automated suite is entirely offline: the Alpaca boundary is
+mocked, the fakes return real alpaca-py models so normalization is exercised
+against real response shapes, no real credential is read, and sockets are
+asserted shut. Source-level tests scan *executable* code with docstrings and
+comments stripped, so prose describing a forbidden construct cannot mask its
+presence or absence.
+
+**Explicitly out of scope for Phase 7:** live trading in any form; startup or
+crash-recovery reconciliation; open-order synchronization; fill-history
+reconciliation; position repair; automatic `UNKNOWN` resolution; retry or
+backoff on submission; `TradingStream`, websockets, or any streaming; order
+replacement or cancellation as part of the execution path; multi-broker
+abstraction; fractional, notional, limit, stop, bracket, or OCO orders;
+options; crypto; shorting; a monitoring surface; a frontend; and deployment.
+
+**Done when:** the gates, ordering, failure semantics, and schema above hold;
+`submit_order` is never called more than once per intent and never after an
+ambiguous outcome; the risk-approved quantity is the only quantity sent; the
+intent is committed before submission; the migration preserves Phase 6 data;
+every automated test is offline; and `pytest`, `ruff check .`, and
+`ruff format --check .` all pass.
+
 ### Later phases
 
 Each later phase is specified when it is reached. A phase may not begin until
 the previous phase's acceptance criteria are met and committed.
+
+**Phase 8 - Reconciliation / Crash Recovery** is next. It owns: resolving
+`UNKNOWN` intents against the broker by `client_order_id`, startup
+broker-vs-local reconciliation, open-order synchronization, fill history,
+position repair, and the local order state machine. Phase 7 deliberately built
+only the durable anchors it will need.
