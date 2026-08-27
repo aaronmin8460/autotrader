@@ -1,10 +1,12 @@
 """Command-line entry point.
 
-Phase 1 exposes application metadata and a historical market-data download.
-There is no trading command and no broker order path (see docs/SPEC.md).
+Phase 1 exposes application metadata and a historical market-data download;
+Phase 2 adds read-only validation of an already-downloaded dataset. There is
+no trading command and no broker order path (see docs/SPEC.md).
 """
 
 from pathlib import Path
+from typing import Annotated
 
 import typer
 
@@ -15,8 +17,17 @@ from autotrader.data.historical import (
     HistoricalDataError,
     download_bars,
 )
+from autotrader.data.validation import (
+    ValidationInputError,
+    ValidationResult,
+    validate_parquet_file,
+)
 
 DEFAULT_OUTPUT_DIR = Path("data/raw")
+
+#: `validate` exit codes. 0 is a valid dataset.
+INVALID_DATASET_EXIT_CODE = 1
+UNREADABLE_INPUT_EXIT_CODE = 2
 
 app = typer.Typer(
     name="autotrader",
@@ -29,8 +40,8 @@ app = typer.Typer(
 def cli() -> None:
     """Personal automated trading system.
 
-    Phase 1: historical market data only - no strategies, no backtests,
-    no broker connectivity, no live trading.
+    Phase 2: historical market data and dataset validation only - no
+    strategies, no backtests, no broker connectivity, no live trading.
     """
 
 
@@ -90,6 +101,48 @@ def download(
     typer.echo(f"Feed:      {result.feed.upper()}")
     typer.echo(f"Saved:     {result.parquet_path}")
     typer.echo(f"Metadata:  {result.metadata_path}")
+
+
+def _echo_report(path: Path, result: ValidationResult) -> None:
+    """Print the shared VALID/INVALID report body."""
+    typer.echo("")
+    typer.echo(f"File:   {path}")
+    typer.echo(f"Rows:   {result.row_count}")
+    if result.symbol is not None:
+        typer.echo(f"Symbol: {result.symbol}")
+    typer.echo(f"Errors: {result.error_count}")
+
+
+@app.command()
+def validate(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Path to a Parquet bar dataset written by `download`."),
+    ],
+) -> None:
+    """Validate a stored Parquet bar dataset against the canonical schema.
+
+    Reads the file only. Nothing is downloaded, modified, or repaired. Exits 0
+    when the dataset is valid, 1 when it has validation errors, and 2 when the
+    file cannot be read at all.
+    """
+    try:
+        result = validate_parquet_file(path)
+    except ValidationInputError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=UNREADABLE_INPUT_EXIT_CODE) from None
+
+    if result.valid:
+        typer.secho("VALID", fg=typer.colors.GREEN)
+        _echo_report(path, result)
+        return
+
+    typer.secho("INVALID", fg=typer.colors.RED)
+    _echo_report(path, result)
+    typer.echo("")
+    for issue in result.errors:
+        typer.echo(f"- {issue.code}: {issue.message}")
+    raise typer.Exit(code=INVALID_DATASET_EXIT_CODE)
 
 
 def main() -> None:

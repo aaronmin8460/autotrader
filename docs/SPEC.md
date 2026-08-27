@@ -1,6 +1,6 @@
 # autotrader - Project Specification (v0.1)
 
-**Status:** Phase 1 - historical market data.
+**Status:** Phase 2 - data validation.
 **Last updated:** 2026-08-27
 
 This document is the authoritative scope definition for this repository. When
@@ -85,8 +85,8 @@ next begins.
 
 ```
 Phase 0  Repository Foundation          <- done
-Phase 1  Historical Market Data         <- current
-Phase 2  Data Validation
+Phase 1  Historical Market Data         <- done
+Phase 2  Data Validation                <- current
 Phase 3  Strategy
 Phase 4  Backtesting
 Phase 5  Risk Engine
@@ -104,7 +104,9 @@ Phase 10 Deployment
 - **Historical market data:** Parquet files under `data/`.
   - `data/raw/` - as fetched from the provider, normalized only to the
     canonical schema in section 8 (Phase 1).
-  - `data/processed/` - validated bars used by backtests (Phase 2).
+  - `data/processed/` - validated bars used by backtests. Phase 2 validates
+    `data/raw/` in place and writes nothing; populating this directory belongs
+    to a later phase.
   - Market data is **never committed**. The directories are tracked via
     `.gitkeep`; their contents are ignored.
 - **Operational trading state** (orders, positions, fills, run journal):
@@ -217,7 +219,7 @@ Docker.
 works, `pytest` passes, `ruff check .` passes, and no secrets or market data
 are committed.
 
-### Phase 1 - Historical Market Data (current)
+### Phase 1 - Historical Market Data (complete)
 
 Fetch 15-minute historical bars for the V0.1 universe from Alpaca's data API
 and persist them to Parquet under `data/raw/`. Read-only market data access;
@@ -289,6 +291,69 @@ Parquet or metadata file is written.
 timestamps, OHLC relationships, missing bars, session continuity, anomalous
 prices, quality reports - all Phase 2), indicators, strategies, backtesting,
 risk, SQLite, order models, and every trading endpoint.
+
+### Phase 2 - Data Validation (current)
+
+Validate a Parquet bar dataset that Phase 1 already wrote, and answer one
+question: is it structurally and internally valid enough for future
+strategy and backtesting code to consume?
+
+Phase 2 is read-only. It does not download, modify, repair, or rewrite market
+data, and it produces no signals, backtests, or broker calls. Validation must
+not mutate the DataFrame it is given.
+
+**Validation rules.** The Phase 1 canonical schema in section 8 is the
+authoritative input contract. A dataset is valid when all of the following
+hold.
+
+| Area | Rule |
+| --- | --- |
+| Schema | Exactly the canonical columns. Missing and unexpected columns are both reported; none are silently dropped or added. |
+| Rows | At least one row. A zero-row dataset is invalid. |
+| `timestamp` | Present, non-null, timezone-aware, UTC, strictly ascending with no duplicates. |
+| `symbol` | Non-null, uppercase, exactly one distinct value, and in the V0.1 universe. |
+| OHLC | `open`, `high`, `low`, `close` non-null, finite, and greater than zero, with `high >= low`, `high >= open`, `high >= close`, `low <= open`, and `low <= close`. |
+| `volume` | Present, numeric, finite, and `>= 0`. Zero volume is legitimate; it is not an error. |
+| `trade_count` | Nullable. When present: numeric, finite, `>= 0`. |
+| `vwap` | Nullable. When present: numeric, finite, `> 0`. |
+
+**Bar spacing is not checked.** Continuous 15-minute intervals are *not*
+required. Weekends, holidays, overnight closures, and early closes make gaps
+normal, and Phase 2 adds no exchange-calendar dependency.
+
+**Explicitly out of scope for Phase 2:** exchange-holiday awareness, market
+session completeness, missing-bar detection, early-close handling, outlier
+and price-spike heuristics, statistical anomaly detection, split and
+corporate-action correctness, suspicious-volume patterns, cross-provider
+consistency, data repair, and writing to `data/processed/`. These may be
+researched in a later phase if a concrete need appears.
+
+**Result model.** Validation returns a small dataclass exposing `valid`,
+`row_count`, `symbol` (when a single one is determinable), `error_count`, and
+the collected `errors`. Each error carries a stable machine-readable code and
+a concise human-readable message. The codes are:
+
+```
+EMPTY_DATASET        MISSING_COLUMN       UNEXPECTED_COLUMN
+INVALID_TIMESTAMP    DUPLICATE_TIMESTAMP  UNSORTED_TIMESTAMP
+INVALID_SYMBOL       NULL_OHLC            INVALID_OHLC
+INVALID_VOLUME       INVALID_TRADE_COUNT  INVALID_VWAP
+```
+
+Codes are part of the contract; messages are not. Ordinary data-quality
+problems are collected rather than aborting on the first one, and repeated
+violations are summarized with a row count (`3 rows violate high >= low`)
+rather than emitted one error per row. A malformed or unreadable Parquet file
+is a controlled input error instead, because there are no rows to report on.
+
+**CLI.** `validate <path>` prints a `VALID` or `INVALID` report and exits `0`
+for a valid dataset, `1` when validation errors were found, and `2` when the
+file cannot be read. Neither an invalid dataset nor a missing file produces a
+traceback, and the command is non-interactive.
+
+**Done when:** the validator implements exactly the rules above, leaves its
+input unmodified, the CLI honours those exit codes, and `pytest`, `ruff check
+.`, and `ruff format --check .` all pass with every test offline.
 
 ### Later phases
 

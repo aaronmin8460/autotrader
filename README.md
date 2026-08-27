@@ -6,16 +6,17 @@ as a local Python CLI process against an Alpaca **paper** account.
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Phase 1 - historical market data
+## Status: Phase 2 - data validation
 
 There is **no trading in this repository, and none is planned within the
 current milestone** - no live trading and no paper trading. No order is ever
 submitted, and no Alpaca trading client is constructed anywhere in the code.
 
-What exists today is one read-only capability: downloading historical
+What exists today are two read-only capabilities: downloading historical
 15-minute US-equity bars from Alpaca's IEX feed and storing them locally as
-Parquet. Data validation, strategies, backtesting, and risk logic belong to
-later phases and are not implemented.
+Parquet, and validating a stored dataset against that canonical schema.
+Validation never downloads, modifies, or repairs data. Strategies,
+backtesting, and risk logic belong to later phases and are not implemented.
 
 ## Scope summary
 
@@ -107,6 +108,37 @@ count, and retrieval time - never credentials.
 is never committed; the repository is reproducible from source plus a
 re-fetch.
 
+Validate a downloaded dataset:
+
+```bash
+python -m autotrader.cli validate data/raw/SPY_15m_2025-01-01_2025-12-31.parquet
+```
+
+The command reads the file and reports whether it is structurally and
+internally consistent enough for later phases to consume. It checks the exact
+canonical columns, a non-empty dataset, timezone-aware UTC timestamps that are
+unique and ascending, a single supported uppercase symbol, positive finite
+OHLC values with `high`/`low` bounding `open` and `close`, non-negative
+volume, and - where present - non-negative `trade_count` and positive `vwap`.
+Violations are summarized with a row count, never listed one line per row.
+
+It deliberately does **not** check bar-to-bar spacing, session completeness,
+or price anomalies: weekends, holidays, and overnight closures make gaps
+normal, and anomaly heuristics are out of scope.
+
+```
+VALID
+
+File:   data/raw/SPY_15m_2025-01-01_2025-12-31.parquet
+Rows:   6552
+Symbol: SPY
+Errors: 0
+```
+
+Exit codes are `0` for a valid dataset, `1` when validation errors were found,
+and `2` when the file cannot be read at all. Nothing is written, and neither
+an invalid dataset nor a missing file produces a traceback.
+
 The `autotrader` console script is installed as an equivalent entry point.
 There are no strategy, backtest, or trading commands.
 
@@ -133,8 +165,9 @@ ruff format --check .
 ## Layout
 
 ```
-src/autotrader/data/        Alpaca historical bars -> canonical Parquet (Phase 1)
-src/autotrader/cli/         Typer CLI (version, download)
+src/autotrader/data/        Alpaca historical bars -> canonical Parquet (Phase 1),
+                            stored-dataset validation (Phase 2)
+src/autotrader/cli/         Typer CLI (version, download, validate)
 src/autotrader/strategies/  empty stub (Phase 3)
 src/autotrader/backtest/    empty stub (Phase 4)
 src/autotrader/risk/        empty stub (Phase 5)
