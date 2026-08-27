@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autotrader"
+description = "Personal automated trading system (US equities, Alpaca paper trading)."
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+dependencies = [
+    "alpaca-py",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "pydantic",
+    "typer",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+autotrader = "autotrader.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "autotrader.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
