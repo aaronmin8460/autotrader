@@ -1,6 +1,7 @@
 # autotrader - Project Specification (v0.1)
 
-**Status:** Phase 4 - backtesting complete. Next: Phase 5 risk engine.
+**Status:** Phase 5 - risk engine complete on branch `feat/risk-engine`, not yet
+merged into `main`. Next: Phase 6 SQLite trading state.
 **Last updated:** 2026-08-27
 
 This document is the authoritative scope definition for this repository. When
@@ -89,8 +90,8 @@ Phase 1  Historical Market Data         <- done
 Phase 2  Data Validation                <- done
 Phase 3  Strategy                       <- done
 Phase 4  Backtesting                    <- done
-Phase 5  Risk Engine                    <- next
-Phase 6  SQLite Trading State
+Phase 5  Risk Engine                    <- done
+Phase 6  SQLite Trading State           <- next
 Phase 7  Alpaca Paper Trading
 Phase 8  Reconciliation / Crash Recovery
 Phase 9  Monitoring
@@ -526,6 +527,160 @@ symbols, strategy selection, parameter or walk-forward optimization, Monte
 Carlo, Sharpe, Sortino, alpha, beta, benchmark comparison, fractional shares,
 transaction-cost modelling, an event bus, a plugin or broker-simulator
 framework, and vectorized optimization.
+
+### Phase 5 - Risk Engine (complete)
+
+The deterministic risk engine, `autotrader.risk.engine`. It occupies the stage
+between a signal and an order intent (section 6A) and answers exactly one
+question: may this proposed trade be allowed, and if so, what is the largest
+safe whole-share quantity under the V0.1 limits?
+
+Phase 5 is a **calculator**. It submits no order, constructs no broker client,
+makes no network call, opens no database, persists nothing, writes no file,
+and mutates neither the request nor the context it is given. The same inputs
+always produce the same decision.
+
+**Not wired into Phase 4.** The backtester keeps its own all-cash sizing
+baseline and is deliberately *not* re-plumbed through these limits, so no
+Phase 4 result changes. Integrating risk into real sizing belongs to paper
+execution, a later phase.
+
+**V0.1 risk policy.** These are engineering safety defaults. They are **not**
+investment advice and not a recommended allocation.
+
+| Field | Value | Meaning |
+| --- | --- | --- |
+| `max_position_fraction` | `0.05` | market value of any one symbol <= **5%** of current equity |
+| `max_total_exposure_fraction` | `0.30` | aggregate long exposure <= **30%** of current equity |
+| `max_daily_loss_fraction` | `0.02` | new entries halt once the day is down **2%** of start-of-day equity |
+| `long_only` | `true` | no short side exists to request |
+| `allow_leverage` | `false` | an entry may only spend cash already held |
+| `whole_shares_only` | `true` | quantities are floored to whole shares |
+
+The policy is fixed for V0.1, strategy-independent, and deliberately not
+loaded from the environment. `DEFAULT_POLICY` encodes exactly the table above.
+A policy that flips one of the booleans is **refused** rather than partly
+honoured: silently ignoring `allow_leverage=True` would leave a caller
+believing something untrue about the system.
+
+**Risk context.** A flat, immutable snapshot - not a portfolio object
+hierarchy: `equity`, `cash`, `total_exposure`, `symbol_exposure`,
+`current_position_quantity`, `daily_pnl`, `start_of_day_equity`, and
+`trading_enabled`. `symbol_exposure` is part of `total_exposure`, and
+`daily_pnl` is the only field that may be negative.
+
+**Risk request.** A small internal `RiskRequest` of `symbol`, `side`,
+`reference_price`, and `requested_quantity`, where `side` is `BUY` or `SELL`.
+It is a risk-calculation question, **not** a broker order and not a persisted
+order intent: it carries no order type, no time in force, no identifier, and
+no broker field. `reference_price` is the price sizing is done against - a
+mark, never a promised fill.
+
+**Kill switch.** `trading_enabled` is an explicit boolean in the context. When
+it is `false`, **every new BUY entry is rejected**. It does **not** block an
+exit; see below.
+
+**Entry gates.** A BUY is approved only when all of these hold, checked in
+this order so the reported reason is deterministic:
+
+1. the request is well formed - positive finite price, positive whole-share
+   quantity, non-empty symbol, a real `RiskSide`;
+2. `trading_enabled` is `true`;
+3. `daily_pnl / start_of_day_equity > -0.02`;
+4. the resulting symbol exposure is within 5% of equity;
+5. the resulting total exposure is within 30% of equity;
+6. the required cash is within available cash - the no-leverage rule.
+
+**Entry sizing.** The tightest of the three ceilings wins, and the quantity is
+floored to whole shares:
+
+```
+position_remaining  = max(0, equity * 0.05 - symbol_exposure)
+portfolio_remaining = max(0, equity * 0.30 - total_exposure)
+max_notional        = min(position_remaining, portfolio_remaining, cash)
+max_quantity        = floor(max_notional / reference_price)
+approved_quantity   = min(requested_quantity, max_quantity)
+```
+
+Ties between ceilings resolve in that fixed order. That `floor` is the
+**only** rounding in the engine.
+
+**Clamping, not refusing.** A BUY larger than the safe maximum is approved at
+`max_quantity` rather than rejected, and `reason_code` names the constraint
+that bound it - `POSITION_LIMIT`, `TOTAL_EXPOSURE_LIMIT`, or
+`INSUFFICIENT_CASH` - instead of `APPROVED`. Requesting 100 shares when 12 are
+safe yields an approved decision for 12. When `max_quantity` is **zero** the
+request is rejected. Nothing is ever approved above a limit, and sizing is
+never silently constrained without saying so.
+
+**Daily-loss halt.** `daily_pnl / start_of_day_equity <= -0.02` blocks new
+entries, and `start_of_day_equity` must be positive. The boundary is
+inclusive: **exactly -2.00% blocks.** Exits are unaffected.
+
+**Exits reduce risk, so risk never blocks them.** A SELL only reduces an
+existing long. The `trading_enabled` kill switch, the daily-loss halt, the
+per-symbol cap, and the total-exposure cap are **entry** gates, and none of
+them is consulted for an exit - a control that prevented an account from
+reducing exposure would trap an open position, which is the opposite of a
+safety control. A SELL is still checked for a usable price and quantity, and:
+
+- `current_position_quantity <= 0` is rejected as `NO_POSITION_TO_EXIT`;
+- a quantity larger than the position is **clamped to the position**
+  (`EXIT_QUANTITY_EXCEEDS_POSITION`), so an exit can fully flatten a holding
+  but can never cross below zero into a short.
+
+**Long only is structural.** `RiskSide` has exactly `BUY` and `SELL`, so a
+short cannot be expressed, and an approved SELL never exceeds the position.
+There is therefore no `LONG_ONLY_VIOLATION` reason code: it would be
+unreachable, and an unreachable code in a machine-readable contract is a false
+promise. Selling while flat surfaces as `NO_POSITION_TO_EXIT`.
+
+**Invalid input is not a risk denial.** The two are deliberately distinct:
+
+- A **context** that cannot describe a real account raises `RiskInputError` -
+  `equity <= 0`, `cash < 0`, a negative exposure, `symbol_exposure >
+  total_exposure`, a negative or non-integer position, `start_of_day_equity <=
+  0`, a non-boolean `trading_enabled`, or any NaN or infinity. Nothing is
+  repaired or clamped into range. An unsupported policy raises the same way.
+- A **request** that is malformed returns an ordinary rejected decision with
+  `INVALID_REQUEST`.
+- An ordinary risk denial never raises.
+
+Numeric strings are not coerced: a price or quantity that arrived as text
+means something upstream lost its type, and parsing it would hide that.
+
+**Decision model.** A frozen `RiskDecision` of `approved`,
+`approved_quantity`, `reason_code`, `message`, and `max_allowed_quantity`.
+`approved_quantity` is `0` whenever `approved` is false, and never exceeds
+either the requested quantity or `max_allowed_quantity`.
+`max_allowed_quantity` is the cap that applied - the sizing ceiling for an
+entry, the current position for an exit. `reason_code` is a stable machine
+string; `message` is human-readable and is **not** part of the contract. The
+codes are:
+
+```
+APPROVED             INVALID_REQUEST      TRADING_DISABLED
+DAILY_LOSS_LIMIT     POSITION_LIMIT       TOTAL_EXPOSURE_LIMIT
+INSUFFICIENT_CASH    NO_POSITION_TO_EXIT  EXIT_QUANTITY_EXCEEDS_POSITION
+```
+
+**Numeric policy.** Plain floats, as elsewhere in the project; no `Decimal`
+framework is introduced. Values are checked for finiteness explicitly, and
+quantities are deterministic integers.
+
+**Public API.** `evaluate_risk(request, context, policy=DEFAULT_POLICY) ->
+RiskDecision`. There is no CLI command: Phase 5 has no user-facing action to
+offer, only a decision for a later phase to consume.
+
+**Explicitly out of scope for Phase 5:** order creation, order intents, broker
+adapters, any trading client, paper or live orders, Alpaca calls of any kind,
+SQLite and every other form of persistence, risk-event journaling, changes to
+Phase 4 accounting, portfolio state mutation, an event bus, dependency
+injection, a generic policy framework, environment-loaded policies,
+strategy-dependent risk parameters, per-strategy limits, stop losses, take
+profits, trailing stops, volatility or drawdown sizing, correlation limits,
+sector limits, intraday rate limiting, reconciliation, monitoring, a frontend,
+and deployment.
 
 ### Later phases
 

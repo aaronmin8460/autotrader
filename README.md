@@ -6,21 +6,23 @@ as a local Python CLI process against an Alpaca **paper** account.
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Phase 4 complete - deterministic backtesting. Next: Phase 5 risk engine
+## Status: Phase 5 - deterministic risk engine (branch `feat/risk-engine`, unmerged). Next: Phase 6 SQLite trading state
 
 There is **no trading in this repository, and none is planned within the
 current milestone** - no live trading and no paper trading. No order is ever
 submitted, and no Alpaca trading client is constructed anywhere in the code.
 
-What exists today are four capabilities: downloading historical 15-minute
+What exists today are five capabilities: downloading historical 15-minute
 US-equity bars from Alpaca's IEX feed and storing them locally as Parquet,
 validating a stored dataset against that canonical schema, the EMA 20 / EMA 50
-signal generator that turns those bars into BUY/EXIT signals, and a
-deterministic backtester that simulates what those signals would have done.
-Validation never downloads, modifies, or repairs data; the strategy emits
-signals only; and the backtester is local arithmetic over a DataFrame - it
-creates no order and contacts no broker. Risk logic (Phase 5) and everything
-after it are not implemented.
+signal generator that turns those bars into BUY/EXIT signals, a deterministic
+backtester that simulates what those signals would have done, and a
+deterministic risk engine that decides whether a proposed trade would be
+allowed and how large it could safely be. Validation never downloads,
+modifies, or repairs data; the strategy emits signals only; the backtester is
+local arithmetic over a DataFrame; and the risk engine is a pure calculator
+that creates no order, contacts no broker, and persists nothing. Trading state
+(Phase 6) and everything after it are not implemented.
 
 ## Scope summary
 
@@ -257,6 +259,115 @@ the starting cash is unusable, and `2` when the file cannot be read.
 See [docs/SPEC.md](docs/SPEC.md) section 8, "Phase 4 - Backtesting", for the
 full contract.
 
+## Risk engine (Phase 5)
+
+`autotrader.risk` answers one question about a **proposed** trade: may it be
+allowed, and if so, what is the largest safe whole-share quantity?
+
+It is a calculator and nothing else. It submits no order, builds no broker
+client, makes no network call, opens no database, and writes no file. It does
+not mutate what it is given, and the same inputs always produce the same
+decision. It is also **not** wired into the Phase 4 backtester, which keeps its
+own all-cash sizing baseline - no backtest result changes.
+
+```python
+from autotrader.risk import RiskContext, RiskRequest, RiskSide, evaluate_risk
+
+context = RiskContext(
+    equity=200_000.0,
+    cash=200_000.0,
+    total_exposure=0.0,
+    symbol_exposure=0.0,
+    current_position_quantity=0,
+    daily_pnl=0.0,
+    start_of_day_equity=200_000.0,
+    trading_enabled=True,
+)
+request = RiskRequest(
+    symbol="SPY", side=RiskSide.BUY, reference_price=250.0, requested_quantity=1_000
+)
+
+decision = evaluate_risk(request, context)
+# approved=True, approved_quantity=40, reason_code="POSITION_LIMIT"
+```
+
+The request asked for 1,000 shares; 5% of $200,000 is $10,000, which is 40
+shares at $250. The decision is **approved at 40** - an oversized request is
+sized down, not thrown away - and `reason_code` names the constraint that
+bound it.
+
+### The V0.1 limits
+
+These are **engineering safety defaults, not investment advice** and not a
+recommended allocation.
+
+| Limit | Value |
+| --- | --- |
+| Maximum market value of any one symbol | 5% of current equity |
+| Maximum aggregate long exposure | 30% of current equity |
+| Daily loss at which new entries halt | -2% of start-of-day equity |
+| Direction | Long only |
+| Leverage | None - an entry may only spend cash on hand |
+| Share quantities | Whole shares only |
+
+They are fixed for V0.1, strategy-independent, and deliberately not loaded
+from the environment. A policy that claims to allow leverage or shorting is
+refused outright rather than quietly ignored.
+
+### Entries are gated
+
+A BUY must clear a well-formed request, the `trading_enabled` kill switch, and
+the daily-loss halt, and is then sized against the **tightest** of three
+ceilings:
+
+```
+position_remaining  = max(0, equity * 0.05 - symbol_exposure)
+portfolio_remaining = max(0, equity * 0.30 - total_exposure)
+max_notional        = min(position_remaining, portfolio_remaining, cash)
+max_quantity        = floor(max_notional / reference_price)
+approved_quantity   = min(requested_quantity, max_quantity)
+```
+
+An oversized BUY is **clamped** to `max_quantity` and approved, with the
+binding constraint reported as the reason. A `max_quantity` of zero is
+rejected. Nothing is ever approved above a limit. The daily-loss boundary is
+inclusive - exactly -2.00% blocks.
+
+### Exits are not
+
+Every limit above exists to stop the account **adding** risk. None of them may
+stop it **removing** risk, so a SELL against an existing long is evaluated
+separately: the kill switch, the daily-loss halt, and both exposure caps are
+entry gates and none of them can block an exit. A kill switch that trapped an
+open position would be a safety defect, not a safety feature.
+
+A SELL is rejected only when there is no position (`NO_POSITION_TO_EXIT`), and
+a request for more shares than are held is clamped to the position - an exit
+can fully flatten a holding but can never cross below zero into a short. Long
+only is structural: there is no short side to request.
+
+### Decisions and errors
+
+A decision carries `approved`, `approved_quantity`, a stable machine
+`reason_code`, a human-readable `message`, and `max_allowed_quantity`:
+
+```
+APPROVED             INVALID_REQUEST      TRADING_DISABLED
+DAILY_LOSS_LIMIT     POSITION_LIMIT       TOTAL_EXPOSURE_LIMIT
+INSUFFICIENT_CASH    NO_POSITION_TO_EXIT  EXIT_QUANTITY_EXCEEDS_POSITION
+```
+
+A malformed *request* - a zero, negative, or fractional quantity, or a price
+that is zero, negative, NaN, or infinite - is an ordinary rejected decision
+with `INVALID_REQUEST`. A *context* that could not describe a real account -
+zero equity, negative cash, a symbol exposure larger than the total - raises
+`RiskInputError` instead, because that is a programming error rather than a
+risk outcome. Nothing is silently repaired, and an ordinary risk denial never
+raises.
+
+See [docs/SPEC.md](docs/SPEC.md) section 8, "Phase 5 - Risk Engine", for the
+full contract.
+
 ## Development
 
 Run the tests:
@@ -285,7 +396,7 @@ src/autotrader/data/        Alpaca historical bars -> canonical Parquet (Phase 1
 src/autotrader/cli/         Typer CLI (version, download, validate, backtest)
 src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals (Phase 3)
 src/autotrader/backtest/    deterministic next-bar-open backtester (Phase 4)
-src/autotrader/risk/        empty stub (Phase 5)
+src/autotrader/risk/        deterministic risk decisions and sizing (Phase 5)
 tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)
 data/processed/             validated market data (git-ignored)
