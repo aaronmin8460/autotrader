@@ -6,23 +6,30 @@ as a local Python CLI process against an Alpaca **paper** account.
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Phase 5 - deterministic risk engine (branch `feat/risk-engine`, unmerged). Next: Phase 6 SQLite trading state
+## Status: Phase 6 complete - deterministic risk engine and local SQLite operational state. Next: Phase 7 Alpaca paper execution
 
 There is **no trading in this repository, and none is planned within the
 current milestone** - no live trading and no paper trading. No order is ever
 submitted, and no Alpaca trading client is constructed anywhere in the code.
 
-What exists today are five capabilities: downloading historical 15-minute
+What exists today are six capabilities: downloading historical 15-minute
 US-equity bars from Alpaca's IEX feed and storing them locally as Parquet,
 validating a stored dataset against that canonical schema, the EMA 20 / EMA 50
 signal generator that turns those bars into BUY/EXIT signals, a deterministic
-backtester that simulates what those signals would have done, and a
-deterministic risk engine that decides whether a proposed trade would be
-allowed and how large it could safely be. Validation never downloads,
-modifies, or repairs data; the strategy emits signals only; the backtester is
-local arithmetic over a DataFrame; and the risk engine is a pure calculator
-that creates no order, contacts no broker, and persists nothing. Trading state
-(Phase 6) and everything after it are not implemented.
+backtester that simulates what those signals would have done, a deterministic
+risk engine that decides whether a proposed trade would be allowed and how
+large it could safely be, and a local SQLite database that can durably record
+operational state. Validation never downloads, modifies, or repairs data; the
+strategy emits signals only; the backtester is local arithmetic over a
+DataFrame; the risk engine is a pure calculator that creates no order,
+contacts no broker, and persists nothing; and the database only stores records
+- it decides nothing and contacts nobody.
+
+The risk engine and the database are deliberately independent layers:
+evaluating risk never writes to SQLite, and recording a risk event never
+evaluates risk. Broker connectivity (Phase 7) and reconciliation (Phase 8) are
+not implemented, and the database deliberately has no table for broker orders,
+fills, executions, or reconciliation runs.
 
 ## Scope summary
 
@@ -36,7 +43,7 @@ that creates no order, contacts no broker, and persists nothing. Trading state
 | Direction | Long only |
 | Research strategy | EMA 20 / EMA 50 crossover (engineering validation only) |
 | Historical storage | Parquet |
-| Trading state | SQLite (later phase) |
+| Operational state | SQLite, local file (Phase 6) |
 | Interface | Python CLI, local process - no web frontend |
 
 Out of scope: live trading, options, crypto, futures, forex, shorting,
@@ -368,6 +375,92 @@ raises.
 See [docs/SPEC.md](docs/SPEC.md) section 8, "Phase 5 - Risk Engine", for the
 full contract.
 
+## Operational state (Phase 6)
+
+Operational state lives in a **local SQLite file**. SQLite was chosen because
+this is a single-user, single-process, local system: the standard library ships
+the driver, so the whole feature adds **zero dependencies** - no ORM, no
+migration framework, and no database service. There is no PostgreSQL, no
+Supabase, no Redis, and no cloud database anywhere in this project.
+
+`autotrader.state` is persistence infrastructure and nothing else. It stores
+records; it decides nothing, orchestrates nothing, and contacts nobody. It
+imports only the standard library, needs no credentials, and opens no socket.
+
+```python
+from datetime import UTC, datetime
+
+from autotrader.state import connect, initialize_database, record_strategy_run
+
+path = initialize_database("data/autotrader.db")
+with connect(path) as connection:
+    run_id = record_strategy_run(
+        connection,
+        strategy_name="EMA20/EMA50",
+        mode="BACKTEST",
+        started_at=datetime.now(UTC),
+    )
+```
+
+**The database file is git-ignored** (`*.db`, `*.sqlite`, `*.sqlite3`, plus the
+WAL sidecars), like everything else under `data/`. Nothing creates it
+implicitly - a caller passes an explicit path - and the whole test suite writes
+into temporary directories, so running `pytest` never creates a real database.
+
+Every connection sets **`journal_mode = WAL`**, **`foreign_keys = ON`**, and a
+5-second busy timeout. Foreign keys are per-connection in SQLite, so
+configuring them once at creation time would silently disable referential
+integrity for every later caller.
+
+Writes are transactional. `transaction()` commits on success and rolls back on
+**any** exception, so a failure halfway through a multi-write unit of work
+leaves none of it behind. Nested use joins the outer transaction, which lets
+several records be written as one atomic unit.
+
+`initialize_database(path)` is idempotent - calling it repeatedly creates
+nothing twice. The schema carries an explicit `schema_version` (currently `1`);
+a database written by a newer version is **refused and left untouched** rather
+than downgraded, and an inconsistent database raises a clear error instead of
+being repaired. There is deliberately no migration framework and no database
+CLI.
+
+Six tables exist:
+
+| Table | Holds |
+| --- | --- |
+| `schema_metadata` | The schema version |
+| `strategy_runs` | One logical strategy session |
+| `signals` | Durable Phase 3 BUY/EXIT signals, linked to a run |
+| `risk_events` | A generic risk-decision audit trail |
+| `system_events` | General operational events |
+| `positions` | The latest **local** position snapshot per symbol |
+
+**There is no broker or order persistence yet.** No `broker_orders`, `fills`,
+`executions`, `broker_accounts`, or `reconciliation_runs` table exists, because
+those records describe an external system this repository does not talk to.
+Adding them correctly in Phase 7/8 is better than guessing their shape now.
+`risk_events` is deliberately generic for the same reason: Phase 5 owns what a
+risk decision means, and this module stores opaque text rather than importing
+or mirroring its model.
+
+Some deliberate invariants:
+
+- **All timestamps are ISO-8601 UTC** in one canonical form. Aware values in
+  another zone are converted; **naive datetimes are rejected**, because reading
+  one as local time would silently misdate an audit record.
+- **`EXIT` is stored as `EXIT`**, never rewritten as `SELL`. A signal is not a
+  trade, and persistence must not make that translation on a caller's behalf.
+- **The same logical signal cannot be stored twice** for one run. This is a
+  storage invariant only - real order idempotency is Phase 7's problem.
+- **`quantity >= 0`**, enforced in Python *and* as a SQLite `CHECK`, because the
+  system is long only. `average_price` is either NULL or greater than zero. No
+  P&L is stored.
+- **Positions are local.** Nothing here has ever spoken to a broker, so an
+  empty `positions` table means "no local snapshot", not "flat at the broker".
+
+See [docs/SPEC.md](docs/SPEC.md) section 8, "Phase 6 - SQLite Operational
+State", for the full contract.
+
 ## Development
 
 Run the tests:
@@ -397,8 +490,11 @@ src/autotrader/cli/         Typer CLI (version, download, validate, backtest)
 src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals (Phase 3)
 src/autotrader/backtest/    deterministic next-bar-open backtester (Phase 4)
 src/autotrader/risk/        deterministic risk decisions and sizing (Phase 5)
+src/autotrader/state/       local SQLite operational state (Phase 6)
 tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)
 data/processed/             validated market data (git-ignored)
+data/autotrader.db          local operational state (git-ignored, not created
+                            unless an application asks for it)
 docs/SPEC.md                authoritative scope specification
 ```
