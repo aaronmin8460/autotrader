@@ -1,6 +1,6 @@
 # autotrader - Project Specification (v0.1)
 
-**Status:** Phase 0 - repository foundation only.
+**Status:** Phase 1 - historical market data.
 **Last updated:** 2026-08-27
 
 This document is the authoritative scope definition for this repository. When
@@ -84,8 +84,8 @@ Phases are sequential. Each phase must be complete and verified before the
 next begins.
 
 ```
-Phase 0  Repository Foundation          <- current
-Phase 1  Historical Market Data
+Phase 0  Repository Foundation          <- done
+Phase 1  Historical Market Data         <- current
 Phase 2  Data Validation
 Phase 3  Strategy
 Phase 4  Backtesting
@@ -102,8 +102,9 @@ Phase 10 Deployment
 ## 5. Storage policy
 
 - **Historical market data:** Parquet files under `data/`.
-  - `data/raw/` - as fetched from the provider, unmodified.
-  - `data/processed/` - validated / normalized bars used by backtests.
+  - `data/raw/` - as fetched from the provider, normalized only to the
+    canonical schema in section 8 (Phase 1).
+  - `data/processed/` - validated bars used by backtests (Phase 2).
   - Market data is **never committed**. The directories are tracked via
     `.gitkeep`; their contents are ignored.
 - **Operational trading state** (orders, positions, fills, run journal):
@@ -200,7 +201,7 @@ requirements, complex abstract base classes.
 
 ## 8. Phase boundaries
 
-### Phase 0 - Repository Foundation (current)
+### Phase 0 - Repository Foundation (complete)
 
 **In scope:** src-layout Python package, `pyproject.toml`, minimal Typer CLI
 that prints help and version, this specification, README, `.gitignore`,
@@ -216,11 +217,78 @@ Docker.
 works, `pytest` passes, `ruff check .` passes, and no secrets or market data
 are committed.
 
-### Phase 1 - Historical Market Data (next, not started)
+### Phase 1 - Historical Market Data (current)
 
 Fetch 15-minute historical bars for the V0.1 universe from Alpaca's data API
 and persist them to Parquet under `data/raw/`. Read-only market data access;
-no trading endpoints, no order submission.
+no trading endpoints, no order submission, and no `TradingClient` anywhere in
+the codebase.
+
+The contract below is authoritative for every later phase that reads stored
+bars.
+
+**Provider and feed.** Alpaca only, via `alpaca-py`, using the **IEX** equity
+feed. IEX is the free-tier-compatible path. No second market-data provider and
+no paid provider may be added as a fallback; a gap in IEX coverage is a data
+problem to be handled in Phase 2, not a reason to add a provider.
+
+**Symbols.** The five V0.1 symbols only (SPY, QQQ, AAPL, MSFT, NVDA). User
+input is uppercased; anything outside the universe is rejected.
+
+**Timeframe.** `15m` only. There is deliberately no generic timeframe
+framework.
+
+**Date semantics.** `--start` and `--end` are `YYYY-MM-DD` US market calendar
+dates interpreted in `America/New_York`. `--end` is **inclusive** from the
+user's perspective; internally the request boundary becomes midnight
+`America/New_York` on the following day, converted to UTC. Malformed dates and
+`end < start` are rejected. Exchange holiday and session-calendar awareness is
+**not** part of Phase 1.
+
+**Canonical bar schema.** Every stored row has exactly these columns, in this
+order:
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `timestamp` | datetime, tz-aware | Always UTC. Bar open time. |
+| `symbol` | string | Uppercase. |
+| `open` | float | |
+| `high` | float | |
+| `low` | float | |
+| `close` | float | |
+| `volume` | float | |
+| `trade_count` | float, nullable | Null when Alpaca omits it. |
+| `vwap` | float, nullable | Null when Alpaca omits it. |
+
+Rows are ordered **ascending by `timestamp`**.
+
+**File naming.** Output is deterministic and date-ranged, so a download for a
+different range can never silently overwrite an existing file:
+
+```
+data/raw/{SYMBOL}_15m_{START}_{END}.parquet
+data/raw/{SYMBOL}_15m_{START}_{END}.metadata.json
+```
+
+Both files are written via a temporary file and an atomic rename, so an
+interrupted run cannot leave a truncated Parquet file behind.
+
+**Metadata sidecar.** A small JSON file records `provider`, `feed`, `symbol`,
+`timeframe`, `requested_start`, `requested_end`, `timestamp_timezone`,
+`retrieved_at_utc`, `row_count`, and `parquet_filename`. It must never contain
+credentials or account information.
+
+**Credentials.** `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` are read from the
+process environment. Missing credentials produce a clear message, not a
+traceback. Credentials are never logged, printed, or persisted.
+
+**Empty responses.** Zero returned bars is an error, not an empty file. No
+Parquet or metadata file is written.
+
+**Explicitly out of scope for Phase 1:** data-quality validation (duplicate
+timestamps, OHLC relationships, missing bars, session continuity, anomalous
+prices, quality reports - all Phase 2), indicators, strategies, backtesting,
+risk, SQLite, order models, and every trading endpoint.
 
 ### Later phases
 
