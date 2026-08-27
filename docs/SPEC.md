@@ -1,6 +1,7 @@
 # autotrader - Project Specification (v0.1)
 
-**Status:** Phase 4 - backtesting complete. Next: Phase 5 risk engine.
+**Status:** Phase 6 - SQLite operational state complete. Phase 5 (risk engine)
+is in progress independently and is **not** complete.
 **Last updated:** 2026-08-27
 
 This document is the authoritative scope definition for this repository. When
@@ -51,7 +52,7 @@ Feature count is explicitly *not* a goal.
 | Direction | Long only |
 | Research strategy | EMA 20 / EMA 50 crossover |
 | Historical data storage | Parquet |
-| Operational trading state | SQLite (later phase; not now) |
+| Operational trading state | SQLite, local file (Phase 6) |
 | Application style | Python CLI / local process |
 | Frontend | None |
 
@@ -89,8 +90,8 @@ Phase 1  Historical Market Data         <- done
 Phase 2  Data Validation                <- done
 Phase 3  Strategy                       <- done
 Phase 4  Backtesting                    <- done
-Phase 5  Risk Engine                    <- next
-Phase 6  SQLite Trading State
+Phase 5  Risk Engine                    <- in progress (separate branch)
+Phase 6  SQLite Operational State       <- done
 Phase 7  Alpaca Paper Trading
 Phase 8  Reconciliation / Crash Recovery
 Phase 9  Monitoring
@@ -109,9 +110,12 @@ Phase 10 Deployment
     to a later phase.
   - Market data is **never committed**. The directories are tracked via
     `.gitkeep`; their contents are ignored.
-- **Operational trading state** (orders, positions, fills, run journal):
-  a local SQLite database, introduced in Phase 6. Database files are ignored
-  by git.
+- **Operational trading state:** a local SQLite database, introduced in
+  Phase 6. Phase 6 stores strategy runs, signals, risk events, system events,
+  and local position snapshots. Broker orders, fills, and reconciliation
+  records are **not** stored yet - they describe an external system this
+  repository does not talk to, and their tables belong to Phase 7/8. Database
+  files are ignored by git.
 - **Secrets:** environment variables loaded from a local `.env`, which is
   ignored by git. `.env.example` documents the variable names only and
   contains no values.
@@ -526,6 +530,138 @@ symbols, strategy selection, parameter or walk-forward optimization, Monte
 Carlo, Sharpe, Sortino, alpha, beta, benchmark comparison, fractional shares,
 transaction-cost modelling, an event bus, a plugin or broker-simulator
 framework, and vectorized optimization.
+
+### Phase 6 - SQLite Operational State (complete)
+
+The local operational-state foundation, `autotrader.state.sqlite`. It is
+**persistence infrastructure and nothing else**: it opens a database, creates a
+fixed schema, and stores durable records. It decides nothing, orchestrates
+nothing, and contacts nobody. No order is placed, no broker is called, no
+signal is executed, and no risk rule is evaluated. It imports only the standard
+library, requires no credentials, and opens no socket.
+
+Phase 5 is developed independently and is **not** complete. Phase 6 does not
+import it, mirror its models, or assume its vocabulary.
+
+**Technology.** The standard library's `sqlite3`, and nothing else. No ORM, no
+migration framework, no async driver, and no database service - the dependency
+footprint of this phase is zero. One user, one local process, one file.
+
+**Database file.** The conventional local path is `data/autotrader.db`
+(`DEFAULT_DATABASE_PATH`). Nothing creates it implicitly; a caller passes an
+explicit path to `initialize_database`. Database files are git-ignored
+(`*.db`, `*.sqlite`, `*.sqlite3`, and the WAL/journal sidecars). Every test
+writes into a temporary directory, so running the suite never creates a real
+persistent database.
+
+**Connections.** Every connection - not just the first - sets
+`foreign_keys = ON`, `journal_mode = WAL`, and `busy_timeout = 5000`. Foreign
+keys are per-connection in SQLite, so configuring them once at creation time
+would silently disable referential integrity for every later caller. There is
+no connection pool.
+
+**Transactions.** Connections run with `isolation_level=None`: nothing is
+implicitly in a transaction and nothing implicitly commits. Every write goes
+through `transaction()`, which commits on success and rolls back on **any**
+exception, so a caller never observes a partially written multi-step state.
+Nested use joins the outer transaction and leaves the commit to it, which lets
+several `record_*` calls be grouped into one atomic unit.
+
+**Schema versioning.** A `schema_metadata` table holds a single
+`schema_version` row. The current version is **1**. `initialize_database(path)`
+is idempotent: repeated calls create nothing twice and change nothing. A
+database written by a **newer** version is refused with
+`UnsupportedSchemaVersionError` and left untouched - never downgraded or
+overwritten. An older version is refused too; there is deliberately no
+migration framework.
+
+**Damaged databases are not repaired.** If the schema metadata and the tables
+disagree - a missing table, a version marker without tables, tables without a
+version marker - initialization raises `DatabaseStateError` rather than
+attempting a fix. Detection is a table-name and version check only. There is no
+backup or restore tooling.
+
+**Timestamps.** Every persisted timestamp is ISO-8601 UTC in one canonical
+fixed-width form, `YYYY-MM-DDTHH:MM:SS.ffffff+00:00`, so text ordering is also
+chronological ordering. Aware inputs in any other zone are converted to UTC.
+**Naive datetimes are rejected** - there is no correct guess for the offset,
+and reading one as local time would silently misdate an audit record. Domain
+times (`started_at`, `signal_timestamp`, `event_timestamp`, `updated_at`) are
+supplied by the caller; `created_at` is stamped by this module and records when
+the row was written.
+
+**Identifiers.** `INTEGER PRIMARY KEY` row ids. No UUID dependency. A row id is
+a local database identifier and must never be presented as a broker id.
+
+**SQL safety.** Every statement is a literal; every value is bound as a
+parameter. No SQL is ever built by string interpolation, and a test asserts
+that at the source level.
+
+**Tables.** Exactly six, and no others.
+
+| Table | Purpose | Invariants |
+| --- | --- | --- |
+| `schema_metadata` | Schema version marker | Exactly one row (`CHECK (id = 1)`) |
+| `strategy_runs` | One logical strategy session | `mode` is `BACKTEST` or `PAPER`; `status` is `RUNNING`, `COMPLETED`, or `FAILED`; `ended_at` NULL until the run ends; a run ends once, never before it started |
+| `signals` | Durable Phase 3 signals | `strategy_run_id` -> `strategy_runs.id`; `signal_type` is `BUY` or `EXIT`; unique on `(strategy_run_id, signal_timestamp, symbol, signal_type, reason)` |
+| `risk_events` | Risk-decision audit trail | `strategy_run_id` and `symbol` nullable; `decision` and `reason_code` opaque non-empty text |
+| `system_events` | General operational events | `event_type` non-empty; `message` nullable |
+| `positions` | Latest **local** position snapshot | `symbol` PRIMARY KEY; `quantity >= 0`; `average_price` NULL or `> 0` |
+
+**Signals are immutable facts.** A signal is stored exactly as Phase 3 produced
+it. `EXIT` is persisted as `EXIT` and is **never** rewritten as `SELL` - that
+translation is an execution decision, and the schema rejects `SELL` outright.
+No EMA is recomputed, no risk engine is consulted, and nothing is executed.
+Persistence is not orchestration.
+
+**Duplicate signal protection.** The same logical signal - same run, timestamp,
+symbol, type, and reason - cannot be stored twice; a repeat raises
+`DuplicateSignalError` rather than silently creating a second copy. This is a
+storage invariant only. The stable client-side order idempotency key required
+before any live trading (section 6E) is Phase 7's problem and is not attempted
+here.
+
+**Position invariants.** The system is long only (section 3), so `quantity`
+must be a non-negative whole number. This is enforced twice - in Python and as
+a SQLite `CHECK` constraint - so a write that bypassed the module still cannot
+store a short position. `average_price` is NULL, the natural value for a flat
+position, or a finite number greater than zero. No P&L is computed or stored.
+**Phase 6 never populates this table from a broker**: it is local state,
+nothing synchronizes it, and reconciling it against a broker's authoritative
+positions is Phase 8.
+
+**Read models.** Small frozen dataclasses - `StrategyRun`, `StoredSignal`,
+`RiskEvent`, `SystemEvent`, `Position` - rather than raw `sqlite3.Row` objects
+passed through the codebase. `StoredSignal` is named distinctly from
+`autotrader.strategies.Signal`: that one is a freshly computed observation,
+this one is a durable record of it. There is no ORM and no repository
+framework.
+
+**Auditability.** The schema supports asking, later, which strategy run
+produced a signal, when it was produced, what risk event occurred, what
+operational event occurred, and what local position snapshot was last stored.
+It does **not** yet support "what broker order resulted", because no broker
+order exists.
+
+**No tables are created for:** `broker_orders`, `fills`, `executions`,
+`broker_accounts`, or `reconciliation_runs`. Their semantics are defined by an
+external system this repository does not talk to yet. Adding them later,
+correctly, is better than guessing now.
+
+**No CLI.** Phase 6 adds no `db-init`, `db-shell`, or migration command.
+Initialization will be driven by application startup in a later phase.
+
+**Explicitly out of scope for Phase 6:** the risk engine (Phase 5), order
+models, order intents, broker orders, fills, executions, broker accounts,
+reconciliation, crash recovery, paper or live execution, any Alpaca call,
+trading loops or schedulers, migrations, connection pooling, an ORM, a
+database CLI, backup and restore tooling, database repair, monitoring, and
+deployment.
+
+**Done when:** the schema, invariants, and transaction behaviour above hold;
+initialization is idempotent and refuses an unsupported version; every test is
+offline and writes only to a temporary directory; and `pytest`, `ruff check .`,
+and `ruff format --check .` all pass.
 
 ### Later phases
 
