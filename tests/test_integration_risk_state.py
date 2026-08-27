@@ -1,9 +1,9 @@
-"""Integration tests: a Phase 5 risk decision persisted as a Phase 6 risk event.
+"""Integration tests: a risk decision persisted as a risk event.
 
-Phases 5 and 6 were built independently and stay that way. The risk engine is
-a pure calculator that has never heard of SQLite, and the state module stores
-`decision` and `reason_code` as opaque text rather than importing the risk
-engine's vocabulary. Nothing in `src/` joins them.
+The risk engine and the state module were built independently and stay that
+way. The risk engine is a pure calculator that has never heard of SQLite, and
+the state module stores `decision` and `reason_code` as opaque text rather than
+importing the risk engine's vocabulary. Nothing in `src/` joins them.
 
 That independence is only safe if the two contracts actually fit, so these
 tests do the joining themselves - exactly as a future orchestrator would:
@@ -16,7 +16,9 @@ Every test is offline and writes only into pytest's `tmp_path`.
 
 from __future__ import annotations
 
+import ast
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -64,7 +66,7 @@ def flat_account(*, trading_enabled: bool = True) -> RiskContext:
         cash=200_000.0,
         total_exposure=0.0,
         symbol_exposure=0.0,
-        current_position_quantity=0,
+        current_position_quantity=Decimal(0),
         daily_pnl=0.0,
         start_of_day_equity=200_000.0,
         trading_enabled=trading_enabled,
@@ -83,10 +85,10 @@ def test_risk_decision_round_trips_through_risk_events(
 ) -> None:
     """A decision, persisted explicitly, reads back with its meaning intact."""
     request = RiskRequest(
-        symbol="AAPL",
+        symbol="BTC/USD",
         side=RiskSide.BUY,
         reference_price=100.0,
-        requested_quantity=50,
+        requested_quantity=Decimal("0.05"),
     )
 
     decision = evaluate_risk(request, flat_account(trading_enabled=trading_enabled))
@@ -120,7 +122,7 @@ def test_every_reason_code_survives_storage(connection) -> None:
             event_timestamp=T0,
             decision=DECISION_APPROVED if code == APPROVED else DECISION_REJECTED,
             reason_code=code,
-            symbol="AAPL",
+            symbol="BTC/USD",
             message=f"case {index}",
         )
 
@@ -136,7 +138,10 @@ def test_evaluating_risk_writes_no_database(tmp_path: Path) -> None:
         for _ in range(3):
             evaluate_risk(
                 RiskRequest(
-                    symbol="AAPL", side=RiskSide.BUY, reference_price=100.0, requested_quantity=10
+                    symbol="BTC/USD",
+                    side=RiskSide.BUY,
+                    reference_price=100.0,
+                    requested_quantity=Decimal(10),
                 ),
                 flat_account(),
             )
@@ -151,7 +156,7 @@ def test_recording_a_risk_event_evaluates_nothing(connection) -> None:
         event_timestamp=T0,
         decision=DECISION_APPROVED,
         reason_code=TRADING_DISABLED,
-        symbol="AAPL",
+        symbol="BTC/USD",
         message="stored verbatim; the database does not second-guess it",
     )
 
@@ -160,13 +165,35 @@ def test_recording_a_risk_event_evaluates_nothing(connection) -> None:
     assert stored.reason_code == TRADING_DISABLED
 
 
+def code_without_prose(source: str) -> str:
+    """`source` with every docstring and comment removed.
+
+    The independence guarantee is about *code*. The risk engine's prose points
+    a reader at where the UTC-day baseline is persisted, which is documentation
+    of a boundary rather than a crossing of it.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            node.body = body[1:] or [ast.Pass()]
+    return ast.unparse(tree)
+
+
 def test_neither_package_imports_the_other() -> None:
     """The separation is structural, not merely conventional."""
     import autotrader.risk.engine as engine
     import autotrader.state.sqlite as state_sqlite
 
-    risk_source = Path(engine.__file__).read_text()
-    state_source = Path(state_sqlite.__file__).read_text()
+    risk_source = code_without_prose(Path(engine.__file__).read_text())
+    state_source = code_without_prose(Path(state_sqlite.__file__).read_text())
 
     assert "sqlite" not in risk_source.lower()
     assert "autotrader.state" not in risk_source

@@ -1,18 +1,23 @@
-"""Phase 7 schema tests: the v1 -> v2 migration and the two new tables.
+"""C6 schema tests: the v1 -> v2 -> v3 migration path and the order tables.
 
 Every test is offline and writes only into pytest's temporary directory. No
 credential is read and no socket is opened - this is the persistence layer,
 which has never talked to a broker and still does not.
 
-The migration is the risky part of this phase: it runs against a database that
-may already hold real operational history. These tests exist to prove it is
-additive, transactional, idempotent, and that it leaves Phase 6 data alone.
+The migration is the risky part of the pivot: it runs against a database that
+may already hold real operational history, and unlike the earlier additive step
+v3 has to *rebuild* three tables to widen their quantity columns from whole
+integers to exact decimal text. These tests exist to prove that rebuild is
+transactional, idempotent, schema-identical to a fresh database, and that it
+carries every existing row across unchanged - an integer `100` becoming the
+decimal `"100"`, and nothing else moving.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -23,6 +28,7 @@ from autotrader.state.sqlite import (
     REQUIRED_TABLES,
     SCHEMA_VERSION,
     V2_TABLES,
+    V3_TABLES,
     DatabaseStateError,
     DuplicateBrokerOrderError,
     DuplicateOrderIntentError,
@@ -31,8 +37,10 @@ from autotrader.state.sqlite import (
     UnknownStrategyRunError,
     UnsupportedSchemaVersionError,
     connect,
+    ensure_daily_risk_baseline,
     get_broker_order_by_client_id,
     get_broker_order_by_intent,
+    get_daily_risk_baseline,
     get_order_intent,
     get_order_intent_by_client_id,
     get_position,
@@ -40,6 +48,7 @@ from autotrader.state.sqlite import (
     get_strategy_run,
     initialize_database,
     list_broker_orders,
+    list_daily_risk_baselines,
     list_order_intents,
     list_risk_events,
     list_signals,
@@ -64,7 +73,7 @@ STEP = timedelta(minutes=15)
 
 
 def build_v1_database(path: Path) -> Path:
-    """Create a database exactly as Phase 6 would have left it.
+    """Create a database exactly as the v1 release would have left it.
 
     Uses the module's own retained v1 statements, so this fixture is the real
     historical shape rather than a hand-copied approximation of it.
@@ -79,8 +88,27 @@ def build_v1_database(path: Path) -> Path:
     return path
 
 
-def populate_phase_six_data(path: Path) -> dict[str, object]:
-    """Write one row into every Phase 6 table and describe what was written."""
+def build_v2_database(path: Path) -> Path:
+    """Create a database exactly as the v2 (equity) release would have left it."""
+    build_v1_database(path)
+    with connect(path) as connection, transaction(connection):
+        for statement in state._V2_SCHEMA_STATEMENTS:
+            connection.execute(statement)
+        connection.execute(state._UPDATE_SCHEMA_VERSION, (2,))
+    return path
+
+
+#: The pre-pivot equity rows a real v1/v2 database would hold. Written with raw
+#: SQL because the current Python API refuses both an integer-only quantity
+#: column and an equity ticker - which is the point: this is history, and the
+#: migration has to carry it forward without judging it.
+LEGACY_POSITION = ("SPY", 7, 101.5)
+LEGACY_INTENT = ("autotrader-legacy-1", "SPY", "BUY", 10, 3, 500.0)
+LEGACY_BROKER_ORDER = ("broker-legacy-1", "autotrader-legacy-1", "SPY", "BUY", 100, 25, 501.5)
+
+
+def populate_v1_data(path: Path) -> dict[str, object]:
+    """Write one row into every v1 table and describe what was written."""
     with connect(path) as connection:
         run_id = record_strategy_run(
             connection, strategy_name="EMA20/EMA50", mode="BACKTEST", started_at=T0
@@ -101,13 +129,71 @@ def populate_phase_six_data(path: Path) -> dict[str, object]:
             symbol="SPY",
             strategy_run_id=run_id,
         )
-        upsert_position(connection, symbol="SPY", quantity=7, average_price=101.5, updated_at=T0)
+        with transaction(connection):
+            connection.execute(
+                "INSERT INTO positions (symbol, quantity, average_price, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (*LEGACY_POSITION, state.to_utc_text(T0)),
+            )
     return {"run_id": run_id}
+
+
+def populate_v2_order_data(path: Path) -> None:
+    """Write one legacy integer-quantity order intent and broker order."""
+    stamp = state.to_utc_text(T0)
+    with connect(path) as connection, transaction(connection):
+        connection.execute(
+            "INSERT INTO order_intents (id, client_order_id, strategy_run_id, created_at, "
+            "symbol, side, requested_quantity, approved_quantity, reference_price, "
+            "risk_reason_code, status, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                LEGACY_INTENT[0],
+                None,
+                stamp,
+                LEGACY_INTENT[1],
+                LEGACY_INTENT[2],
+                LEGACY_INTENT[3],
+                LEGACY_INTENT[4],
+                LEGACY_INTENT[5],
+                "POSITION_LIMIT",
+                "SUBMITTED",
+                stamp,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO broker_orders (id, order_intent_id, broker_order_id, client_order_id, "
+            "symbol, side, quantity, filled_quantity, filled_average_price, status, "
+            "submitted_at, filled_at, updated_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                1,
+                1,
+                LEGACY_BROKER_ORDER[0],
+                LEGACY_BROKER_ORDER[1],
+                LEGACY_BROKER_ORDER[2],
+                LEGACY_BROKER_ORDER[3],
+                LEGACY_BROKER_ORDER[4],
+                LEGACY_BROKER_ORDER[5],
+                LEGACY_BROKER_ORDER[6],
+                "accepted",
+                stamp,
+                None,
+                stamp,
+                stamp,
+            ),
+        )
 
 
 @pytest.fixture
 def v1_database(tmp_path: Path) -> Path:
     return build_v1_database(tmp_path / "v1.db")
+
+
+@pytest.fixture
+def v2_database(tmp_path: Path) -> Path:
+    return build_v2_database(tmp_path / "v2.db")
 
 
 @pytest.fixture
@@ -128,11 +214,11 @@ def intent_id(connection: sqlite3.Connection) -> int:
         connection,
         client_order_id="autotrader-fixture-1",
         created_at=T0,
-        symbol="SPY",
+        symbol="BTC/USD",
         side="BUY",
-        requested_quantity=10,
-        approved_quantity=3,
-        reference_price=500.0,
+        requested_quantity=Decimal("0.01"),
+        approved_quantity=Decimal("0.0025"),
+        reference_price=104_000.0,
         risk_reason_code="POSITION_LIMIT",
     )
 
@@ -155,43 +241,59 @@ def schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]]
 # --------------------------------------------------------------------------
 
 
-def test_a_new_database_initializes_directly_at_version_two(database_path: Path) -> None:
-    """A fresh database is never created at v1 and then upgraded."""
+def test_a_new_database_initializes_directly_at_version_three(database_path: Path) -> None:
+    """A fresh database is never created at an older version and then upgraded."""
     with connect(database_path) as connection:
-        assert get_schema_version(connection) == 2
+        assert get_schema_version(connection) == SCHEMA_VERSION == 3
         assert set(REQUIRED_TABLES) <= table_names(connection)
+        assert set(V3_TABLES) <= table_names(connection)
 
 
-def test_version_one_database_migrates_to_version_two(v1_database: Path) -> None:
+def test_a_version_one_database_migrates_all_the_way_to_three(v1_database: Path) -> None:
     with connect(v1_database) as connection:
         assert get_schema_version(connection) == 1
-        assert not set(V2_TABLES) & table_names(connection)
+        assert not (set(V2_TABLES) | set(V3_TABLES)) & table_names(connection)
 
     initialize_database(v1_database)
 
     with connect(v1_database) as connection:
         assert get_schema_version(connection) == SCHEMA_VERSION
         assert set(V2_TABLES) <= table_names(connection)
+        assert set(V3_TABLES) <= table_names(connection)
 
 
-def test_migrated_schema_is_identical_to_a_freshly_created_one(
-    v1_database: Path, tmp_path: Path
-) -> None:
-    """ "Migrated to v2" and "created as v2" must be the same database.
+def test_a_version_two_database_migrates_to_three(v2_database: Path) -> None:
+    with connect(v2_database) as connection:
+        assert get_schema_version(connection) == 2
+        assert not set(V3_TABLES) & table_names(connection)
 
-    Both run the same statement list, so any drift between the two paths -
-    a column added to one and not the other - shows up here rather than as a
-    mysterious constraint failure months later.
+    initialize_database(v2_database)
+
+    with connect(v2_database) as connection:
+        assert get_schema_version(connection) == SCHEMA_VERSION
+        assert set(V3_TABLES) <= table_names(connection)
+
+
+@pytest.mark.parametrize("builder", [build_v1_database, build_v2_database])
+def test_a_migrated_schema_is_identical_to_a_freshly_created_one(tmp_path: Path, builder) -> None:
+    """ "Migrated to v3" and "created as v3" must be the same database.
+
+    Byte-identical, `sqlite_master.sql` included. v3 rebuilds three tables, and
+    the rebuild deliberately creates each one under its real name from the same
+    literal a fresh database uses - rather than renaming a temporary table into
+    place, which would leave SQLite's own quoting in the stored schema and make
+    the two paths quietly different.
     """
-    initialize_database(v1_database)
+    legacy = builder(tmp_path / "legacy.db")
+    initialize_database(legacy)
     fresh = initialize_database(tmp_path / "fresh.db")
 
-    with connect(v1_database) as migrated_connection, connect(fresh) as fresh_connection:
+    with connect(legacy) as migrated_connection, connect(fresh) as fresh_connection:
         assert schema_objects(migrated_connection) == schema_objects(fresh_connection)
 
 
-def test_existing_phase_six_data_survives_the_migration(v1_database: Path) -> None:
-    written = populate_phase_six_data(v1_database)
+def test_existing_v1_data_survives_the_migration(v1_database: Path) -> None:
+    written = populate_v1_data(v1_database)
 
     initialize_database(v1_database)
 
@@ -204,34 +306,172 @@ def test_existing_phase_six_data_survives_the_migration(v1_database: Path) -> No
 
         position = get_position(connection, "SPY")
         assert position is not None
-        assert position.quantity == 7
+        assert position.quantity == Decimal(7)
         assert position.average_price == 101.5
+        assert position.updated_at == T0
 
 
-def test_migration_is_idempotent(v1_database: Path) -> None:
-    populate_phase_six_data(v1_database)
-    initialize_database(v1_database)
+def test_legacy_integer_quantities_migrate_to_exact_decimals(v2_database: Path) -> None:
+    """`1` becomes `"1"` and `100` becomes `"100"` - the same number, written out.
 
-    with connect(v1_database) as connection:
+    Nothing is scaled, rounded, or given an invented precision, and no row is
+    dropped: ids, keys, prices, statuses, and timestamps all come through.
+    """
+    populate_v1_data(v2_database)
+    populate_v2_order_data(v2_database)
+
+    initialize_database(v2_database)
+
+    with connect(v2_database) as connection:
+        position = get_position(connection, "SPY")
+        assert position is not None
+        assert position.quantity == Decimal(7)
+        assert str(position.quantity) == "7"
+
+        [intent] = list_order_intents(connection)
+        assert intent.id == 1
+        assert intent.client_order_id == LEGACY_INTENT[0]
+        assert intent.requested_quantity == Decimal(10)
+        assert intent.approved_quantity == Decimal(3)
+        assert str(intent.requested_quantity) == "10"
+        assert str(intent.approved_quantity) == "3"
+        assert intent.reference_price == 500.0
+        assert intent.status == "SUBMITTED"
+        assert intent.created_at == T0
+
+        [order] = list_broker_orders(connection)
+        assert order.id == 1
+        assert order.order_intent_id == 1
+        assert order.broker_order_id == LEGACY_BROKER_ORDER[0]
+        assert order.quantity == Decimal(100)
+        assert order.filled_quantity == Decimal(25)
+        assert str(order.quantity) == "100"
+        assert str(order.filled_quantity) == "25"
+        assert order.filled_average_price == 501.5
+        assert order.status == "accepted"
+
+
+def test_migrated_quantities_are_stored_as_text_not_numbers(v2_database: Path) -> None:
+    populate_v1_data(v2_database)
+    populate_v2_order_data(v2_database)
+
+    initialize_database(v2_database)
+
+    with connect(v2_database) as connection:
+        assert connection.execute("SELECT typeof(quantity) FROM positions").fetchone()[0] == "text"
+        assert (
+            connection.execute("SELECT typeof(requested_quantity) FROM order_intents").fetchone()[0]
+            == "text"
+        )
+        assert (
+            connection.execute("SELECT typeof(filled_quantity) FROM broker_orders").fetchone()[0]
+            == "text"
+        )
+
+
+def test_the_foreign_key_from_a_migrated_broker_order_still_resolves(
+    v2_database: Path,
+) -> None:
+    """The rebuild drops and recreates both tables; the link must survive it."""
+    populate_v1_data(v2_database)
+    populate_v2_order_data(v2_database)
+
+    initialize_database(v2_database)
+
+    with connect(v2_database) as connection:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        order = get_broker_order_by_client_id(connection, LEGACY_INTENT[0])
+        assert order is not None
+        intent = get_order_intent(connection, order.order_intent_id)
+        assert intent is not None and intent.client_order_id == LEGACY_INTENT[0]
+
+
+def test_a_fractional_quantity_round_trips_after_the_migration(v2_database: Path) -> None:
+    """The reason for the whole rebuild: 0.0001 BTC is now storable."""
+    initialize_database(v2_database)
+
+    with connect(v2_database) as connection:
+        upsert_position(connection, symbol="BTC/USD", quantity=Decimal("0.00012345"), updated_at=T0)
+        intent = record_order_intent(
+            connection,
+            client_order_id="autotrader-post-migration",
+            created_at=T0,
+            symbol="BTC/USD",
+            side="BUY",
+            requested_quantity=Decimal("0.01"),
+            approved_quantity=Decimal("0.000123456789012345"),
+            reference_price=104_000.0,
+            risk_reason_code="POSITION_LIMIT",
+        )
+        upsert_broker_order(
+            connection,
+            order_intent_id=intent,
+            broker_order_id="broker-post-migration",
+            client_order_id="autotrader-post-migration",
+            symbol="BTC/USD",
+            side="BUY",
+            quantity=Decimal("0.000123456789012345"),
+            filled_quantity=Decimal("0.000000000000000001"),
+            status="accepted",
+            updated_at=T0,
+        )
+
+        position = get_position(connection, "BTC/USD")
+        assert position is not None and position.quantity == Decimal("0.00012345")
+        stored_intent = get_order_intent(connection, intent)
+        assert stored_intent is not None
+        assert stored_intent.approved_quantity == Decimal("0.000123456789012345")
+        order = get_broker_order_by_intent(connection, intent)
+        assert order is not None
+        assert order.quantity == Decimal("0.000123456789012345")
+        assert order.filled_quantity == Decimal("0.000000000000000001")
+
+
+def test_the_daily_risk_baseline_table_arrives_with_v3(v2_database: Path) -> None:
+    initialize_database(v2_database)
+
+    with connect(v2_database) as connection:
+        assert "daily_risk_baselines" in table_names(connection)
+        assert list_daily_risk_baselines(connection) == []
+        ensure_daily_risk_baseline(
+            connection,
+            risk_date_utc=date(2025, 1, 2),
+            baseline_equity=Decimal("100000"),
+            captured_at=T0,
+        )
+        stored = get_daily_risk_baseline(connection, date(2025, 1, 2))
+        assert stored is not None and stored.baseline_equity == Decimal("100000")
+
+
+@pytest.mark.parametrize("builder", [build_v1_database, build_v2_database])
+def test_migration_is_idempotent(tmp_path: Path, builder) -> None:
+    legacy = builder(tmp_path / "legacy.db")
+    populate_v1_data(legacy)
+    initialize_database(legacy)
+
+    with connect(legacy) as connection:
         before = schema_objects(connection)
+        before_position = get_position(connection, "SPY")
 
-    initialize_database(v1_database)
-    initialize_database(v1_database)
+    initialize_database(legacy)
+    initialize_database(legacy)
 
-    with connect(v1_database) as connection:
+    with connect(legacy) as connection:
         assert schema_objects(connection) == before
         assert get_schema_version(connection) == SCHEMA_VERSION
         assert len(list_strategy_runs(connection)) == 1
+        assert get_position(connection, "SPY") == before_position
 
 
-def test_a_failed_migration_rolls_back_completely(v1_database: Path) -> None:
+def test_a_failed_v1_to_v2_migration_rolls_back_completely(v1_database: Path) -> None:
     """A conflicting table must leave the database untouched on v1.
 
     SQLite DDL is transactional, so a migration that fails part-way must not
     leave one new table behind, a bumped version marker, or any other
     half-applied state.
     """
-    populate_phase_six_data(v1_database)
+    populate_v1_data(v1_database)
     with connect(v1_database) as connection, transaction(connection):
         # Occupies one of the names the migration is about to create.
         connection.execute("CREATE TABLE broker_orders (surprise TEXT)")
@@ -244,9 +484,115 @@ def test_a_failed_migration_rolls_back_completely(v1_database: Path) -> None:
     with connect(v1_database) as connection:
         assert get_schema_version(connection) == MIN_MIGRATABLE_SCHEMA_VERSION
         assert "order_intents" not in table_names(connection)
-        # The pre-existing table and the Phase 6 rows are both untouched.
+        assert "daily_risk_baselines" not in table_names(connection)
+        # The pre-existing table and the v1 rows are both untouched.
         assert connection.execute("SELECT surprise FROM broker_orders").fetchall() == []
         assert len(list_strategy_runs(connection)) == 1
+
+
+def test_a_failed_v2_to_v3_migration_rolls_back_completely(v2_database: Path) -> None:
+    """The rebuild is the risky step, so its rollback is tested on its own.
+
+    A conflicting `daily_risk_baselines` table makes v3 refuse *before* any
+    table is renamed. The database must still be a working v2 afterwards, with
+    every row and the original integer-quantity schema intact.
+    """
+    populate_v1_data(v2_database)
+    populate_v2_order_data(v2_database)
+    with connect(v2_database) as connection, transaction(connection):
+        connection.execute("CREATE TABLE daily_risk_baselines (surprise TEXT)")
+
+    with pytest.raises(DatabaseStateError) as error:
+        initialize_database(v2_database)
+
+    assert "daily_risk_baselines" in str(error.value)
+
+    with connect(v2_database) as connection:
+        assert get_schema_version(connection) == 2
+        assert not set(state._PRE_V3_TABLES) & table_names(connection)
+        # Untouched: still the integer-quantity v2 shape, with its rows.
+        assert connection.execute("SELECT typeof(quantity) FROM positions").fetchone()[0] == (
+            "integer"
+        )
+        assert connection.execute("SELECT COUNT(*) FROM order_intents").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM broker_orders").fetchone()[0] == 1
+        assert len(list_strategy_runs(connection)) == 1
+        assert connection.execute("SELECT surprise FROM daily_risk_baselines").fetchall() == []
+
+
+def test_a_migration_that_fails_mid_rebuild_rolls_back(
+    v2_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Injected failure *after* the tables have been renamed aside.
+
+    This is the state a partial migration would be most damaging in: the old
+    tables renamed, the new ones created, the rows half-copied. SQLite's
+    transactional DDL must undo all of it.
+    """
+    populate_v1_data(v2_database)
+    populate_v2_order_data(v2_database)
+
+    def explode(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("injected failure during the rebuild")
+
+    monkeypatch.setattr(state, "_legacy_quantity_text", explode)
+
+    with pytest.raises(RuntimeError):
+        initialize_database(v2_database)
+
+    with connect(v2_database) as connection:
+        assert get_schema_version(connection) == 2
+        assert not set(state._PRE_V3_TABLES) & table_names(connection)
+        assert "daily_risk_baselines" not in table_names(connection)
+        assert connection.execute("SELECT typeof(quantity) FROM positions").fetchone()[0] == (
+            "integer"
+        )
+        assert connection.execute("SELECT COUNT(*) FROM broker_orders").fetchone()[0] == 1
+
+
+def test_foreign_keys_are_restored_after_a_failed_migration(
+    v2_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rebuild suspends referential enforcement; a failure must not leave it off."""
+
+    def explode(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("injected failure during the rebuild")
+
+    monkeypatch.setattr(state, "_legacy_quantity_text", explode)
+    populate_v1_data(v2_database)
+    populate_v2_order_data(v2_database)
+
+    with pytest.raises(RuntimeError):
+        initialize_database(v2_database)
+
+    with connect(v2_database) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_a_migration_that_would_break_a_reference_is_refused(
+    v2_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Referential integrity is re-checked before the migration commits."""
+    populate_v1_data(v2_database)
+    populate_v2_order_data(v2_database)
+
+    real_migrate = state._migrate_v2_to_v3
+
+    def migrate_then_orphan(connection: sqlite3.Connection) -> None:
+        real_migrate(connection)
+        connection.execute("DELETE FROM order_intents")
+
+    monkeypatch.setattr(
+        state, "_MIGRATIONS", ((2, state._migrate_v1_to_v2), (3, migrate_then_orphan))
+    )
+
+    with pytest.raises(DatabaseStateError) as error:
+        initialize_database(v2_database)
+    assert "foreign-key" in str(error.value)
+
+    with connect(v2_database) as connection:
+        assert get_schema_version(connection) == 2
+        assert connection.execute("SELECT COUNT(*) FROM order_intents").fetchone()[0] == 1
 
 
 def test_a_newer_schema_version_is_still_refused_and_left_alone(database_path: Path) -> None:
@@ -268,24 +614,32 @@ def test_a_version_below_the_migration_path_is_refused(v1_database: Path) -> Non
         initialize_database(v1_database)
 
 
-def test_migration_does_not_drop_or_recreate_a_phase_six_object(v1_database: Path) -> None:
-    """Every v1 object must come through byte-identical, not rebuilt.
+def test_the_migration_rebuilds_only_the_tables_that_hold_quantities(
+    v2_database: Path,
+) -> None:
+    """Every other v1/v2 object must come through byte-identical.
 
-    Checked as a subset rather than an equality: the migration is allowed to
-    *add* objects, and only forbidden to change or remove one that was already
-    there. A dropped-and-recreated table would show up as a missing key or a
-    differing `sql`.
+    A rebuild is a real cost - it drops and recreates a table - so it is spent
+    only where it buys something: the three tables whose quantity columns
+    cannot express a fractional coin. Everything else is left exactly alone,
+    and this asserts that rather than trusting it.
     """
-    with connect(v1_database) as connection:
+    rebuilt = {"positions", "order_intents", "broker_orders"}
+
+    with connect(v2_database) as connection:
         before = {name: sql for _type, name, sql in schema_objects(connection)}
 
-    initialize_database(v1_database)
+    initialize_database(v2_database)
 
-    with connect(v1_database) as connection:
+    with connect(v2_database) as connection:
         after = {name: sql for _type, name, sql in schema_objects(connection)}
 
-    assert before.items() <= after.items()
-    assert set(after) - set(before), "the migration should have added something"
+    untouched = {name: sql for name, sql in before.items() if name not in rebuilt}
+    assert untouched.items() <= after.items()
+    for name in rebuilt:
+        assert after[name] != before[name], name
+        assert "TEXT" in after[name]
+    assert "daily_risk_baselines" in after
 
 
 # --------------------------------------------------------------------------
@@ -313,11 +667,11 @@ def test_an_order_intent_round_trips(connection: sqlite3.Connection, intent_id: 
     stored = get_order_intent(connection, intent_id)
     assert stored is not None
     assert stored.client_order_id == "autotrader-fixture-1"
-    assert stored.symbol == "SPY"
+    assert stored.symbol == "BTC/USD"
     assert stored.side == "BUY"
-    assert stored.requested_quantity == 10
-    assert stored.approved_quantity == 3
-    assert stored.reference_price == 500.0
+    assert stored.requested_quantity == Decimal("0.01")
+    assert stored.approved_quantity == Decimal("0.0025")
+    assert stored.reference_price == 104_000.0
     assert stored.risk_reason_code == "POSITION_LIMIT"
     assert stored.status == state.INTENT_STATUS_CREATED
     assert stored.created_at == T0
@@ -341,10 +695,10 @@ def test_a_duplicate_client_order_id_is_rejected(
             connection,
             client_order_id="autotrader-fixture-1",
             created_at=T0,
-            symbol="QQQ",
+            symbol="ETH/USD",
             side="SELL",
-            requested_quantity=1,
-            approved_quantity=1,
+            requested_quantity=Decimal(1),
+            approved_quantity=Decimal(1),
             reference_price=400.0,
             risk_reason_code="APPROVED",
         )
@@ -360,7 +714,7 @@ def test_approved_quantity_may_not_exceed_requested_quantity(
             connection,
             client_order_id="autotrader-oversized",
             created_at=T0,
-            symbol="SPY",
+            symbol="BTC/USD",
             side="BUY",
             requested_quantity=1,
             approved_quantity=2,
@@ -378,35 +732,75 @@ def test_the_database_itself_rejects_an_over_approved_intent(
             "INSERT INTO order_intents (client_order_id, created_at, symbol, side, "
             "requested_quantity, approved_quantity, reference_price, risk_reason_code, "
             "status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("raw-1", "t", "SPY", "BUY", 1, 5, 100.0, "APPROVED", "CREATED", "t"),
+            ("raw-1", "t", "BTC/USD", "BUY", "1", "5", 100.0, "APPROVED", "CREATED", "t"),
         )
 
 
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("requested_quantity", 0),
-        ("requested_quantity", -1),
-        ("approved_quantity", 0),
-        ("approved_quantity", -3),
+        ("requested_quantity", Decimal(0)),
+        ("requested_quantity", Decimal(-1)),
+        ("requested_quantity", Decimal("-0.0001")),
+        ("approved_quantity", Decimal(0)),
+        ("approved_quantity", Decimal("-0.0003")),
+        ("requested_quantity", 0.5),
+        ("approved_quantity", 0.5),
+        ("approved_quantity", Decimal("NaN")),
     ],
 )
-def test_non_positive_quantities_are_rejected(
-    connection: sqlite3.Connection, field: str, value: int
+def test_an_unusable_quantity_is_rejected(
+    connection: sqlite3.Connection, field: str, value: object
 ) -> None:
+    """Zero, negative, non-finite, and float quantities are all refused."""
     payload = {
         "client_order_id": f"autotrader-{field}-{value}",
         "created_at": T0,
-        "symbol": "SPY",
+        "symbol": "BTC/USD",
         "side": "BUY",
-        "requested_quantity": 5,
-        "approved_quantity": 5,
+        "requested_quantity": Decimal(5),
+        "approved_quantity": Decimal(5),
         "reference_price": 500.0,
         "risk_reason_code": "APPROVED",
         field: value,
     }
     with pytest.raises(StateInputError):
         record_order_intent(connection, **payload)
+
+
+def test_a_fractional_intent_quantity_round_trips_exactly(
+    connection: sqlite3.Connection,
+) -> None:
+    intent = record_order_intent(
+        connection,
+        client_order_id="autotrader-fractional",
+        created_at=T0,
+        symbol="BTC/USD",
+        side="BUY",
+        requested_quantity=Decimal("0.5"),
+        approved_quantity=Decimal("0.000123456789012345"),
+        reference_price=104_000.0,
+        risk_reason_code="POSITION_LIMIT",
+    )
+
+    stored = get_order_intent(connection, intent)
+    assert stored is not None
+    assert stored.requested_quantity == Decimal("0.5")
+    assert stored.approved_quantity == Decimal("0.000123456789012345")
+    assert isinstance(stored.approved_quantity, Decimal)
+
+
+def test_the_database_rejects_a_fractionally_over_approved_intent(
+    connection: sqlite3.Connection,
+) -> None:
+    """The CHECK compares numerically, so a fractional overshoot is caught too."""
+    with pytest.raises(sqlite3.IntegrityError), transaction(connection):
+        connection.execute(
+            "INSERT INTO order_intents (client_order_id, created_at, symbol, side, "
+            "requested_quantity, approved_quantity, reference_price, risk_reason_code, "
+            "status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("raw-2", "t", "BTC/USD", "BUY", "0.001", "0.002", 100.0, "APPROVED", "CREATED", "t"),
+        )
 
 
 @pytest.mark.parametrize("price", [0.0, -1.0, float("nan"), float("inf")])
@@ -418,10 +812,10 @@ def test_an_unusable_reference_price_is_rejected(
             connection,
             client_order_id=f"autotrader-price-{price}",
             created_at=T0,
-            symbol="SPY",
+            symbol="BTC/USD",
             side="BUY",
-            requested_quantity=1,
-            approved_quantity=1,
+            requested_quantity=Decimal(1),
+            approved_quantity=Decimal(1),
             reference_price=price,
             risk_reason_code="APPROVED",
         )
@@ -434,10 +828,10 @@ def test_only_buy_and_sell_are_storable_sides(connection: sqlite3.Connection, si
             connection,
             client_order_id=f"autotrader-side-{side}",
             created_at=T0,
-            symbol="SPY",
+            symbol="BTC/USD",
             side=side,
-            requested_quantity=1,
-            approved_quantity=1,
+            requested_quantity=Decimal(1),
+            approved_quantity=Decimal(1),
             reference_price=500.0,
             risk_reason_code="APPROVED",
         )
@@ -449,10 +843,10 @@ def test_an_unsupported_status_is_rejected(connection: sqlite3.Connection) -> No
             connection,
             client_order_id="autotrader-status",
             created_at=T0,
-            symbol="SPY",
+            symbol="BTC/USD",
             side="BUY",
-            requested_quantity=1,
-            approved_quantity=1,
+            requested_quantity=Decimal(1),
+            approved_quantity=Decimal(1),
             reference_price=500.0,
             risk_reason_code="APPROVED",
             status="FILLED",
@@ -467,10 +861,10 @@ def test_an_intent_may_reference_a_strategy_run(connection: sqlite3.Connection) 
         connection,
         client_order_id="autotrader-with-run",
         created_at=T0,
-        symbol="SPY",
+        symbol="BTC/USD",
         side="BUY",
-        requested_quantity=1,
-        approved_quantity=1,
+        requested_quantity=Decimal(1),
+        approved_quantity=Decimal(1),
         reference_price=500.0,
         risk_reason_code="APPROVED",
         strategy_run_id=run_id,
@@ -485,10 +879,10 @@ def test_an_unknown_strategy_run_is_rejected(connection: sqlite3.Connection) -> 
             connection,
             client_order_id="autotrader-bad-run",
             created_at=T0,
-            symbol="SPY",
+            symbol="BTC/USD",
             side="BUY",
-            requested_quantity=1,
-            approved_quantity=1,
+            requested_quantity=Decimal(1),
+            approved_quantity=Decimal(1),
             reference_price=500.0,
             risk_reason_code="APPROVED",
             strategy_run_id=9999,
@@ -533,9 +927,9 @@ def store_broker_order(connection: sqlite3.Connection, intent_id: int, **overrid
         "order_intent_id": intent_id,
         "broker_order_id": "broker-1",
         "client_order_id": "autotrader-fixture-1",
-        "symbol": "SPY",
+        "symbol": "BTC/USD",
         "side": "BUY",
-        "quantity": 3,
+        "quantity": Decimal("0.0025"),
         "status": "accepted",
         "updated_at": T0,
         "submitted_at": T0,
@@ -551,7 +945,7 @@ def test_a_broker_order_round_trips(connection: sqlite3.Connection, intent_id: i
     assert stored is not None
     assert stored.broker_order_id == "broker-1"
     assert stored.client_order_id == "autotrader-fixture-1"
-    assert stored.quantity == 3
+    assert stored.quantity == Decimal("0.0025")
     assert stored.filled_quantity == 0
     assert stored.filled_average_price is None
     assert stored.status == "accepted"
@@ -576,7 +970,7 @@ def test_re_reading_the_same_broker_order_updates_the_snapshot(
         connection,
         intent_id,
         status="filled",
-        filled_quantity=3,
+        filled_quantity=Decimal("0.0025"),
         filled_average_price=501.25,
         filled_at=T0 + STEP,
         updated_at=T0 + STEP,
@@ -585,7 +979,7 @@ def test_re_reading_the_same_broker_order_updates_the_snapshot(
     orders = list_broker_orders(connection)
     assert len(orders) == 1
     assert orders[0].status == "filled"
-    assert orders[0].filled_quantity == 3
+    assert orders[0].filled_quantity == Decimal("0.0025")
     assert orders[0].filled_average_price == 501.25
 
 
@@ -608,10 +1002,10 @@ def test_broker_order_id_is_unique_across_intents(
         connection,
         client_order_id="autotrader-fixture-2",
         created_at=T0,
-        symbol="QQQ",
+        symbol="ETH/USD",
         side="BUY",
-        requested_quantity=1,
-        approved_quantity=1,
+        requested_quantity=Decimal(1),
+        approved_quantity=Decimal(1),
         reference_price=400.0,
         risk_reason_code="APPROVED",
     )
@@ -630,10 +1024,10 @@ def test_client_order_id_is_unique_across_broker_orders(
         connection,
         client_order_id="autotrader-fixture-3",
         created_at=T0,
-        symbol="QQQ",
+        symbol="ETH/USD",
         side="BUY",
-        requested_quantity=1,
-        approved_quantity=1,
+        requested_quantity=Decimal(1),
+        approved_quantity=Decimal(1),
         reference_price=400.0,
         risk_reason_code="APPROVED",
     )
@@ -660,19 +1054,41 @@ def test_a_broker_order_snapshot_defaults_to_unfilled(
     assert stored.filled_average_price is None
 
 
-@pytest.mark.parametrize("quantity", [0, -1])
-def test_a_broker_order_quantity_must_be_positive(
-    connection: sqlite3.Connection, intent_id: int, quantity: int
+@pytest.mark.parametrize(
+    "quantity", [Decimal(0), Decimal(-1), Decimal("-0.0001"), 0.5, Decimal("NaN")]
+)
+def test_a_broker_order_quantity_must_be_a_positive_decimal(
+    connection: sqlite3.Connection, intent_id: int, quantity: object
 ) -> None:
     with pytest.raises(StateInputError):
         store_broker_order(connection, intent_id, quantity=quantity)
 
 
-def test_a_negative_filled_quantity_is_rejected(
-    connection: sqlite3.Connection, intent_id: int
+@pytest.mark.parametrize("filled", [Decimal(-1), Decimal("-0.0000001"), 0.5])
+def test_an_unusable_filled_quantity_is_rejected(
+    connection: sqlite3.Connection, intent_id: int, filled: object
 ) -> None:
     with pytest.raises(StateInputError):
-        store_broker_order(connection, intent_id, filled_quantity=-1)
+        store_broker_order(connection, intent_id, filled_quantity=filled)
+
+
+def test_a_fractional_broker_fill_round_trips_exactly(
+    connection: sqlite3.Connection, intent_id: int
+) -> None:
+    store_broker_order(
+        connection,
+        intent_id,
+        quantity=Decimal("0.000123456789012345"),
+        filled_quantity=Decimal("0.000000000000000001"),
+        filled_average_price=104_123.45,
+        status="filled",
+    )
+
+    stored = get_broker_order_by_intent(connection, intent_id)
+    assert stored is not None
+    assert stored.quantity == Decimal("0.000123456789012345")
+    assert stored.filled_quantity == Decimal("0.000000000000000001")
+    assert isinstance(stored.filled_quantity, Decimal)
 
 
 def test_an_empty_broker_status_is_rejected(connection: sqlite3.Connection, intent_id: int) -> None:
@@ -717,10 +1133,10 @@ def test_the_state_module_needs_no_credentials(
         connection,
         client_order_id="autotrader-no-creds",
         created_at=T0,
-        symbol="SPY",
+        symbol="BTC/USD",
         side="BUY",
-        requested_quantity=1,
-        approved_quantity=1,
+        requested_quantity=Decimal(1),
+        approved_quantity=Decimal(1),
         reference_price=500.0,
         risk_reason_code="APPROVED",
     )

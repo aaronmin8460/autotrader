@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autotrader"
-description = "Personal automated trading system (US equities, Alpaca paper trading)."
+description = "Personal automated 24/7 crypto trading system (BTC/USD + ETH/USD, Alpaca paper trading)."
 readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["version"]

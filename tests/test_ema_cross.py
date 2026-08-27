@@ -1,13 +1,19 @@
-"""Phase 3 tests: EMA 20 / EMA 50 crossover signal generation.
+"""C3 tests: EMA 20 / EMA 50 crossover signal generation.
 
 Every test is offline and needs no credentials. Prices are deterministic
 synthetic series, and the expected crossovers are derived from an independent
 reference EMA implemented here in plain Python - the tests assert the intended
 crossing semantics rather than snapshotting whatever the module returns.
+
+The crypto pivot changed nothing in this module, which is exactly what these
+tests exist to prove: the same crossover semantics, now exercised against the
+`BTC/USD` and `ETH/USD` pair symbols. A symbol containing a slash is just a
+string here, and a test below pins that.
 """
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import inspect
 import socket
@@ -45,7 +51,7 @@ _FLOAT_COLUMNS = ("open", "high", "low", "close", "volume", "trade_count", "vwap
 
 def make_bars(
     closes: list[float],
-    symbol: str = "SPY",
+    symbol: str = "BTC/USD",
     start: datetime = FIRST_BAR,
 ) -> pd.DataFrame:
     """Build a canonical bar frame whose closes are exactly `closes`."""
@@ -150,17 +156,17 @@ def test_signal_type_has_exactly_buy_and_exit() -> None:
 
 def test_signal_is_frozen_and_compares_by_value() -> None:
     timestamp = pd.Timestamp(FIRST_BAR)
-    signal = Signal(timestamp=timestamp, symbol="SPY", type=SignalType.BUY, reason=BUY_REASON)
+    signal = Signal(timestamp=timestamp, symbol="BTC/USD", type=SignalType.BUY, reason=BUY_REASON)
 
     assert signal.timestamp == timestamp
-    assert signal.symbol == "SPY"
+    assert signal.symbol == "BTC/USD"
     assert signal.type is SignalType.BUY
     assert signal.reason == BUY_REASON
     assert signal == Signal(
-        timestamp=timestamp, symbol="SPY", type=SignalType.BUY, reason=BUY_REASON
+        timestamp=timestamp, symbol="BTC/USD", type=SignalType.BUY, reason=BUY_REASON
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
-        signal.symbol = "QQQ"  # type: ignore[misc]
+        signal.symbol = "ETH/USD"  # type: ignore[misc]
 
 
 def test_signal_carries_no_price_or_execution_fields() -> None:
@@ -192,9 +198,9 @@ def test_empty_bars_produce_no_signals() -> None:
 
 
 def test_multiple_symbols_are_rejected() -> None:
-    spy = make_bars(level(60, 100.0), symbol="SPY")
-    qqq = make_bars(level(60, 100.0), symbol="QQQ", start=FIRST_BAR + STEP * 60)
-    bars = pd.concat([spy, qqq], ignore_index=True)
+    btc = make_bars(level(60, 100.0), symbol="BTC/USD")
+    eth = make_bars(level(60, 100.0), symbol="ETH/USD", start=FIRST_BAR + STEP * 60)
+    bars = pd.concat([btc, eth], ignore_index=True)
 
     # Timestamps stay ascending, so only the symbol rule is violated.
     assert bars["timestamp"].is_monotonic_increasing
@@ -202,7 +208,7 @@ def test_multiple_symbols_are_rejected() -> None:
         generate_ema_cross_signals(bars)
     message = str(excinfo.value)
     assert "exactly one symbol" in message
-    assert "QQQ" in message and "SPY" in message
+    assert "ETH/USD" in message and "BTC/USD" in message
 
 
 def test_unsorted_timestamps_are_rejected() -> None:
@@ -309,7 +315,7 @@ def test_buy_is_emitted_on_the_bar_the_fast_ema_crosses_above() -> None:
     assert len(signals) == 1
     signal = signals[0]
     assert signal.type is SignalType.BUY
-    assert signal.symbol == "SPY"
+    assert signal.symbol == "BTC/USD"
     assert signal.reason == BUY_REASON
 
     # The rally begins at index 60; that is the first bar whose close can move
@@ -440,6 +446,54 @@ def test_signal_generation_needs_no_alpaca_credentials(monkeypatch: pytest.Monke
     monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
 
     assert generate_ema_cross_signals(make_bars(RALLY_THEN_SELLOFF))
+
+
+def test_both_crypto_pairs_produce_identical_semantics() -> None:
+    """The strategy is symbol-agnostic: same prices, same signals, either pair.
+
+    Not a tautology worth skipping - a symbol containing a slash is exactly the
+    kind of thing that breaks string handling somewhere unexpected, and this is
+    the test that would catch it.
+    """
+    btc = generate_ema_cross_signals(make_bars(MULTI_CYCLE, symbol="BTC/USD"))
+    eth = generate_ema_cross_signals(make_bars(MULTI_CYCLE, symbol="ETH/USD"))
+
+    assert [signal.symbol for signal in btc] == ["BTC/USD"] * len(btc)
+    assert [signal.symbol for signal in eth] == ["ETH/USD"] * len(eth)
+    assert [(signal.timestamp, signal.type, signal.reason) for signal in btc] == [
+        (signal.timestamp, signal.type, signal.reason) for signal in eth
+    ]
+    assert len(btc) > 1
+
+
+def test_a_slash_in_the_symbol_is_carried_through_verbatim() -> None:
+    """`BTC/USD` is never rewritten as `BTCUSD` or split on the slash."""
+    signals = generate_ema_cross_signals(make_bars(RALLY, symbol="BTC/USD"))
+    assert signals
+    for signal in signals:
+        assert signal.symbol == "BTC/USD"
+
+
+def test_no_crypto_specific_indicator_was_added() -> None:
+    """The pivot added no second indicator and no parameter search.
+
+    Asserted structurally rather than by scanning prose: the module defines
+    exactly these functions, so an RSI, a MACD, a sentiment score, or a
+    parameter sweep could not appear without failing here.
+    """
+    tree = ast.parse(inspect.getsource(ema_cross))
+    defined = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert defined == {
+        "_require_columns",
+        "_require_single_symbol",
+        "_require_ascending_timestamps",
+        "_ema",
+        "add_ema_columns",
+        "generate_ema_cross_signals",
+    }
+    assert FAST_PERIOD == 20
+    assert SLOW_PERIOD == 50
+    assert [member.value for member in SignalType] == ["BUY", "EXIT"]
 
 
 def test_strategy_module_imports_no_broker_client() -> None:

@@ -1,13 +1,15 @@
-"""Phase 6 tests: the local SQLite operational-state foundation.
+"""C6 tests: the local SQLite operational-state store at schema v3.
 
 Every test is offline, needs no credentials, and writes only into pytest's
 `tmp_path`. No test creates or touches a real persistent database.
 
-Two groups matter most. The **transaction** tests prove that a failure part
+Three groups matter most. The **transaction** tests prove that a failure part
 way through a multi-write unit of work leaves nothing behind - verified from a
 second connection, so a rollback that only cleared an in-process cache would
-still fail. The **scope** tests assert what this module is *not*: no broker
-table exists, no non-stdlib module is imported, and no socket is opened.
+still fail. The **decimal** tests prove that a fractional crypto quantity comes
+back out exactly as it went in, with no float rounding anywhere in between. The
+**scope** tests assert what this module is *not*: no broker table exists, no
+non-stdlib module is imported, and no socket is opened.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ import dataclasses
 import socket
 import sqlite3
 import sys
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -32,6 +35,7 @@ from autotrader.state.sqlite import (
     RUN_STATUS_FAILED,
     RUN_STATUS_RUNNING,
     SCHEMA_VERSION,
+    DailyRiskBaseline,
     DatabaseStateError,
     DuplicateSignalError,
     Position,
@@ -41,12 +45,16 @@ from autotrader.state.sqlite import (
     UnknownStrategyRunError,
     UnsupportedSchemaVersionError,
     connect,
+    ensure_daily_risk_baseline,
     finish_strategy_run,
+    from_decimal_text,
     from_utc_text,
+    get_daily_risk_baseline,
     get_position,
     get_schema_version,
     get_strategy_run,
     initialize_database,
+    list_daily_risk_baselines,
     list_positions,
     list_risk_events,
     list_signals,
@@ -56,18 +64,20 @@ from autotrader.state.sqlite import (
     record_signal,
     record_strategy_run,
     record_system_event,
+    to_decimal_text,
     to_utc_text,
     transaction,
     upsert_position,
+    utc_risk_date,
 )
 
 T0 = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
 STEP = timedelta(minutes=15)
 
 #: Tables whose semantics belong to a part of the broker relationship this
-#: repository still does not model. Phase 7 earned `order_intents` and
-#: `broker_orders` by actually reading the broker's vocabulary; these remain
-#: Phase 8's, and guessing them now would be worse than waiting.
+#: repository still does not model. `order_intents` and `broker_orders` were
+#: earned by actually reading the broker's vocabulary; these remain Phase 8's,
+#: and guessing them now would be worse than waiting.
 FORBIDDEN_BROKER_TABLES = (
     "fills",
     "executions",
@@ -125,9 +135,11 @@ def test_initialize_database_creates_the_file(tmp_path: Path) -> None:
     assert path.is_file()
 
 
-def test_schema_version_is_two(connection: sqlite3.Connection) -> None:
-    assert SCHEMA_VERSION == 2
-    assert get_schema_version(connection) == 2
+def test_a_fresh_database_initializes_directly_at_version_three(
+    connection: sqlite3.Connection,
+) -> None:
+    assert SCHEMA_VERSION == 3
+    assert get_schema_version(connection) == 3
 
 
 def test_initialization_is_idempotent(tmp_path: Path) -> None:
@@ -371,7 +383,7 @@ def test_signal_insert_round_trips(connection: sqlite3.Connection) -> None:
         connection,
         strategy_run_id=run_id,
         signal_timestamp=T0 + STEP,
-        symbol="SPY",
+        symbol="BTC/USD",
         signal_type="BUY",
         reason="EMA20_CROSS_ABOVE_EMA50",
     )
@@ -382,7 +394,7 @@ def test_signal_insert_round_trips(connection: sqlite3.Connection) -> None:
         id=signal_id,
         strategy_run_id=run_id,
         signal_timestamp=T0 + STEP,
-        symbol="SPY",
+        symbol="BTC/USD",
         signal_type="BUY",
         reason="EMA20_CROSS_ABOVE_EMA50",
         created_at=stored[0].created_at,
@@ -398,7 +410,7 @@ def test_signal_links_to_its_strategy_run(connection: sqlite3.Connection) -> Non
         connection,
         strategy_run_id=first_run,
         signal_timestamp=T0 + STEP,
-        symbol="SPY",
+        symbol="BTC/USD",
         signal_type="BUY",
         reason="EMA20_CROSS_ABOVE_EMA50",
     )
@@ -406,14 +418,14 @@ def test_signal_links_to_its_strategy_run(connection: sqlite3.Connection) -> Non
         connection,
         strategy_run_id=second_run,
         signal_timestamp=T0 + STEP,
-        symbol="QQQ",
+        symbol="ETH/USD",
         signal_type="EXIT",
         reason="EMA20_CROSS_BELOW_EMA50",
     )
 
     # "Which strategy run produced this signal?" must be answerable.
-    assert [s.symbol for s in list_signals(connection, strategy_run_id=first_run)] == ["SPY"]
-    assert [s.symbol for s in list_signals(connection, strategy_run_id=second_run)] == ["QQQ"]
+    assert [s.symbol for s in list_signals(connection, strategy_run_id=first_run)] == ["BTC/USD"]
+    assert [s.symbol for s in list_signals(connection, strategy_run_id=second_run)] == ["ETH/USD"]
     assert len(list_signals(connection)) == 2
 
 
@@ -423,7 +435,7 @@ def test_signal_with_invalid_strategy_run_is_rejected(connection: sqlite3.Connec
             connection,
             strategy_run_id=999,
             signal_timestamp=T0,
-            symbol="SPY",
+            symbol="BTC/USD",
             signal_type="BUY",
             reason="EMA20_CROSS_ABOVE_EMA50",
         )
@@ -436,7 +448,7 @@ def test_duplicate_logical_signal_is_rejected(connection: sqlite3.Connection) ->
     fields = {
         "strategy_run_id": run_id,
         "signal_timestamp": T0 + STEP,
-        "symbol": "SPY",
+        "symbol": "BTC/USD",
         "signal_type": "BUY",
         "reason": "EMA20_CROSS_ABOVE_EMA50",
     }
@@ -455,13 +467,13 @@ def test_signals_differing_in_any_key_field_are_both_stored(
     base = {
         "strategy_run_id": run_id,
         "signal_timestamp": T0 + STEP,
-        "symbol": "SPY",
+        "symbol": "BTC/USD",
         "signal_type": "BUY",
         "reason": "EMA20_CROSS_ABOVE_EMA50",
     }
     record_signal(connection, **base)
     record_signal(connection, **{**base, "signal_timestamp": T0 + 2 * STEP})
-    record_signal(connection, **{**base, "symbol": "QQQ"})
+    record_signal(connection, **{**base, "symbol": "ETH/USD"})
     record_signal(
         connection,
         **{**base, "signal_type": "EXIT", "reason": "EMA20_CROSS_BELOW_EMA50"},
@@ -476,7 +488,7 @@ def test_buy_signal_persists_exactly(connection: sqlite3.Connection) -> None:
         connection,
         strategy_run_id=run_id,
         signal_timestamp=T0,
-        symbol="SPY",
+        symbol="BTC/USD",
         signal_type="BUY",
         reason="EMA20_CROSS_ABOVE_EMA50",
     )
@@ -484,7 +496,7 @@ def test_buy_signal_persists_exactly(connection: sqlite3.Connection) -> None:
     stored = list_signals(connection)[0]
     assert stored.signal_type == "BUY"
     assert stored.reason == "EMA20_CROSS_ABOVE_EMA50"
-    assert stored.symbol == "SPY"
+    assert stored.symbol == "BTC/USD"
     assert stored.signal_timestamp == T0
 
 
@@ -497,7 +509,7 @@ def test_exit_signal_persists_as_exit_not_sell(connection: sqlite3.Connection) -
         connection,
         strategy_run_id=run_id,
         signal_timestamp=T0,
-        symbol="SPY",
+        symbol="BTC/USD",
         signal_type="EXIT",
         reason="EMA20_CROSS_BELOW_EMA50",
     )
@@ -518,7 +530,7 @@ def test_sell_is_not_a_storable_signal_type(connection: sqlite3.Connection) -> N
             connection,
             strategy_run_id=run_id,
             signal_timestamp=T0,
-            symbol="SPY",
+            symbol="BTC/USD",
             signal_type="SELL",
             reason="EMA20_CROSS_BELOW_EMA50",
         )
@@ -530,7 +542,7 @@ def test_sell_is_not_a_storable_signal_type(connection: sqlite3.Connection) -> N
             "INSERT INTO signals "
             "(strategy_run_id, signal_timestamp, symbol, signal_type, reason, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (run_id, to_utc_text(T0), "SPY", "SELL", "R", to_utc_text(T0)),
+            (run_id, to_utc_text(T0), "BTC/USD", "SELL", "R", to_utc_text(T0)),
         )
 
 
@@ -555,7 +567,7 @@ def test_signals_list_in_deterministic_order(connection: sqlite3.Connection) -> 
             connection,
             strategy_run_id=run_id,
             signal_timestamp=T0 + offset * STEP,
-            symbol="SPY",
+            symbol="BTC/USD",
             signal_type="BUY",
             reason="EMA20_CROSS_ABOVE_EMA50",
         )
@@ -576,7 +588,7 @@ def test_risk_event_persists(connection: sqlite3.Connection) -> None:
         connection,
         strategy_run_id=run_id,
         event_timestamp=T0,
-        symbol="SPY",
+        symbol="BTC/USD",
         decision="REJECTED",
         reason_code="EXAMPLE_LIMIT",
         message="illustrative only",
@@ -586,7 +598,7 @@ def test_risk_event_persists(connection: sqlite3.Connection) -> None:
     assert len(events) == 1
     event = events[0]
     assert event.strategy_run_id == run_id
-    assert event.symbol == "SPY"
+    assert event.symbol == "BTC/USD"
     assert event.decision == "REJECTED"
     assert event.reason_code == "EXAMPLE_LIMIT"
     assert event.message == "illustrative only"
@@ -685,31 +697,46 @@ def test_system_events_list_in_deterministic_order(connection: sqlite3.Connectio
 
 
 def test_position_upsert_creates_a_position(connection: sqlite3.Connection) -> None:
-    upsert_position(connection, symbol="SPY", quantity=10, average_price=123.45, updated_at=T0)
+    upsert_position(
+        connection,
+        symbol="BTC/USD",
+        quantity=Decimal("0.00012345"),
+        average_price=123.45,
+        updated_at=T0,
+    )
 
-    assert get_position(connection, "SPY") == Position(
-        symbol="SPY", quantity=10, average_price=123.45, updated_at=T0
+    assert get_position(connection, "BTC/USD") == Position(
+        symbol="BTC/USD",
+        quantity=Decimal("0.00012345"),
+        average_price=123.45,
+        updated_at=T0,
     )
 
 
 def test_position_upsert_updates_a_position(connection: sqlite3.Connection) -> None:
-    upsert_position(connection, symbol="SPY", quantity=10, average_price=100.0, updated_at=T0)
-
     upsert_position(
-        connection, symbol="SPY", quantity=25, average_price=110.5, updated_at=T0 + STEP
+        connection, symbol="BTC/USD", quantity=Decimal("0.5"), average_price=100.0, updated_at=T0
     )
 
-    assert get_position(connection, "SPY") == Position(
-        symbol="SPY", quantity=25, average_price=110.5, updated_at=T0 + STEP
+    upsert_position(
+        connection,
+        symbol="BTC/USD",
+        quantity=Decimal("0.25"),
+        average_price=110.5,
+        updated_at=T0 + STEP,
+    )
+
+    assert get_position(connection, "BTC/USD") == Position(
+        symbol="BTC/USD", quantity=Decimal("0.25"), average_price=110.5, updated_at=T0 + STEP
     )
     # One row per symbol: the snapshot is replaced, never appended to.
     assert len(list_positions(connection)) == 1
 
 
 def test_zero_quantity_is_allowed(connection: sqlite3.Connection) -> None:
-    upsert_position(connection, symbol="SPY", quantity=0, updated_at=T0)
+    upsert_position(connection, symbol="BTC/USD", quantity=Decimal(0), updated_at=T0)
 
-    position = get_position(connection, "SPY")
+    position = get_position(connection, "BTC/USD")
     assert position is not None
     assert position.quantity == 0
     assert position.average_price is None
@@ -717,35 +744,112 @@ def test_zero_quantity_is_allowed(connection: sqlite3.Connection) -> None:
 
 def test_negative_position_is_rejected(connection: sqlite3.Connection) -> None:
     with pytest.raises(StateInputError):
-        upsert_position(connection, symbol="SPY", quantity=-1, updated_at=T0)
+        upsert_position(connection, symbol="BTC/USD", quantity=Decimal(-1), updated_at=T0)
 
-    assert get_position(connection, "SPY") is None
+    assert get_position(connection, "BTC/USD") is None
+
+
+def test_a_negative_fraction_is_rejected_too(connection: sqlite3.Connection) -> None:
+    with pytest.raises(StateInputError):
+        upsert_position(connection, symbol="BTC/USD", quantity=Decimal("-0.00001"), updated_at=T0)
 
 
 def test_negative_position_is_rejected_by_the_schema_too(
     connection: sqlite3.Connection,
 ) -> None:
     # Defence in depth: the long-only invariant must survive a write that did
-    # not go through this module's validation.
+    # not go through this module's validation. The CHECK casts the stored text
+    # to a number, so a negative decimal string is still refused.
+    for stored in ("-1", "-0.00000001"):
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO positions (symbol, quantity, average_price, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("BTC/USD", stored, None, to_utc_text(T0)),
+            )
+
+
+def test_an_empty_quantity_string_is_refused_by_the_schema(
+    connection: sqlite3.Connection,
+) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute(
             "INSERT INTO positions (symbol, quantity, average_price, updated_at) "
             "VALUES (?, ?, ?, ?)",
-            ("SPY", -1, None, to_utc_text(T0)),
+            ("BTC/USD", "", None, to_utc_text(T0)),
         )
 
 
-def test_fractional_quantity_is_rejected(connection: sqlite3.Connection) -> None:
+@pytest.mark.parametrize(
+    "quantity",
+    [
+        Decimal("0.0001"),
+        Decimal("0.00000001"),
+        Decimal("1.25000000"),
+        Decimal("123456.789012345678"),
+        Decimal("0.1") + Decimal("0.2"),
+    ],
+)
+def test_a_fractional_position_round_trips_exactly(
+    connection: sqlite3.Connection, quantity: Decimal
+) -> None:
+    """The whole point of decimal text storage: what went in comes back out."""
+    upsert_position(connection, symbol="BTC/USD", quantity=quantity, updated_at=T0)
+
+    position = get_position(connection, "BTC/USD")
+    assert position is not None
+    assert position.quantity == quantity
+    assert isinstance(position.quantity, Decimal)
+
+
+def test_a_stored_quantity_keeps_its_scale(connection: sqlite3.Connection) -> None:
+    """`1.25000000` is not silently normalized to `1.25`: precision is information."""
+    upsert_position(connection, symbol="BTC/USD", quantity=Decimal("1.25000000"), updated_at=T0)
+
+    position = get_position(connection, "BTC/USD")
+    assert position is not None
+    assert str(position.quantity) == "1.25000000"
+
+
+def test_no_float_precision_is_lost_in_storage(connection: sqlite3.Connection) -> None:
+    """A REAL column would round 18 significant digits away. TEXT does not."""
+    exact = Decimal("0.123456789012345678")
+    upsert_position(connection, symbol="BTC/USD", quantity=exact, updated_at=T0)
+
+    stored = connection.execute(
+        "SELECT quantity, typeof(quantity) FROM positions WHERE symbol = ?", ("BTC/USD",)
+    ).fetchone()
+    assert stored[1] == "text"
+    assert stored[0] == "0.123456789012345678"
+    assert Decimal(stored[0]) == exact
+    assert Decimal(str(float(exact))) != exact, "the float route would have lost digits"
+
+
+def test_a_float_quantity_is_refused_rather_than_converted(
+    connection: sqlite3.Connection,
+) -> None:
+    """A binary float cannot represent an exact broker quantity."""
+    with pytest.raises(StateInputError) as error:
+        upsert_position(connection, symbol="BTC/USD", quantity=1.5, updated_at=T0)
+    assert "Decimal" in str(error.value)
+
+
+@pytest.mark.parametrize("quantity", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")])
+def test_a_non_finite_quantity_is_rejected(
+    connection: sqlite3.Connection, quantity: Decimal
+) -> None:
     with pytest.raises(StateInputError):
-        upsert_position(connection, symbol="SPY", quantity=1.5, updated_at=T0)
+        upsert_position(connection, symbol="BTC/USD", quantity=quantity, updated_at=T0)
 
 
 @pytest.mark.parametrize("price", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_average_price_is_rejected(connection: sqlite3.Connection, price: float) -> None:
     with pytest.raises(StateInputError):
-        upsert_position(connection, symbol="SPY", quantity=1, average_price=price, updated_at=T0)
+        upsert_position(
+            connection, symbol="BTC/USD", quantity=Decimal(1), average_price=price, updated_at=T0
+        )
 
-    assert get_position(connection, "SPY") is None
+    assert get_position(connection, "BTC/USD") is None
 
 
 def test_non_positive_average_price_is_rejected_by_the_schema_too(
@@ -755,30 +859,236 @@ def test_non_positive_average_price_is_rejected_by_the_schema_too(
         connection.execute(
             "INSERT INTO positions (symbol, quantity, average_price, updated_at) "
             "VALUES (?, ?, ?, ?)",
-            ("SPY", 1, 0.0, to_utc_text(T0)),
+            ("BTC/USD", "1", 0.0, to_utc_text(T0)),
         )
 
 
 def test_unknown_position_reads_as_none(connection: sqlite3.Connection) -> None:
     # None means "no local snapshot", not "flat at the broker".
-    assert get_position(connection, "SPY") is None
+    assert get_position(connection, "BTC/USD") is None
 
 
 def test_list_positions_is_deterministically_ordered(connection: sqlite3.Connection) -> None:
-    for symbol in ("QQQ", "AAPL", "SPY", "MSFT"):
-        upsert_position(connection, symbol=symbol, quantity=1, updated_at=T0)
+    for symbol in ("ETH/USD", "BTC/USD"):
+        upsert_position(connection, symbol=symbol, quantity=Decimal(1), updated_at=T0)
 
     assert [position.symbol for position in list_positions(connection)] == [
-        "AAPL",
-        "MSFT",
-        "QQQ",
-        "SPY",
+        "BTC/USD",
+        "ETH/USD",
     ]
 
 
 def test_no_pnl_is_stored(connection: sqlite3.Connection) -> None:
     columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(positions)")}
     assert columns == {"symbol", "quantity", "average_price", "updated_at"}
+
+
+# --------------------------------------------------------------------------
+# Daily risk baselines (schema v3)
+#
+# Crypto has no equity-session previous close, so the daily-loss halt measures
+# against the first equity observed on a UTC calendar date. These tests pin
+# "first observation wins" and "exactly one row per UTC date", which are the
+# two properties that make the halt reproducible across restarts.
+# --------------------------------------------------------------------------
+
+
+def test_utc_risk_date_is_the_utc_calendar_day() -> None:
+    assert utc_risk_date(datetime(2025, 3, 14, 0, 0, tzinfo=UTC)) == date(2025, 3, 14)
+    assert utc_risk_date(datetime(2025, 3, 14, 23, 59, 59, tzinfo=UTC)) == date(2025, 3, 14)
+    # 20:00 in New York on the 14th is 00:00 UTC on the 15th: the UTC date wins.
+    assert utc_risk_date(datetime(2025, 3, 14, 20, 0, tzinfo=ZoneInfo("America/New_York"))) == date(
+        2025, 3, 15
+    )
+
+
+def test_utc_risk_date_rejects_a_naive_datetime() -> None:
+    with pytest.raises(StateInputError):
+        utc_risk_date(datetime(2025, 3, 14, 12, 0))
+
+
+def test_a_baseline_round_trips(connection: sqlite3.Connection) -> None:
+    baseline = ensure_daily_risk_baseline(
+        connection,
+        risk_date_utc=date(2025, 3, 14),
+        baseline_equity=Decimal("100000.55"),
+        captured_at=T0,
+    )
+
+    assert baseline == DailyRiskBaseline(
+        risk_date_utc=date(2025, 3, 14),
+        baseline_equity=Decimal("100000.55"),
+        captured_at=T0,
+    )
+    assert get_daily_risk_baseline(connection, date(2025, 3, 14)) == baseline
+
+
+def test_the_first_observation_of_a_utc_day_wins_permanently(
+    connection: sqlite3.Connection,
+) -> None:
+    """A baseline that drifted during the day would silently reset the halt."""
+    first = ensure_daily_risk_baseline(
+        connection,
+        risk_date_utc=date(2025, 3, 14),
+        baseline_equity=Decimal("100000"),
+        captured_at=T0,
+    )
+    second = ensure_daily_risk_baseline(
+        connection,
+        risk_date_utc=date(2025, 3, 14),
+        baseline_equity=Decimal("90000"),
+        captured_at=T0 + STEP,
+    )
+
+    assert second == first
+    assert second.baseline_equity == Decimal("100000")
+    assert second.captured_at == T0
+    assert len(list_daily_risk_baselines(connection)) == 1
+
+
+def test_exactly_one_baseline_exists_per_utc_date(connection: sqlite3.Connection) -> None:
+    for day in (date(2025, 3, 14), date(2025, 3, 15), date(2025, 3, 14)):
+        ensure_daily_risk_baseline(
+            connection,
+            risk_date_utc=day,
+            baseline_equity=Decimal("100000"),
+            captured_at=T0,
+        )
+
+    assert [row.risk_date_utc for row in list_daily_risk_baselines(connection)] == [
+        date(2025, 3, 14),
+        date(2025, 3, 15),
+    ]
+
+
+def test_the_primary_key_refuses_a_second_row_for_one_date(
+    connection: sqlite3.Connection,
+) -> None:
+    """Defence in depth: a writer that bypassed this module still cannot."""
+    ensure_daily_risk_baseline(
+        connection,
+        risk_date_utc=date(2025, 3, 14),
+        baseline_equity=Decimal("100000"),
+        captured_at=T0,
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO daily_risk_baselines (risk_date_utc, baseline_equity, captured_at) "
+            "VALUES (?, ?, ?)",
+            ("2025-03-14", "90000", to_utc_text(T0)),
+        )
+
+
+def test_a_baseline_equity_is_stored_as_exact_decimal_text(
+    connection: sqlite3.Connection,
+) -> None:
+    ensure_daily_risk_baseline(
+        connection,
+        risk_date_utc=date(2025, 3, 14),
+        baseline_equity=Decimal("100000.123456789012"),
+        captured_at=T0,
+    )
+    stored = connection.execute(
+        "SELECT baseline_equity, typeof(baseline_equity) FROM daily_risk_baselines"
+    ).fetchone()
+
+    assert stored[1] == "text"
+    assert stored[0] == "100000.123456789012"
+    baseline = get_daily_risk_baseline(connection, date(2025, 3, 14))
+    assert baseline is not None
+    assert baseline.baseline_equity == Decimal("100000.123456789012")
+
+
+@pytest.mark.parametrize("equity", [Decimal(0), Decimal(-1), Decimal("NaN"), 1.5, "100"])
+def test_an_unusable_baseline_equity_is_rejected(
+    connection: sqlite3.Connection, equity: object
+) -> None:
+    with pytest.raises(StateInputError):
+        ensure_daily_risk_baseline(
+            connection,
+            risk_date_utc=date(2025, 3, 14),
+            baseline_equity=equity,
+            captured_at=T0,
+        )
+    assert list_daily_risk_baselines(connection) == []
+
+
+def test_a_baseline_requires_an_aware_captured_at(connection: sqlite3.Connection) -> None:
+    with pytest.raises(StateInputError):
+        ensure_daily_risk_baseline(
+            connection,
+            risk_date_utc=date(2025, 3, 14),
+            baseline_equity=Decimal("100000"),
+            captured_at=datetime(2025, 3, 14, 12, 0),
+        )
+
+
+def test_a_datetime_is_refused_where_a_risk_date_belongs(
+    connection: sqlite3.Connection,
+) -> None:
+    """A datetime is not a UTC day; `utc_risk_date` is how you get one."""
+    with pytest.raises(StateInputError):
+        ensure_daily_risk_baseline(
+            connection,
+            risk_date_utc=T0,
+            baseline_equity=Decimal("100000"),
+            captured_at=T0,
+        )
+
+
+def test_an_unknown_baseline_date_reads_as_none(connection: sqlite3.Connection) -> None:
+    assert get_daily_risk_baseline(connection, date(2025, 3, 14)) is None
+
+
+def test_the_baseline_table_holds_only_the_three_documented_fields(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = {
+        str(row["name"]) for row in connection.execute("PRAGMA table_info(daily_risk_baselines)")
+    }
+    assert columns == {"risk_date_utc", "baseline_equity", "captured_at"}
+
+
+# --------------------------------------------------------------------------
+# Exact decimal storage helpers
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (Decimal("0.0001"), "0.0001"),
+        (Decimal("1E-4"), "0.0001"),
+        (Decimal("1.25000000"), "1.25000000"),
+        (Decimal(1), "1"),
+        (Decimal(100), "100"),
+        (Decimal("1E+2"), "100"),
+        (1, "1"),
+        (100, "100"),
+    ],
+)
+def test_decimal_text_is_plain_fixed_point(value: object, text: str) -> None:
+    """Never scientific notation: a stored quantity has to be readable."""
+    assert to_decimal_text(value) == text
+    assert from_decimal_text(text) == Decimal(value)
+
+
+@pytest.mark.parametrize("value", [1.5, 1.0, "1", None, True])
+def test_decimal_text_refuses_anything_inexact(value: object) -> None:
+    with pytest.raises(StateInputError):
+        to_decimal_text(value)
+
+
+@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity")])
+def test_decimal_text_refuses_a_non_finite_value(value: Decimal) -> None:
+    with pytest.raises(StateInputError):
+        to_decimal_text(value)
+
+
+@pytest.mark.parametrize("text", ["", "abc", "1.2.3", None, "NaN"])
+def test_unparsable_stored_decimal_text_is_a_controlled_error(text: object) -> None:
+    with pytest.raises(DatabaseStateError):
+        from_decimal_text(text)
 
 
 # --------------------------------------------------------------------------
@@ -838,14 +1148,14 @@ def test_naive_datetime_is_rejected_everywhere_a_timestamp_is_accepted(
             connection,
             strategy_run_id=run_id,
             signal_timestamp=naive,
-            symbol="SPY",
+            symbol="BTC/USD",
             signal_type="BUY",
             reason="R",
         )
     with pytest.raises(StateInputError):
         record_risk_event(connection, event_timestamp=naive, decision="ALLOW", reason_code="R")
     with pytest.raises(StateInputError):
-        upsert_position(connection, symbol="SPY", quantity=1, updated_at=naive)
+        upsert_position(connection, symbol="BTC/USD", quantity=1, updated_at=naive)
 
 
 def test_persisted_timestamps_use_one_canonical_utc_form(
@@ -861,11 +1171,11 @@ def test_persisted_timestamps_use_one_canonical_utc_form(
         connection,
         strategy_run_id=run_id,
         signal_timestamp=T0,
-        symbol="SPY",
+        symbol="BTC/USD",
         signal_type="BUY",
         reason="R",
     )
-    upsert_position(connection, symbol="SPY", quantity=1, updated_at=T0)
+    upsert_position(connection, symbol="BTC/USD", quantity=1, updated_at=T0)
 
     stored: list[str] = []
     for query in (
@@ -945,14 +1255,14 @@ def test_transaction_rolls_back_all_writes_on_failure(database_path: Path) -> No
 
         with pytest.raises(UnknownStrategyRunError), transaction(connection):
             record_system_event(connection, event_timestamp=T0, event_type="ABOUT_TO_FAIL")
-            upsert_position(connection, symbol="SPY", quantity=7, updated_at=T0)
+            upsert_position(connection, symbol="BTC/USD", quantity=7, updated_at=T0)
             # No such strategy run: a foreign-key violation inside the same
             # transaction as the two writes above.
             record_signal(
                 connection,
                 strategy_run_id=run_id + 1000,
                 signal_timestamp=T0,
-                symbol="SPY",
+                symbol="BTC/USD",
                 signal_type="BUY",
                 reason="EMA20_CROSS_ABOVE_EMA50",
             )
@@ -976,7 +1286,7 @@ def test_transaction_rolls_back_on_a_validation_failure(database_path: Path) -> 
         record_system_event(connection, event_timestamp=T0, event_type="FIRST")
         # Rejected in Python, before any SQL is issued; the rollback must
         # still discard the write that already succeeded.
-        upsert_position(connection, symbol="SPY", quantity=-5, updated_at=T0)
+        upsert_position(connection, symbol="BTC/USD", quantity=-5, updated_at=T0)
 
     with connect(database_path) as connection:
         assert list_system_events(connection) == []
@@ -999,7 +1309,7 @@ def test_two_connections_see_committed_state(database_path: Path) -> None:
             writer,
             strategy_run_id=run_id,
             signal_timestamp=T0,
-            symbol="SPY",
+            symbol="BTC/USD",
             signal_type="BUY",
             reason="EMA20_CROSS_ABOVE_EMA50",
         )
@@ -1036,10 +1346,10 @@ def test_a_single_record_call_commits_on_its_own(database_path: Path) -> None:
 
 def test_failed_write_leaves_the_connection_usable(connection: sqlite3.Connection) -> None:
     with pytest.raises(StateInputError):
-        upsert_position(connection, symbol="SPY", quantity=-1, updated_at=T0)
+        upsert_position(connection, symbol="BTC/USD", quantity=-1, updated_at=T0)
 
-    upsert_position(connection, symbol="SPY", quantity=1, updated_at=T0)
-    assert get_position(connection, "SPY") is not None
+    upsert_position(connection, symbol="BTC/USD", quantity=1, updated_at=T0)
+    assert get_position(connection, "BTC/USD") is not None
 
 
 # --------------------------------------------------------------------------
@@ -1097,8 +1407,8 @@ def test_hostile_values_are_stored_verbatim_not_executed(
 
 
 def test_hostile_symbol_is_stored_verbatim(connection: sqlite3.Connection) -> None:
-    injection = "SPY'); DROP TABLE POSITIONS;--"
-    upsert_position(connection, symbol=injection, quantity=1, updated_at=T0)
+    injection = "BTC/USD'); DROP TABLE POSITIONS;--"
+    upsert_position(connection, symbol=injection, quantity=Decimal(1), updated_at=T0)
 
     assert get_position(connection, injection) is not None
     assert "positions" in table_names(connection)
@@ -1148,6 +1458,7 @@ def test_module_imports_only_the_standard_library() -> None:
         "contextlib",
         "dataclasses",
         "datetime",
+        "decimal",
         "math",
         "pathlib",
         "sqlite3",
@@ -1169,11 +1480,11 @@ def test_database_code_requires_no_alpaca_credentials(
             connection,
             strategy_run_id=run_id,
             signal_timestamp=T0,
-            symbol="SPY",
+            symbol="BTC/USD",
             signal_type="BUY",
             reason="EMA20_CROSS_ABOVE_EMA50",
         )
-        upsert_position(connection, symbol="SPY", quantity=1, updated_at=T0)
+        upsert_position(connection, symbol="BTC/USD", quantity=Decimal(1), updated_at=T0)
         assert len(list_signals(connection)) == 1
 
 
@@ -1197,7 +1508,7 @@ def test_database_code_makes_no_network_connection(
             reason_code="EXAMPLE",
         )
         record_system_event(connection, event_timestamp=T0, event_type="OFFLINE")
-        upsert_position(connection, symbol="SPY", quantity=1, updated_at=T0)
+        upsert_position(connection, symbol="BTC/USD", quantity=Decimal(1), updated_at=T0)
         finish_strategy_run(connection, run_id, ended_at=T0 + STEP)
 
     assert path.is_file()
@@ -1221,7 +1532,15 @@ def test_no_database_file_is_created_outside_the_temporary_directory(
 
 
 @pytest.mark.parametrize(
-    "model", [StrategyRun, StoredSignal, Position, state.RiskEvent, state.SystemEvent]
+    "model",
+    [
+        StrategyRun,
+        StoredSignal,
+        Position,
+        DailyRiskBaseline,
+        state.RiskEvent,
+        state.SystemEvent,
+    ],
 )
 def test_read_models_are_frozen_dataclasses(model: type) -> None:
     assert dataclasses.is_dataclass(model)
@@ -1236,8 +1555,8 @@ def test_public_api_is_re_exported_by_the_package() -> None:
 
 def test_reads_return_typed_records_not_raw_rows(connection: sqlite3.Connection) -> None:
     run_id = open_run(connection)
-    upsert_position(connection, symbol="SPY", quantity=1, updated_at=T0)
+    upsert_position(connection, symbol="BTC/USD", quantity=1, updated_at=T0)
 
     assert isinstance(get_strategy_run(connection, run_id), StrategyRun)
-    assert isinstance(get_position(connection, "SPY"), Position)
-    assert not isinstance(get_position(connection, "SPY"), sqlite3.Row)
+    assert isinstance(get_position(connection, "BTC/USD"), Position)
+    assert not isinstance(get_position(connection, "BTC/USD"), sqlite3.Row)

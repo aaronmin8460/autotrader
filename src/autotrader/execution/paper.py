@@ -1,4 +1,4 @@
-"""Phase 7: the Alpaca **paper** execution boundary. The only file that trades.
+"""C7: the Alpaca **paper** crypto execution boundary. The only file that trades.
 
 This is the one module in the repository that constructs a broker trading
 client or submits an order. Everything about live trading being impossible is
@@ -11,7 +11,7 @@ and no environment variable that selects an environment. Live trading here is
 not "disabled by default"; it is **unexpressible**. A source-level test asserts
 that ``paper=False`` appears nowhere in the package.
 
-**Two independent gates.** Reading the account, the clock, a position, or a
+**Two independent gates.** Reading the account, a position, an asset, or a
 price needs neither. *Submitting* needs both:
 
 1. the environment gate ``AUTOTRADER_PAPER_TRADING_ENABLED`` set to exactly
@@ -21,15 +21,31 @@ price needs neither. *Submitting* needs both:
 
 Both default to closed, and neither can satisfy the other.
 
-**Everything fails closed.** No current price, an account that cannot trade, a
-duplicate check that could not complete - each stops the attempt rather than
-proceeding on an assumption. "I could not check for a duplicate" is never
-treated as "there is no duplicate".
+**Everything fails closed.** No current price, an account that cannot trade, an
+asset whose broker metadata is missing or contradictory, a duplicate check that
+could not complete - each stops the attempt rather than proceeding on an
+assumption. "I could not check for a duplicate" is never treated as "there is
+no duplicate".
 
 **The risk engine is not optional.** Every submission is sized by
-`evaluate_risk`, and the quantity sent to the broker is
+`evaluate_risk`, and the quantity sent to the broker is never larger than
 `RiskDecision.approved_quantity` - never the caller's requested quantity. A
 rejected decision means no broker request is even constructed.
+
+**The broker owns order precision.** The exact quantity sent is the
+risk-approved quantity normalized to the asset's *current*
+`min_trade_increment`, always rounding **down**, and refused outright if it
+lands below `min_order_size`. No BTC or ETH increment is hardcoded anywhere:
+provider rules change, so the broker's live asset metadata is the authority.
+
+**There is no market clock here.** Crypto trades continuously, so there is no
+session to open or close and nothing to gate a submission on. `get_clock()` is
+an equity-market concept and is not called.
+
+**The risk day is a UTC calendar day.** The daily-loss baseline is the first
+account equity observed on a UTC date, recorded durably in
+`daily_risk_baselines`. Alpaca's `last_equity` is an equity-session previous
+close and is deliberately **not** used: a 24/7 market has no previous close.
 
 **Order of operations is a safety property, not a style choice.** The intent
 and its `client_order_id` are committed to SQLite *before* the broker is
@@ -49,10 +65,10 @@ an order. Nothing in this module infers a position from that: the local
 positions table is only ever written from a position actually *observed* at the
 broker.
 
-Scope: US equities, the five V0.1 symbols, whole shares, MARKET orders, DAY
-time in force, regular hours, long only. No fractional or notional orders, no
-limit/stop/bracket/OCO orders, no options, no crypto, no shorts, no streaming,
-and no reconciliation - see docs/SPEC.md section 8, "Phase 7".
+Scope: crypto spot, BTC/USD and ETH/USD, fractional quantities, MARKET orders,
+GTC time in force, long only. No DAY and no IOC, no notional orders, no
+limit/stop/bracket/OCO orders, no options, no equities, no shorts, no
+streaming, and no reconciliation - see docs/SPEC.md section 8, "C7".
 """
 
 from __future__ import annotations
@@ -62,20 +78,23 @@ import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from enum import Enum
 
 from alpaca.common.exceptions import APIError
-from alpaca.data.enums import DataFeed
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
+from alpaca.data.enums import CryptoFeed
+from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoLatestTradeRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
     AccountStatus,
+    AssetClass,
+    AssetStatus,
     PositionSide,
     TimeInForce,
 )
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
-from alpaca.trading.models import Order, TradeAccount
+from alpaca.trading.models import Asset, Order, TradeAccount
 from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.requests import MarketOrderRequest
 
@@ -84,10 +103,11 @@ from autotrader.execution.models import (
     ExecutionInputError,
     OrderIntent,
     OrderSide,
+    format_quantity,
     normalize_side,
     normalize_symbol,
+    require_quantity,
     require_reference_price,
-    require_whole_share_quantity,
 )
 from autotrader.risk import (
     RiskContext,
@@ -113,9 +133,17 @@ CONFIRMATION_TOKEN = "PAPER"
 _API_KEY_ENV = "ALPACA_API_KEY"
 _SECRET_KEY_ENV = "ALPACA_SECRET_KEY"
 
-#: Market-data feed for the reference price. IEX matches Phase 1's historical
-#: feed, so sizing and research see the same source.
-REFERENCE_PRICE_FEED = DataFeed.IEX
+#: Market-data feed for the reference price. Alpaca's crypto feed, matching the
+#: historical feed, so sizing and research see the same source.
+REFERENCE_PRICE_FEED = CryptoFeed.US
+
+#: The only time in force this milestone sends.
+#:
+#: `DAY` is an equity-session concept - it expires at a close that a 24/7
+#: market does not have - and `IOC` would silently cancel the unfilled part of
+#: an order this system believes it placed. `GTC` is the one that means what it
+#: says here.
+ORDER_TIME_IN_FORCE = TimeInForce.GTC
 
 #: Account states in which this system will submit a paper order. `PAPER_ONLY`
 #: is accepted because it describes exactly this environment.
@@ -131,6 +159,8 @@ EVENT_SUBMITTED = "PAPER_ORDER_SUBMITTED"
 EVENT_REJECTED = "PAPER_ORDER_REJECTED"
 EVENT_UNKNOWN = "PAPER_ORDER_UNKNOWN"
 EVENT_DUPLICATE = "PAPER_ORDER_DUPLICATE"
+
+_ZERO = Decimal(0)
 
 
 class PaperTradingDisabledError(ExecutionError):
@@ -155,6 +185,24 @@ class AccountNotTradableError(ExecutionError):
 
 class UnsupportedBrokerStateError(ExecutionError):
     """The broker reports something this long-only phase cannot reason about."""
+
+
+class AssetNotTradableError(ExecutionError):
+    """The broker's own metadata says this asset may not be traded here.
+
+    Covers a missing, inactive, non-crypto, non-fractionable, or incoherent
+    asset. Nothing is assumed on the broker's behalf: an asset whose
+    constraints cannot be read is one this system will not size against.
+    """
+
+
+class QuantityBelowMinimumError(ExecutionError):
+    """Normalizing to the broker's increment left less than its minimum order.
+
+    Not an error to work around by rounding up: the broker's minimum is a
+    floor, and exceeding a risk-approved quantity to clear it would put sizing
+    outside the risk engine's control.
+    """
 
 
 class ReferencePriceUnavailableError(ExecutionError):
@@ -264,7 +312,7 @@ def create_paper_trading_client() -> TradingClient:
     The SDK's own request retry is switched off for this client. It retries
     `429` and `504` responses internally, which is harmless for a `GET` but
     unacceptable for `POST /orders`: a gateway timeout there is precisely the
-    ambiguous case this phase must classify as `UNKNOWN`, and a silent
+    ambiguous case this milestone must classify as `UNKNOWN`, and a silent
     resubmission would defeat that. The constructor cannot express "no
     retries" (it ignores a zero), so the attribute is set directly; a test
     asserts it stays effective.
@@ -279,26 +327,37 @@ def create_paper_trading_client() -> TradingClient:
     return client
 
 
-def create_market_data_client() -> StockHistoricalDataClient:
-    """Build the market-data client used for the current reference price.
+def create_market_data_client() -> CryptoHistoricalDataClient:
+    """Build the crypto market-data client used for the current reference price.
 
-    Reuses the Phase 1 factory rather than duplicating credential handling.
-    Market data is read-only and carries no trading permission.
+    Reuses the C1 factory rather than duplicating credential handling. Crypto
+    market data is served without authentication, so this succeeds with or
+    without credentials; submitting an order still requires them.
     """
-    from autotrader.data.historical import HistoricalDataError, create_client
+    from autotrader.data.historical import create_client
 
-    try:
-        return create_client()
-    except HistoricalDataError as error:
-        raise MissingCredentialsError(str(error)) from None
+    return create_client()
 
 
 # --------------------------------------------------------------------------
 # Normalized broker reads
 #
 # Alpaca returns money and quantities as strings. They are converted once,
-# here, so no downstream arithmetic is done on text.
+# here, so no downstream arithmetic is done on text - and quantities become
+# exact `Decimal` values rather than binary floats.
 # --------------------------------------------------------------------------
+
+
+def broker_symbol_key(symbol: str) -> str:
+    """The provider-agnostic key for one market.
+
+    Alpaca reports a crypto market as ``BTC/USD`` in some responses and
+    ``BTCUSD`` in others. Both name the same market, so both key to ``BTCUSD``
+    here and a position is matched to the pair it belongs to either way. This
+    is a lookup key only: the canonical ``BTC/USD`` spelling is what the domain
+    models, the stored data, and the database all use.
+    """
+    return symbol.strip().upper().replace("/", "")
 
 
 def _to_float(value: object, field_name: str) -> float:
@@ -332,31 +391,48 @@ def _optional_float(value: object) -> float | None:
     return number
 
 
-def _to_whole_shares(value: object, field_name: str) -> int:
-    """Convert a broker quantity to whole shares, refusing a fractional one."""
-    number = _to_float(value, field_name)
-    if number != int(number):
+def to_broker_decimal(value: object, field_name: str) -> Decimal:
+    """Convert a broker quantity to an exact `Decimal`.
+
+    Alpaca sends quantities as decimal strings, which convert exactly. A float
+    is routed through its shortest round-tripping form rather than
+    `Decimal(float)`, so ``0.0001`` stays ``0.0001``.
+    """
+    if value is None:
         raise UnsupportedBrokerStateError(
-            f"The broker reported a fractional {field_name} ({number}); fractional "
-            "shares are out of scope for this phase."
+            f"The broker did not report {field_name}, which is required to reason about "
+            "an order safely. Refusing to guess it."
         )
-    return int(number)
+    if isinstance(value, Decimal):
+        candidate = value
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise UnsupportedBrokerStateError(f"The broker reported a non-finite {field_name}.")
+        candidate = Decimal(str(value))
+    else:
+        try:
+            candidate = Decimal(str(value))
+        except InvalidOperation:
+            raise UnsupportedBrokerStateError(
+                f"The broker reported a non-numeric {field_name}."
+            ) from None
+    if not candidate.is_finite():
+        raise UnsupportedBrokerStateError(f"The broker reported a non-finite {field_name}.")
+    return candidate
 
 
 @dataclass(frozen=True)
 class PaperAccountState:
     """The paper account, normalized to the numbers risk actually needs.
 
-    `start_of_day_equity` is Alpaca's `last_equity`: the account's equity at
-    the previous trading day's close, which is the baseline Alpaca itself uses
-    for a day's P&L. `daily_pnl` is derived from it as `equity - last_equity`
-    rather than read from a separate field, so the two can never disagree.
+    There is deliberately **no** `last_equity` here. Alpaca's `last_equity` is
+    the previous *trading day's* close, which is an equity-session concept; a
+    24/7 crypto account has no such boundary, so the daily-loss baseline comes
+    from `daily_risk_baselines` instead (see `resolve_daily_baseline_equity`).
     """
 
     equity: float
     cash: float
-    start_of_day_equity: float
-    daily_pnl: float
     status: str
     trading_blocked: bool
     account_blocked: bool
@@ -378,21 +454,29 @@ class PaperPosition:
     """One long position, normalized. Shorts are rejected before this exists."""
 
     symbol: str
-    quantity: int
+    quantity: Decimal
     market_value: float
     average_entry_price: float | None
 
 
 @dataclass(frozen=True)
-class MarketClock:
-    """The broker's market clock. Informational only.
+class CryptoAssetSpec:
+    """What the broker says about one crypto asset, right now.
 
-    A closed market does **not** block a DAY market order: Alpaca queues it for
-    the next session. Nothing here infers a fill from an open market either.
+    This is the runtime authority on order precision. Nothing here is
+    remembered from documentation: `min_order_size` and `min_trade_increment`
+    are read from the broker on every attempt, because provider rules change
+    and a stale constant would produce orders the broker silently refuses - or
+    worse, accepts at the wrong size.
     """
 
-    is_open: bool
-    timestamp: datetime
+    symbol: str
+    asset_class: str
+    status: str
+    tradable: bool
+    fractionable: bool
+    min_order_size: Decimal
+    min_trade_increment: Decimal
 
 
 @dataclass(frozen=True)
@@ -407,8 +491,8 @@ class BrokerOrderSnapshot:
     client_order_id: str
     symbol: str
     side: str
-    quantity: int
-    filled_quantity: int
+    quantity: Decimal
+    filled_quantity: Decimal
     filled_average_price: float | None
     status: str
     submitted_at: datetime | None
@@ -426,8 +510,7 @@ def fetch_paper_account_state(client: TradingClient) -> PaperAccountState:
 
     equity = _to_float(account.equity, "account equity")
     cash = _to_float(account.cash, "account cash")
-    start_of_day_equity = _to_float(account.last_equity, "account last_equity")
-    if start_of_day_equity <= 0 or equity <= 0:
+    if equity <= 0:
         raise UnsupportedBrokerStateError(
             "The broker reported a non-positive account equity, which cannot describe "
             "a usable account. Refusing to size an order against it."
@@ -437,8 +520,6 @@ def fetch_paper_account_state(client: TradingClient) -> PaperAccountState:
     return PaperAccountState(
         equity=equity,
         cash=cash,
-        start_of_day_equity=start_of_day_equity,
-        daily_pnl=equity - start_of_day_equity,
         status=status,
         trading_blocked=bool(account.trading_blocked),
         account_blocked=bool(account.account_blocked),
@@ -464,7 +545,7 @@ def require_tradable_account(account: PaperAccountState) -> None:
 
 
 def fetch_paper_positions(client: TradingClient) -> dict[str, PaperPosition]:
-    """Read every open paper position, keyed by symbol.
+    """Read every open paper position, keyed by `broker_symbol_key`.
 
     A **short** position raises rather than being coerced into a long. This
     system cannot reason about one: it would make a SELL an increase in risk
@@ -484,27 +565,158 @@ def fetch_paper_positions(client: TradingClient) -> dict[str, PaperPosition]:
                 "submitted."
             )
         symbol = str(position.symbol)
-        normalized[symbol] = PaperPosition(
+        quantity = to_broker_decimal(position.qty, f"{symbol} position quantity")
+        if quantity < 0:
+            raise UnsupportedBrokerStateError(
+                f"The broker reported a negative quantity for {symbol}. This system is "
+                "long only. Nothing was submitted."
+            )
+        normalized[broker_symbol_key(symbol)] = PaperPosition(
             symbol=symbol,
-            quantity=_to_whole_shares(position.qty, f"{symbol} position quantity"),
+            quantity=quantity,
             market_value=_to_float(position.market_value, f"{symbol} position market value"),
             average_entry_price=_optional_float(position.avg_entry_price),
         )
     return normalized
 
 
-def fetch_market_clock(client: TradingClient) -> MarketClock:
-    """Read the broker's market clock. Never used to gate a submission."""
-    clock = client.get_clock()
-    timestamp = getattr(clock, "timestamp", None)
-    return MarketClock(
-        is_open=bool(clock.is_open),
-        timestamp=timestamp if isinstance(timestamp, datetime) else datetime.now(UTC),
+def _require_positive_decimal(value: object, field_name: str) -> Decimal:
+    """A broker-supplied constraint that must exist and be strictly positive."""
+    if value is None:
+        raise AssetNotTradableError(
+            f"The broker did not report {field_name}. Order precision cannot be derived "
+            "from anything else, and guessing it is not acceptable. Nothing was submitted."
+        )
+    amount = to_broker_decimal(value, field_name)
+    if amount <= 0:
+        raise AssetNotTradableError(
+            f"The broker reported a non-positive {field_name} ({amount}). Nothing was submitted."
+        )
+    return amount
+
+
+def fetch_crypto_asset(client: TradingClient, symbol: str) -> CryptoAssetSpec:
+    """Read one crypto asset's live broker metadata, or fail closed.
+
+    Every constraint an order depends on is read here rather than remembered:
+    the asset must be crypto (not an equity and not a perpetual future), active,
+    tradable, and fractionable, and it must report both a minimum order size and
+    a trade increment. Anything missing or contradictory raises.
+    """
+    ticker = normalize_symbol(symbol)
+    try:
+        asset = client.get_asset(ticker)
+    except APIError as error:
+        raise AssetNotTradableError(
+            f"Could not read broker metadata for {ticker}: {_api_error_text(error)}. "
+            "Nothing was submitted."
+        ) from None
+    except Exception as error:  # noqa: BLE001 - any failure here must fail closed
+        raise AssetNotTradableError(
+            f"Could not read broker metadata for {ticker}: {type(error).__name__}. "
+            "Nothing was submitted."
+        ) from None
+
+    if not isinstance(asset, Asset):
+        raise AssetNotTradableError(
+            f"The broker returned {ticker} asset metadata in an unexpected shape. "
+            "Nothing was submitted."
+        )
+
+    asset_class = (
+        asset.asset_class.value if isinstance(asset.asset_class, Enum) else str(asset.asset_class)
+    )
+    status = asset.status.value if isinstance(asset.status, Enum) else str(asset.status)
+
+    if asset_class != AssetClass.CRYPTO.value:
+        raise AssetNotTradableError(
+            f"{ticker} is reported as asset class {asset_class!r}, not "
+            f"{AssetClass.CRYPTO.value!r}. This system trades crypto spot only. "
+            "Nothing was submitted."
+        )
+    if status != AssetStatus.ACTIVE.value:
+        raise AssetNotTradableError(
+            f"{ticker} is {status!r} at the broker, not {AssetStatus.ACTIVE.value!r}. "
+            "Nothing was submitted."
+        )
+    if not asset.tradable:
+        raise AssetNotTradableError(
+            f"{ticker} is not tradable at the broker. Nothing was submitted."
+        )
+    if not asset.fractionable:
+        raise AssetNotTradableError(
+            f"The broker reports {ticker} as not fractionable, which contradicts the "
+            "fractional sizing this system depends on. Nothing was submitted."
+        )
+
+    min_order_size = _require_positive_decimal(asset.min_order_size, f"{ticker} min_order_size")
+    min_trade_increment = _require_positive_decimal(
+        asset.min_trade_increment, f"{ticker} min_trade_increment"
+    )
+    return CryptoAssetSpec(
+        symbol=ticker,
+        asset_class=asset_class,
+        status=status,
+        tradable=bool(asset.tradable),
+        fractionable=bool(asset.fractionable),
+        min_order_size=min_order_size,
+        min_trade_increment=min_trade_increment,
     )
 
 
-def fetch_reference_price(client: StockHistoricalDataClient, symbol: str) -> float:
-    """Return the latest IEX trade price for `symbol`.
+def normalize_broker_quantity(quantity: Decimal, asset: CryptoAssetSpec) -> Decimal:
+    """Round `quantity` **down** to the asset's trade increment.
+
+    Down, always. Rounding up would send more than the risk engine approved,
+    which is the one direction this boundary may never move in. If the result
+    lands below the broker's minimum order size there is no valid order to
+    place, and that is reported rather than papered over by rounding back up.
+    """
+    amount = require_quantity(quantity, "quantity")
+    steps = (amount / asset.min_trade_increment).to_integral_value(rounding=ROUND_FLOOR)
+    normalized = (steps * asset.min_trade_increment).quantize(
+        asset.min_trade_increment, rounding=ROUND_FLOOR
+    )
+    if normalized > amount:  # pragma: no cover - ROUND_FLOOR cannot exceed the input
+        raise QuantityBelowMinimumError(
+            "Quantity normalization increased the order size, which is never allowed."
+        )
+    if normalized < asset.min_order_size or normalized <= 0:
+        raise QuantityBelowMinimumError(
+            f"{format_quantity(amount)} {asset.symbol} normalizes down to "
+            f"{format_quantity(normalized)} at the broker's trade increment of "
+            f"{format_quantity(asset.min_trade_increment)}, which is below its minimum "
+            f"order size of {format_quantity(asset.min_order_size)}. No order was "
+            "submitted: rounding up would exceed what risk approved."
+        )
+    return normalized
+
+
+def to_wire_quantity(quantity: Decimal) -> float:
+    """Render an exact quantity as the float the installed SDK's request takes.
+
+    `MarketOrderRequest.qty` is typed as a float, so the exact Decimal has to
+    become one somewhere. It becomes one here, and only after checking that the
+    value the broker will actually receive - the float's shortest round-tripping
+    decimal form, which is what JSON serialization emits - is not *larger* than
+    the approved quantity. If a conversion artefact pushed it up, the value
+    steps down to the next representable float instead. A quantity may shrink
+    on the way to the broker; it may never grow.
+    """
+    amount = require_quantity(quantity, "quantity")
+    value = float(amount)
+    while value > 0 and Decimal(repr(value)) > amount:  # pragma: no branch
+        value = math.nextafter(value, 0.0)
+    if value <= 0:
+        raise QuantityBelowMinimumError(
+            f"{format_quantity(amount)} cannot be represented as a positive order "
+            "quantity. No order was submitted."
+        )
+    return value
+
+
+def fetch_reference_price(client: CryptoHistoricalDataClient, symbol: str) -> float:
+    """Return the latest crypto trade price for `symbol`.
 
     This is the *current* market price, not a stored historical bar: sizing a
     live order against yesterday's Parquet close would be wrong. A price that
@@ -512,9 +724,9 @@ def fetch_reference_price(client: StockHistoricalDataClient, symbol: str) -> flo
     order is sized or submitted.
     """
     ticker = normalize_symbol(symbol)
-    request = StockLatestTradeRequest(symbol_or_symbols=ticker, feed=REFERENCE_PRICE_FEED)
+    request = CryptoLatestTradeRequest(symbol_or_symbols=ticker)
     try:
-        latest = client.get_stock_latest_trade(request)
+        latest = client.get_crypto_latest_trade(request, feed=REFERENCE_PRICE_FEED)
     except APIError as error:
         raise ReferencePriceUnavailableError(
             f"Could not get a current price for {ticker}: {_api_error_text(error)}. "
@@ -526,7 +738,7 @@ def fetch_reference_price(client: StockHistoricalDataClient, symbol: str) -> flo
             "Nothing was submitted."
         ) from None
 
-    trade = latest.get(ticker) if hasattr(latest, "get") else None
+    trade = _select_by_symbol(latest, ticker)
     price = getattr(trade, "price", None)
     if price is None:
         raise ReferencePriceUnavailableError(
@@ -540,9 +752,55 @@ def fetch_reference_price(client: StockHistoricalDataClient, symbol: str) -> flo
         ) from None
 
 
+def _select_by_symbol(payload: object, ticker: str) -> object | None:
+    """Pull one symbol's entry out of a keyed market-data response.
+
+    The provider keys the mapping by its own spelling of the pair, which is not
+    guaranteed to be the canonical one, so a direct hit is tried first and a
+    `broker_symbol_key` match second.
+    """
+    if not hasattr(payload, "get"):
+        return None
+    direct = payload.get(ticker)  # type: ignore[union-attr]
+    if direct is not None:
+        return direct
+    wanted = broker_symbol_key(ticker)
+    items = payload.items() if hasattr(payload, "items") else ()
+    for key, value in items:
+        if broker_symbol_key(str(key)) == wanted:
+            return value
+    return None
+
+
 # --------------------------------------------------------------------------
 # Risk context
 # --------------------------------------------------------------------------
+
+
+def resolve_daily_baseline_equity(
+    connection: sqlite3.Connection, *, equity: float, now: datetime
+) -> Decimal:
+    """Return the equity baseline the UTC risk day is measured against.
+
+    The first equity observed on a UTC calendar date establishes that date's
+    baseline durably; every later check on the same date reuses it, so the
+    daily-loss halt survives a process restart and cannot be reset by
+    re-running a command.
+
+    **Honest limitation.** This is the first equity this system *observed* on
+    the date, not the equity at exactly 00:00 UTC. Nothing in this milestone
+    runs continuously, so a day whose first observation is at 14:00 UTC is
+    measured from 14:00 UTC. The stored `captured_at` records how close that
+    was, and a 24/7 runner (Phase 9) is what will make the first observation
+    land near the boundary.
+    """
+    baseline = state.ensure_daily_risk_baseline(
+        connection,
+        risk_date_utc=state.utc_risk_date(now),
+        baseline_equity=Decimal(str(equity)),
+        captured_at=now,
+    )
+    return baseline.baseline_equity
 
 
 def build_risk_context(
@@ -550,9 +808,10 @@ def build_risk_context(
     positions: dict[str, PaperPosition],
     symbol: str,
     *,
+    daily_baseline_equity: Decimal,
     trading_enabled: bool = True,
 ) -> RiskContext:
-    """Map current paper broker state onto Phase 5's account context.
+    """Map current paper broker state onto the risk engine's account context.
 
     The mapping, field by field:
 
@@ -561,11 +820,11 @@ def build_risk_context(
     ==========================  ====================================================
     `equity`                    `TradeAccount.equity`
     `cash`                      `TradeAccount.cash`
-    `start_of_day_equity`       `TradeAccount.last_equity` (prior close)
-    `daily_pnl`                 `equity - last_equity`
+    `start_of_day_equity`       the stored UTC-day baseline
+    `daily_pnl`                 `equity - baseline`
     `total_exposure`            sum of positive **long** position market values
-    `symbol_exposure`           that symbol's long market value, else 0
-    `current_position_quantity` that symbol's long share count, else 0
+    `symbol_exposure`           that pair's long market value, else 0
+    `current_position_quantity` that pair's long quantity, else 0
     `trading_enabled`           caller-supplied kill switch
     ==========================  ====================================================
 
@@ -573,26 +832,31 @@ def build_risk_context(
     from `long_market_value`, so the total and the per-symbol figure it must
     contain always come from one source and cannot disagree.
 
-    `trading_enabled` is Phase 5's kill switch and is a parameter, not an
-    environment variable: the operational off switch for this phase is the
-    submission gate, and a second env-driven switch would make it ambiguous
+    The daily baseline is the **UTC-day** figure, never `TradeAccount.last_equity`:
+    that field is an equity-session previous close, and a market that never
+    closes does not have one.
+
+    `trading_enabled` is the risk engine's kill switch and is a parameter, not
+    an environment variable: the operational off switch for this milestone is
+    the submission gate, and a second env-driven switch would make it ambiguous
     which one stopped a trade. Turning it off blocks new entries while still
-    permitting a risk-reducing exit, which is exactly Phase 5's contract.
+    permitting a risk-reducing exit.
     """
     ticker = normalize_symbol(symbol)
     total_exposure = sum(
         position.market_value for position in positions.values() if position.market_value > 0
     )
-    held = positions.get(ticker)
+    held = positions.get(broker_symbol_key(ticker))
     symbol_exposure = max(0.0, held.market_value) if held is not None else 0.0
+    baseline = float(daily_baseline_equity)
     return RiskContext(
         equity=account.equity,
         cash=max(0.0, account.cash),
         total_exposure=total_exposure,
         symbol_exposure=symbol_exposure,
-        current_position_quantity=held.quantity if held is not None else 0,
-        daily_pnl=account.daily_pnl,
-        start_of_day_equity=account.start_of_day_equity,
+        current_position_quantity=held.quantity if held is not None else _ZERO,
+        daily_pnl=account.equity - baseline,
+        start_of_day_equity=baseline,
         trading_enabled=trading_enabled,
     )
 
@@ -610,21 +874,23 @@ def _to_risk_side(side: OrderSide) -> RiskSide:
 def build_market_order_request(intent: OrderIntent) -> MarketOrderRequest:
     """Translate an approved intent into the Alpaca request to send.
 
-    Always a MARKET order, DAY time in force, regular hours, whole shares, and
-    carrying the intent's `client_order_id`. `notional` is never set - a
-    notional order would be sized in dollars by the broker rather than by the
-    risk engine, which would put sizing outside this system's control.
+    Always a MARKET order, `ORDER_TIME_IN_FORCE` (GTC), and carrying the
+    intent's `client_order_id`. `notional` is never set - a notional order
+    would be sized in dollars by the broker rather than by the risk engine,
+    which would put sizing outside this system's control. `extended_hours` is
+    not set either: it is an equity-session flag with no meaning for a market
+    that never closes.
 
-    The quantity is `approved_quantity`, the risk engine's number. The
-    requested quantity is deliberately not reachable from here.
+    The quantity is `approved_quantity` - risk's number after rounding down to
+    the broker's own trade increment. The requested quantity is deliberately
+    not reachable from here.
     """
     return MarketOrderRequest(
         symbol=intent.symbol,
-        qty=intent.approved_quantity,
+        qty=to_wire_quantity(intent.approved_quantity),
         side=AlpacaOrderSide.BUY if intent.side is OrderSide.BUY else AlpacaOrderSide.SELL,
-        time_in_force=TimeInForce.DAY,
+        time_in_force=ORDER_TIME_IN_FORCE,
         client_order_id=intent.client_order_id,
-        extended_hours=False,
     )
 
 
@@ -665,16 +931,17 @@ def _is_definite_rejection(error: APIError) -> bool:
 
 
 def _to_snapshot(order: Order) -> BrokerOrderSnapshot:
-    """Normalize an Alpaca order into the snapshot this phase stores."""
+    """Normalize an Alpaca order into the snapshot this milestone stores."""
     status = order.status.value if isinstance(order.status, Enum) else str(order.status)
     side = order.side.value.upper() if isinstance(order.side, Enum) else str(order.side).upper()
+    filled = order.filled_qty if order.filled_qty is not None else 0
     return BrokerOrderSnapshot(
         broker_order_id=str(order.id),
         client_order_id=str(order.client_order_id),
         symbol=str(order.symbol),
         side=side,
-        quantity=_to_whole_shares(order.qty, "order quantity"),
-        filled_quantity=_to_whole_shares(order.filled_qty or 0, "filled quantity"),
+        quantity=to_broker_decimal(order.qty, "order quantity"),
+        filled_quantity=to_broker_decimal(filled, "filled quantity"),
         filled_average_price=_optional_float(order.filled_avg_price),
         status=status,
         submitted_at=order.submitted_at,
@@ -752,12 +1019,13 @@ class PaperExecutionResult:
     outcome: ExecutionOutcome
     symbol: str
     side: OrderSide
-    requested_quantity: int
+    requested_quantity: Decimal
     reference_price: float
     risk_decision: RiskDecision
     account: PaperAccountState
-    clock: MarketClock
+    daily_baseline_equity: Decimal
     message: str
+    asset: CryptoAssetSpec | None = None
     intent: OrderIntent | None = None
     order_intent_id: int | None = None
     broker_order: BrokerOrderSnapshot | None = None
@@ -770,6 +1038,11 @@ class PaperExecutionResult:
         submission would let a caller assume a fill that may not exist.
         """
         return self.outcome in (ExecutionOutcome.SUBMITTED, ExecutionOutcome.DUPLICATE)
+
+    @property
+    def submitted_quantity(self) -> Decimal | None:
+        """The exact quantity this attempt would send, once one exists."""
+        return None if self.intent is None else self.intent.approved_quantity
 
 
 def _persist_broker_snapshot(
@@ -901,8 +1174,9 @@ def submit_order_intent(
         event_type=EVENT_SUBMITTED,
         message=(
             f"Paper order {snapshot.broker_order_id} accepted for client_order_id "
-            f"{intent.client_order_id} ({snapshot.side} {snapshot.quantity} "
-            f"{snapshot.symbol}, broker status {snapshot.status})."
+            f"{intent.client_order_id} ({snapshot.side} "
+            f"{format_quantity(snapshot.quantity)} {snapshot.symbol}, broker status "
+            f"{snapshot.status})."
         ),
     )
     return SubmissionResult(snapshot=snapshot, duplicate=False)
@@ -949,47 +1223,53 @@ def execute_paper_order(
     *,
     symbol: str,
     side: str | OrderSide,
-    requested_quantity: int,
+    requested_quantity: Decimal,
     trading_client: TradingClient | None = None,
-    data_client: StockHistoricalDataClient | None = None,
+    data_client: CryptoHistoricalDataClient | None = None,
     dry_run: bool = False,
     trading_enabled: bool = True,
     strategy_run_id: int | None = None,
     now: datetime | None = None,
 ) -> PaperExecutionResult:
-    """Run the full paper execution pipeline for one order.
+    """Run the full paper execution pipeline for one crypto order.
 
     The order of operations is the safety contract:
 
-    1. validate the request against this phase's scope;
+    1. validate the request against this milestone's scope;
     2. read the paper account and refuse a non-tradable one;
-    3. read positions and the market clock;
-    4. read the **current** IEX reference price, failing closed without one;
-    5. evaluate risk against the real account state;
-    6. persist the risk decision;
-    7. stop here if risk refused - no intent, no broker request;
-    8. stop here if this is a dry run - nothing is persisted or sent;
-    9. create the intent with its `client_order_id` and **commit** it;
-    10. preflight for a duplicate, failing closed if the check cannot complete;
-    11. submit exactly once;
-    12. persist whatever the broker said.
+    3. read positions;
+    4. read the asset's live broker metadata, failing closed without it;
+    5. read the **current** crypto reference price, failing closed without one;
+    6. resolve the durable UTC-day equity baseline;
+    7. evaluate risk against the real account state;
+    8. persist the risk decision;
+    9. stop here if risk refused - no intent, no broker request;
+    10. round the approved quantity **down** to the broker's trade increment,
+        refusing it if that lands below the broker's minimum;
+    11. stop here if this is a dry run - nothing is persisted or sent;
+    12. create the intent with its `client_order_id` and **commit** it;
+    13. preflight for a duplicate, failing closed if the check cannot complete;
+    14. submit exactly once;
+    15. persist whatever the broker said.
 
-    Steps 9 and 11 are in that order deliberately: a crash between them leaves
+    Steps 12 and 14 are in that order deliberately: a crash between them leaves
     a durable key that Phase 8 can resolve, whereas submitting first would
     leave a real order with no local trace.
 
-    The broker quantity is always `RiskDecision.approved_quantity`. If risk
-    clamps 100 shares to 3, the broker is asked for 3.
+    The broker quantity is never more than `RiskDecision.approved_quantity`.
+    If risk clamps a request to 0.05 BTC, the broker is asked for 0.05 BTC or
+    the largest whole multiple of its trade increment below that - never more.
 
     Returns a `PaperExecutionResult`. Expected operational failures - a closed
-    gate, missing credentials, an untradable account, no price, an
-    incompletable duplicate check, a broker rejection, an ambiguous outcome -
-    raise an `ExecutionError` subclass rather than returning quietly.
+    gate, missing credentials, an untradable account or asset, no price, a
+    quantity below the broker's minimum, an incompletable duplicate check, a
+    broker rejection, an ambiguous outcome - raise an `ExecutionError` subclass
+    rather than returning quietly.
     """
     moment = now if now is not None else datetime.now(UTC)
     ticker = normalize_symbol(symbol)
     order_side = normalize_side(side)
-    quantity = require_whole_share_quantity(requested_quantity, "requested_quantity")
+    quantity = require_quantity(requested_quantity, "requested_quantity")
 
     if not dry_run:
         require_paper_trading_enabled()
@@ -1000,10 +1280,17 @@ def execute_paper_order(
     account = fetch_paper_account_state(client)
     require_tradable_account(account)
     positions = fetch_paper_positions(client)
-    clock = fetch_market_clock(client)
+    asset = fetch_crypto_asset(client, ticker)
     reference_price = fetch_reference_price(prices, ticker)
 
-    context = build_risk_context(account, positions, ticker, trading_enabled=trading_enabled)
+    baseline_equity = resolve_daily_baseline_equity(connection, equity=account.equity, now=moment)
+    context = build_risk_context(
+        account,
+        positions,
+        ticker,
+        daily_baseline_equity=baseline_equity,
+        trading_enabled=trading_enabled,
+    )
     decision = evaluate_risk(
         RiskRequest(
             symbol=ticker,
@@ -1018,11 +1305,11 @@ def execute_paper_order(
     # before anything is submitted. Nothing later in this function updates it:
     # an accepted order is not a fill, and inferring a position from one would
     # be a fabrication. Phase 8 reconciles this table properly.
-    held = positions.get(ticker)
+    held = positions.get(broker_symbol_key(ticker))
     state.upsert_position(
         connection,
         symbol=ticker,
-        quantity=held.quantity if held is not None else 0,
+        quantity=held.quantity if held is not None else _ZERO,
         average_price=held.average_entry_price if held is not None else None,
         updated_at=moment,
     )
@@ -1044,7 +1331,8 @@ def execute_paper_order(
         "reference_price": reference_price,
         "risk_decision": decision,
         "account": account,
-        "clock": clock,
+        "daily_baseline_equity": baseline_equity,
+        "asset": asset,
     }
 
     if not decision.approved:
@@ -1054,11 +1342,13 @@ def execute_paper_order(
             **common,
         )
 
+    broker_quantity = normalize_broker_quantity(decision.approved_quantity, asset)
+
     intent = OrderIntent(
         symbol=ticker,
         side=order_side,
         requested_quantity=quantity,
-        approved_quantity=decision.approved_quantity,
+        approved_quantity=broker_quantity,
         reference_price=reference_price,
         risk_reason_code=decision.reason_code,
         created_at=moment,
@@ -1118,40 +1408,48 @@ __all__ = [
     "EVENT_REJECTED",
     "EVENT_SUBMITTED",
     "EVENT_UNKNOWN",
+    "ORDER_TIME_IN_FORCE",
     "PAPER_TRADING_ENABLED_ENV",
     "PAPER_TRADING_ENABLED_VALUE",
     "REFERENCE_PRICE_FEED",
     "TRADABLE_ACCOUNT_STATUSES",
     "AccountNotTradableError",
     "AmbiguousSubmissionError",
+    "AssetNotTradableError",
     "BrokerOrderSnapshot",
     "BrokerRejectedOrderError",
     "ConfirmationRequiredError",
+    "CryptoAssetSpec",
     "DuplicatePreflightUnavailableError",
     "ExecutionOutcome",
-    "MarketClock",
     "MissingCredentialsError",
     "PaperAccountState",
     "PaperExecutionResult",
     "PaperPosition",
     "PaperTradingDisabledError",
+    "QuantityBelowMinimumError",
     "ReferencePriceUnavailableError",
     "SubmissionResult",
     "UnsupportedBrokerStateError",
+    "broker_symbol_key",
     "build_market_order_request",
     "build_risk_context",
     "create_market_data_client",
     "create_paper_trading_client",
     "credentials_configured",
     "execute_paper_order",
-    "fetch_market_clock",
+    "fetch_crypto_asset",
     "fetch_paper_account_state",
     "fetch_paper_positions",
     "fetch_reference_price",
     "find_broker_order_by_client_id",
+    "normalize_broker_quantity",
     "paper_trading_enabled",
     "require_confirmation",
     "require_paper_trading_enabled",
     "require_tradable_account",
+    "resolve_daily_baseline_equity",
     "submit_order_intent",
+    "to_broker_decimal",
+    "to_wire_quantity",
 ]

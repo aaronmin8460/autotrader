@@ -1,8 +1,12 @@
 """Signal-generating strategies. Strategies never submit broker orders.
 
-Phase 3 provides the single V0.1 strategy: the EMA 20 / EMA 50 crossover in
-`ema_cross`. It emits signals only - no orders, no fills, no positions, no
-P&L - and there is deliberately no plugin framework around it.
+The single V0.2 strategy is the EMA 20 / EMA 50 crossover in `ema_cross`. It
+emits signals only - no orders, no fills, no positions, no P&L - and there is
+deliberately no plugin framework around it.
+
+Its semantics did not change in the crypto pivot. The crossover reads a close
+price and two EMAs; nothing in it was ever specific to an asset class, and
+`BTC/USD` is simply a symbol string like any other.
 """
 
 from autotrader.strategies.ema_cross import (

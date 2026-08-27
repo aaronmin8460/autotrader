@@ -1,30 +1,36 @@
-"""The local SQLite operational-state store (Phase 6, extended by Phase 7).
+"""The local SQLite operational-state store (schema v3).
 
 This module is **persistence infrastructure and nothing else**. It opens a
 local SQLite database, creates a small fixed schema, and stores a handful of
 durable operational records. It does not decide anything, orchestrate
 anything, or talk to anyone: no strategy runs here, no risk rule is evaluated,
 no order is *placed*, and no broker is contacted. It imports only the standard
-library, needs no credentials, and opens no socket. Phase 7 added two tables to
-it; it did not add a broker client to it.
+library, needs no credentials, and opens no socket.
 
 **Why SQLite.** One user, one local process, one file (docs/SPEC.md section 5).
 The standard library ships the driver, so the dependency footprint of this
-phase is zero - no ORM, no migration framework, and no database service.
+module is zero - no ORM, no migration framework, and no database service.
 
-**What Phase 7 added, and why only now.** Schema v2 introduces `order_intents`
-and `broker_orders`. They were deliberately absent from v1: they describe an
-external system this repository did not yet talk to, and their semantics
-cannot be guessed correctly in advance. They exist now because Phase 7 has
-actually read the broker's vocabulary. `broker_orders.status` is still stored
-as **opaque text** - this module does not model a broker state machine, and a
-stored row means an order was accepted, never that it filled.
+**What v3 changed, and why.** The crypto pivot made every stored quantity
+fractional. Quantities that were `INTEGER` columns cannot express 0.0001 BTC at
+all, so v3 migrates them to **exact decimal text** and the read models return
+`decimal.Decimal`. v3 also adds `daily_risk_baselines`, the durable record of
+the first account equity observed on a UTC calendar day - the baseline the
+crypto daily-loss halt measures against, because a 24/7 market has no
+equity-session "previous close" to borrow.
+
+**Prices stayed REAL.** The audit covered every money and quantity column.
+`INTEGER` quantities were migrated because whole numbers cannot represent a
+fractional coin; `REAL` prices were **not**, because a float already represents
+a fractional USD mark, and moving them to text would silently discard the
+`CHECK (... > 0)` constraints that make an impossible price unstorable even by
+a writer that bypassed this module. A price here is a mark, never a quantity.
 
 **What is still deliberately absent.** There is no `fills`, `executions`,
 `broker_accounts`, or `reconciliation_runs` table. Phase 8 owns those, and the
 same reasoning applies: better added later, correctly, than guessed at now.
-`risk_events` remains deliberately generic - Phase 5 owns the meaning of a risk
-decision, and this module stores opaque text rather than importing or
+`risk_events` remains deliberately generic - the risk engine owns the meaning
+of a risk decision, and this module stores opaque text rather than importing or
 mirroring its model.
 
 **Transactions.** Connections run with `isolation_level=None`, so nothing is
@@ -52,14 +58,15 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 #: The schema this module understands. There is no migration *framework*, but
-#: there is one small explicit upgrade path, v1 -> v2, applied in a single
-#: transaction by `initialize_database`. A database written by a **newer**
-#: version is refused, never downgraded.
-SCHEMA_VERSION = 2
+#: there is an explicit ordered upgrade path - v1 -> v2 -> v3 - applied in a
+#: single transaction by `initialize_database`. A database written by a
+#: **newer** version is refused, never downgraded.
+SCHEMA_VERSION = 3
 
 #: The oldest on-disk version this module can still open. Anything below it
 #: predates the migration path and is refused rather than guessed at.
@@ -75,8 +82,8 @@ DEFAULT_DATABASE_PATH = Path("data/autotrader.db")
 BUSY_TIMEOUT_MS = 5_000
 
 #: Every table this schema owns. Used for the lightweight consistency check in
-#: `initialize_database`, and asserted against in tests so a table this phase
-#: has not earned cannot appear here unnoticed. The last two arrived with v2.
+#: `initialize_database`, and asserted against in tests so a table this
+#: milestone has not earned cannot appear here unnoticed.
 REQUIRED_TABLES: tuple[str, ...] = (
     "schema_metadata",
     "strategy_runs",
@@ -86,14 +93,28 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "positions",
     "order_intents",
     "broker_orders",
+    "daily_risk_baselines",
 )
 
-#: The tables v2 adds on top of v1. Kept separate so the migration and a fresh
-#: initialization are provably the same set of statements.
+#: The tables v2 added on top of v1. Kept separate so the v1 -> v2 migration
+#: and the historical v2 shape stay provably the same set of statements.
 V2_TABLES: tuple[str, ...] = ("order_intents", "broker_orders")
 
+#: The table v3 adds on top of v2.
+V3_TABLES: tuple[str, ...] = ("daily_risk_baselines",)
+
+#: Transient names the v2 -> v3 rebuild parks the old tables under. They exist
+#: only inside the migration transaction and are dropped before it commits, so
+#: finding one on disk means a migration was interrupted in a way SQLite is
+#: supposed to make impossible.
+_PRE_V3_TABLES: tuple[str, ...] = (
+    "positions__pre_v3",
+    "order_intents__pre_v3",
+    "broker_orders__pre_v3",
+)
+
 #: How a run was executed. Plain text, not a SQL enum. `PAPER` is a label a
-#: future phase may write; Phase 6 implements no paper behaviour whatsoever.
+#: future phase may write; this module implements no paper behaviour whatsoever.
 RUN_MODES: tuple[str, ...] = ("BACKTEST", "PAPER")
 
 RUN_STATUS_RUNNING = "RUNNING"
@@ -104,7 +125,7 @@ RUN_STATUS_FAILED = "FAILED"
 TERMINAL_RUN_STATUSES: tuple[str, ...] = (RUN_STATUS_COMPLETED, RUN_STATUS_FAILED)
 RUN_STATUSES: tuple[str, ...] = (RUN_STATUS_RUNNING, *TERMINAL_RUN_STATUSES)
 
-#: The Phase 3 signal vocabulary, unchanged. `EXIT` is stored as `EXIT`: this
+#: The strategy's signal vocabulary, unchanged. `EXIT` is stored as `EXIT`: this
 #: layer never translates it into `SELL`, because a signal is not a trade.
 SIGNAL_TYPES: tuple[str, ...] = ("BUY", "EXIT")
 
@@ -112,7 +133,7 @@ SIGNAL_TYPES: tuple[str, ...] = ("BUY", "EXIT")
 #: store, so a short cannot be recorded even by a caller that bypassed Python.
 ORDER_SIDES: tuple[str, ...] = ("BUY", "SELL")
 
-#: An intent's lifecycle, deliberately small (docs/SPEC.md section 8, Phase 7).
+#: An intent's lifecycle, deliberately small (docs/SPEC.md section 8, C7).
 #:
 #: `CREATED`    persisted locally; the broker has not been called for it.
 #: `SUBMITTING` a submission is in flight; a row left here means the process
@@ -192,7 +213,7 @@ class UnknownOrderIntentError(StateError):
 class DuplicateBrokerOrderError(StateError):
     """A different broker order is already recorded under that identity.
 
-    Phase 7 allows exactly one broker order per intent, so a second distinct
+    Exactly one broker order is allowed per intent, so a second distinct
     `broker_order_id` for the same intent - or the same `broker_order_id`
     under a different intent - is a contradiction rather than an update.
     """
@@ -240,6 +261,90 @@ def _now_text() -> str:
     return to_utc_text(datetime.now(UTC))
 
 
+def utc_risk_date(moment: datetime) -> date:
+    """The UTC calendar date `moment` falls on.
+
+    The crypto risk day runs 00:00 UTC to the next 00:00 UTC. There is no
+    exchange session to anchor it to, so the boundary is the UTC date and
+    nothing else. Naive datetimes are rejected for the same reason they are
+    everywhere else here: guessing an offset would silently misdate a day.
+    """
+    if not isinstance(moment, datetime):
+        raise StateInputError(f"moment must be a datetime, got {type(moment).__name__}.")
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise StateInputError(
+            "moment must be timezone-aware; a naive datetime cannot be placed on a UTC "
+            "calendar day without guessing its offset."
+        )
+    return moment.astimezone(UTC).date()
+
+
+def to_risk_date_text(value: date, field: str = "risk_date_utc") -> str:
+    """Serialize a UTC risk day to its canonical ``YYYY-MM-DD`` form."""
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise StateInputError(
+            f"{field} must be a datetime.date (not a datetime), got {type(value).__name__}. "
+            "Use utc_risk_date() to derive one from an aware timestamp."
+        )
+    return value.isoformat()
+
+
+def from_risk_date_text(text: str) -> date:
+    """Parse a stored risk day back into a `datetime.date`."""
+    try:
+        return date.fromisoformat(text)
+    except (TypeError, ValueError) as error:
+        raise DatabaseStateError(
+            f"Stored risk date {text!r} is not an ISO-8601 calendar date."
+        ) from error
+
+
+# --------------------------------------------------------------------------
+# Exact decimal storage
+#
+# Crypto quantities are fractional, and a binary float cannot hold one exactly.
+# They are therefore stored as canonical decimal **text** and read back as
+# `decimal.Decimal`, so a persisted quantity round-trips to the same value it
+# was written from. The storage string is an implementation detail: no public
+# read model exposes it, and every public quantity is a Decimal.
+# --------------------------------------------------------------------------
+
+
+def to_decimal_text(value: Decimal | int, field: str = "quantity") -> str:
+    """Serialize an exact quantity to its canonical decimal string.
+
+    Rendered in plain fixed-point notation - never ``1E-4`` - so a stored value
+    is readable and unambiguous, and so two writers of the same value produce
+    the same text. The scale the caller supplied is preserved: ``1.25000000``
+    stays ``1.25000000`` and ``1`` stays ``1``, because a quantity's precision
+    is information about how it was derived.
+
+    A `float` is refused rather than converted. A binary float is an
+    approximation, and quietly writing one into a column whose whole purpose is
+    exactness would defeat the point.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, Decimal)):
+        raise StateInputError(
+            f"{field} must be a Decimal or an int, got {type(value).__name__}. Floats are "
+            "refused: an exact quantity cannot be recovered from a binary approximation."
+        )
+    number = Decimal(value)
+    if not number.is_finite():
+        raise StateInputError(f"{field} must be finite, got {value!r}.")
+    return format(number, "f")
+
+
+def from_decimal_text(text: object, field: str = "quantity") -> Decimal:
+    """Parse a stored canonical decimal string back into a `Decimal`."""
+    try:
+        number = Decimal(str(text))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise DatabaseStateError(f"Stored {field} {text!r} is not a decimal number.") from error
+    if not number.is_finite():
+        raise DatabaseStateError(f"Stored {field} {text!r} is not finite.")
+    return number
+
+
 # --------------------------------------------------------------------------
 # Value validation
 # --------------------------------------------------------------------------
@@ -269,11 +374,13 @@ def _require_choice(value: str, field: str, allowed: tuple[str, ...]) -> str:
 
 
 def _require_symbol(value: str, field: str = "symbol") -> str:
-    """Require an uppercase ticker.
+    """Require an uppercase symbol, stored exactly as supplied.
 
     Case is not normalized here. Stored data is already uppercase by the
-    Phase 1 contract, and silently upper-casing would let `spy` and `SPY`
-    become one row without the caller ever learning it had a bug.
+    market-data contract, and silently upper-casing would let `btc/usd` and
+    `BTC/USD` become one row without the caller ever learning it had a bug.
+    The slash in a canonical crypto pair is left alone: it is part of the
+    symbol, and this layer stores what it is given.
     """
     symbol = _require_text(value, field)
     if symbol != symbol.upper():
@@ -281,34 +388,36 @@ def _require_symbol(value: str, field: str = "symbol") -> str:
     return symbol
 
 
-def _require_quantity(value: int, field: str = "quantity") -> int:
-    """Require a non-negative whole-share quantity.
+def _require_quantity(value: Decimal | int, field: str = "quantity") -> Decimal:
+    """Require a non-negative fractional quantity.
 
     The system is long only (docs/SPEC.md section 3), so a negative quantity
     would represent a short position that no code path can legitimately
     produce. The same rule is a CHECK constraint in the schema.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise StateInputError(f"{field} must be an int, got {type(value).__name__}.")
-    if value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, Decimal)):
+        raise StateInputError(f"{field} must be a Decimal or an int, got {type(value).__name__}.")
+    number = Decimal(value)
+    if not number.is_finite():
+        raise StateInputError(f"{field} must be finite, got {value!r}.")
+    if number < 0:
         raise StateInputError(
             f"{field} must be >= 0; this system is long only and cannot hold a short "
             f"position. Got {value}."
         )
-    return value
+    return number
 
 
-def _require_positive_quantity(value: int, field: str) -> int:
-    """Require a whole-share quantity strictly greater than zero.
+def _require_positive_quantity(value: Decimal | int, field: str) -> Decimal:
+    """Require a fractional quantity strictly greater than zero.
 
-    An order for zero shares is not an order. The same rule is a CHECK
+    An order for zero of an asset is not an order. The same rule is a CHECK
     constraint in the schema.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise StateInputError(f"{field} must be an int, got {type(value).__name__}.")
-    if value <= 0:
+    number = _require_quantity(value, field)
+    if number <= 0:
         raise StateInputError(f"{field} must be greater than zero, got {value}.")
-    return value
+    return number
 
 
 def _require_positive_price(value: float, field: str) -> float:
@@ -358,7 +467,7 @@ class StrategyRun:
 
 @dataclass(frozen=True)
 class StoredSignal:
-    """A persisted Phase 3 signal.
+    """A persisted strategy signal.
 
     Named to stay distinct from `autotrader.strategies.Signal`: that one is a
     freshly computed observation, this one is a durable record of it.
@@ -380,7 +489,7 @@ class RiskEvent:
     """A risk decision, stored generically.
 
     `decision` and `reason_code` are opaque strings owned by the risk engine
-    (Phase 5). This module neither interprets nor constrains their values.
+    (C5). This module neither interprets nor constrains their values.
     """
 
     id: int
@@ -424,8 +533,8 @@ class StoredOrderIntent:
     created_at: datetime
     symbol: str
     side: str
-    requested_quantity: int
-    approved_quantity: int
+    requested_quantity: Decimal
+    approved_quantity: Decimal
     reference_price: float
     risk_reason_code: str
     status: str
@@ -448,8 +557,8 @@ class StoredBrokerOrder:
     client_order_id: str
     symbol: str
     side: str
-    quantity: int
-    filled_quantity: int
+    quantity: Decimal
+    filled_quantity: Decimal
     filled_average_price: float | None
     status: str
     submitted_at: datetime | None
@@ -469,24 +578,38 @@ class Position:
     """
 
     symbol: str
-    quantity: int
+    quantity: Decimal
     average_price: float | None
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class DailyRiskBaseline:
+    """The account equity a UTC risk day is measured against.
+
+    Written once per UTC calendar date, by whichever observation happens first
+    on that date, and never overwritten afterwards: a baseline that moved
+    during the day would silently reset the daily-loss halt. `baseline_equity`
+    is the equity that was observed, and `captured_at` is when.
+    """
+
+    risk_date_utc: date
+    baseline_equity: Decimal
+    captured_at: datetime
 
 
 # --------------------------------------------------------------------------
 # Schema
 # --------------------------------------------------------------------------
 
-_V1_SCHEMA_STATEMENTS: tuple[str, ...] = (
-    """
+_CREATE_SCHEMA_METADATA = """
     CREATE TABLE schema_metadata (
         id             INTEGER PRIMARY KEY CHECK (id = 1),
         schema_version INTEGER NOT NULL,
         created_at     TEXT    NOT NULL
     )
-    """,
     """
+_CREATE_STRATEGY_RUNS = """
     CREATE TABLE strategy_runs (
         id            INTEGER PRIMARY KEY,
         strategy_name TEXT NOT NULL CHECK (strategy_name <> ''),
@@ -496,8 +619,8 @@ _V1_SCHEMA_STATEMENTS: tuple[str, ...] = (
         ended_at      TEXT,
         created_at    TEXT NOT NULL
     )
-    """,
     """
+_CREATE_SIGNALS = """
     CREATE TABLE signals (
         id               INTEGER PRIMARY KEY,
         strategy_run_id  INTEGER NOT NULL REFERENCES strategy_runs (id),
@@ -508,8 +631,8 @@ _V1_SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at       TEXT NOT NULL,
         UNIQUE (strategy_run_id, signal_timestamp, symbol, signal_type, reason)
     )
-    """,
     """
+_CREATE_RISK_EVENTS = """
     CREATE TABLE risk_events (
         id              INTEGER PRIMARY KEY,
         strategy_run_id INTEGER REFERENCES strategy_runs (id),
@@ -520,8 +643,8 @@ _V1_SCHEMA_STATEMENTS: tuple[str, ...] = (
         message         TEXT,
         created_at      TEXT NOT NULL
     )
-    """,
     """
+_CREATE_SYSTEM_EVENTS = """
     CREATE TABLE system_events (
         id              INTEGER PRIMARY KEY,
         event_timestamp TEXT NOT NULL,
@@ -529,25 +652,45 @@ _V1_SCHEMA_STATEMENTS: tuple[str, ...] = (
         message         TEXT,
         created_at      TEXT NOT NULL
     )
-    """,
     """
+_CREATE_INDEX_SIGNALS = "CREATE INDEX idx_signals_strategy_run ON signals (strategy_run_id)"
+_CREATE_INDEX_RISK_EVENTS = (
+    "CREATE INDEX idx_risk_events_strategy_run ON risk_events (strategy_run_id)"
+)
+_CREATE_INDEX_ORDER_INTENTS_STATUS = (
+    "CREATE INDEX idx_order_intents_status ON order_intents (status)"
+)
+
+# --------------------------------------------------------------------------
+# Historical shapes
+#
+# These are the v1 and v2 tables exactly as they were written on disk. They are
+# retained because a database created by an older release still holds them and
+# the migration path has to read them - not because anything creates them
+# afresh. A new database is built directly at the current version.
+# --------------------------------------------------------------------------
+
+_CREATE_POSITIONS_V1 = """
     CREATE TABLE positions (
         symbol        TEXT PRIMARY KEY CHECK (symbol <> ''),
         quantity      INTEGER NOT NULL CHECK (quantity >= 0),
         average_price REAL CHECK (average_price IS NULL OR average_price > 0),
         updated_at    TEXT NOT NULL
     )
-    """,
-    "CREATE INDEX idx_signals_strategy_run ON signals (strategy_run_id)",
-    "CREATE INDEX idx_risk_events_strategy_run ON risk_events (strategy_run_id)",
+    """
+
+_V1_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    _CREATE_SCHEMA_METADATA,
+    _CREATE_STRATEGY_RUNS,
+    _CREATE_SIGNALS,
+    _CREATE_RISK_EVENTS,
+    _CREATE_SYSTEM_EVENTS,
+    _CREATE_POSITIONS_V1,
+    _CREATE_INDEX_SIGNALS,
+    _CREATE_INDEX_RISK_EVENTS,
 )
 
-#: Everything v2 adds. A fresh database runs v1 then v2 and is stamped 2; an
-#: existing v1 database runs exactly these statements and is re-stamped. One
-#: list, two callers, so "migrated to v2" and "created as v2" cannot drift -
-#: a test compares the resulting `sqlite_master` of both and requires equality.
-_V2_SCHEMA_STATEMENTS: tuple[str, ...] = (
-    """
+_CREATE_ORDER_INTENTS_V2 = """
     CREATE TABLE order_intents (
         id                 INTEGER PRIMARY KEY,
         client_order_id    TEXT NOT NULL UNIQUE CHECK (client_order_id <> ''),
@@ -565,8 +708,8 @@ _V2_SCHEMA_STATEMENTS: tuple[str, ...] = (
         updated_at         TEXT NOT NULL,
         CHECK (approved_quantity <= requested_quantity)
     )
-    """,
     """
+_CREATE_BROKER_ORDERS_V2 = """
     CREATE TABLE broker_orders (
         id                   INTEGER PRIMARY KEY,
         order_intent_id      INTEGER NOT NULL UNIQUE REFERENCES order_intents (id),
@@ -583,13 +726,167 @@ _V2_SCHEMA_STATEMENTS: tuple[str, ...] = (
         updated_at           TEXT NOT NULL,
         created_at           TEXT NOT NULL
     )
-    """,
-    "CREATE INDEX idx_order_intents_status ON order_intents (status)",
+    """
+
+#: Everything v2 added on top of v1. One list, used by the v1 -> v2 migration
+#: and by the tests that reconstruct a historical database.
+_V2_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    _CREATE_ORDER_INTENTS_V2,
+    _CREATE_BROKER_ORDERS_V2,
+    _CREATE_INDEX_ORDER_INTENTS_STATUS,
 )
 
-_SCHEMA_STATEMENTS: tuple[str, ...] = _V1_SCHEMA_STATEMENTS + _V2_SCHEMA_STATEMENTS
+# --------------------------------------------------------------------------
+# Current shapes (v3)
+#
+# Quantities are exact decimal TEXT. The CHECK constraints CAST to REAL so that
+# a negative or zero quantity is still unstorable by a writer that bypassed
+# this module; the cast is a coarse guard, not the value - Python holds the
+# exact Decimal, and the text column holds the exact string.
+# --------------------------------------------------------------------------
+
+_CREATE_POSITIONS = """
+    CREATE TABLE positions (
+        symbol        TEXT PRIMARY KEY CHECK (symbol <> ''),
+        quantity      TEXT NOT NULL CHECK (quantity <> '' AND CAST(quantity AS REAL) >= 0),
+        average_price REAL CHECK (average_price IS NULL OR average_price > 0),
+        updated_at    TEXT NOT NULL
+    )
+    """
+_CREATE_ORDER_INTENTS = """
+    CREATE TABLE order_intents (
+        id                 INTEGER PRIMARY KEY,
+        client_order_id    TEXT NOT NULL UNIQUE CHECK (client_order_id <> ''),
+        strategy_run_id    INTEGER REFERENCES strategy_runs (id),
+        created_at         TEXT NOT NULL,
+        symbol             TEXT NOT NULL CHECK (symbol <> ''),
+        side               TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+        requested_quantity TEXT NOT NULL CHECK (
+            requested_quantity <> '' AND CAST(requested_quantity AS REAL) > 0
+        ),
+        approved_quantity  TEXT NOT NULL CHECK (
+            approved_quantity <> '' AND CAST(approved_quantity AS REAL) > 0
+        ),
+        reference_price    REAL NOT NULL CHECK (reference_price > 0),
+        risk_reason_code   TEXT NOT NULL CHECK (risk_reason_code <> ''),
+        status             TEXT NOT NULL CHECK (
+            status IN ('CREATED', 'SUBMITTING', 'SUBMITTED', 'UNKNOWN', 'REJECTED')
+        ),
+        updated_at         TEXT NOT NULL,
+        CHECK (CAST(approved_quantity AS REAL) <= CAST(requested_quantity AS REAL))
+    )
+    """
+_CREATE_BROKER_ORDERS = """
+    CREATE TABLE broker_orders (
+        id                   INTEGER PRIMARY KEY,
+        order_intent_id      INTEGER NOT NULL UNIQUE REFERENCES order_intents (id),
+        broker_order_id      TEXT NOT NULL UNIQUE CHECK (broker_order_id <> ''),
+        client_order_id      TEXT NOT NULL UNIQUE CHECK (client_order_id <> ''),
+        symbol               TEXT NOT NULL CHECK (symbol <> ''),
+        side                 TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+        quantity             TEXT NOT NULL CHECK (
+            quantity <> '' AND CAST(quantity AS REAL) > 0
+        ),
+        filled_quantity      TEXT NOT NULL CHECK (
+            filled_quantity <> '' AND CAST(filled_quantity AS REAL) >= 0
+        ),
+        filled_average_price REAL CHECK (filled_average_price IS NULL OR filled_average_price > 0),
+        status               TEXT NOT NULL CHECK (status <> ''),
+        submitted_at         TEXT,
+        filled_at            TEXT,
+        updated_at           TEXT NOT NULL,
+        created_at           TEXT NOT NULL
+    )
+    """
+_CREATE_DAILY_RISK_BASELINES = """
+    CREATE TABLE daily_risk_baselines (
+        risk_date_utc   TEXT PRIMARY KEY CHECK (risk_date_utc <> ''),
+        baseline_equity TEXT NOT NULL CHECK (
+            baseline_equity <> '' AND CAST(baseline_equity AS REAL) > 0
+        ),
+        captured_at     TEXT NOT NULL
+    )
+    """
+
+#: A fresh database is built directly from these, at `SCHEMA_VERSION`. It is
+#: never created at v1 and then migrated forward.
+_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    _CREATE_SCHEMA_METADATA,
+    _CREATE_STRATEGY_RUNS,
+    _CREATE_SIGNALS,
+    _CREATE_RISK_EVENTS,
+    _CREATE_SYSTEM_EVENTS,
+    _CREATE_POSITIONS,
+    _CREATE_ORDER_INTENTS,
+    _CREATE_BROKER_ORDERS,
+    _CREATE_DAILY_RISK_BASELINES,
+    _CREATE_INDEX_SIGNALS,
+    _CREATE_INDEX_RISK_EVENTS,
+    _CREATE_INDEX_ORDER_INTENTS_STATUS,
+)
+
+# --------------------------------------------------------------------------
+# v2 -> v3 rebuild statements
+#
+# SQLite cannot change a column's type in place, so the three tables holding
+# quantities are rebuilt: the old table is renamed aside, the current shape is
+# created under the real name from the *same* literal a fresh database uses,
+# every row is copied across with its quantities converted, and the renamed
+# table is dropped. Because the new table is created rather than renamed into
+# place, a migrated database's stored schema is byte-identical to a fresh one.
+# --------------------------------------------------------------------------
+
+_RENAME_POSITIONS_PRE_V3 = "ALTER TABLE positions RENAME TO positions__pre_v3"
+_RENAME_ORDER_INTENTS_PRE_V3 = "ALTER TABLE order_intents RENAME TO order_intents__pre_v3"
+_RENAME_BROKER_ORDERS_PRE_V3 = "ALTER TABLE broker_orders RENAME TO broker_orders__pre_v3"
+
+_SELECT_PRE_V3_POSITIONS = """
+SELECT symbol, quantity, average_price, updated_at FROM positions__pre_v3 ORDER BY symbol
+"""
+_SELECT_PRE_V3_ORDER_INTENTS = """
+SELECT id, client_order_id, strategy_run_id, created_at, symbol, side, requested_quantity,
+       approved_quantity, reference_price, risk_reason_code, status, updated_at
+FROM order_intents__pre_v3
+ORDER BY id
+"""
+_SELECT_PRE_V3_BROKER_ORDERS = """
+SELECT id, order_intent_id, broker_order_id, client_order_id, symbol, side, quantity,
+       filled_quantity, filled_average_price, status, submitted_at, filled_at,
+       updated_at, created_at
+FROM broker_orders__pre_v3
+ORDER BY id
+"""
+
+_INSERT_MIGRATED_POSITION = """
+INSERT INTO positions (symbol, quantity, average_price, updated_at) VALUES (?, ?, ?, ?)
+"""
+_INSERT_MIGRATED_ORDER_INTENT = """
+INSERT INTO order_intents
+    (id, client_order_id, strategy_run_id, created_at, symbol, side, requested_quantity,
+     approved_quantity, reference_price, risk_reason_code, status, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+_INSERT_MIGRATED_BROKER_ORDER = """
+INSERT INTO broker_orders
+    (id, order_intent_id, broker_order_id, client_order_id, symbol, side, quantity,
+     filled_quantity, filled_average_price, status, submitted_at, filled_at,
+     updated_at, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+_DROP_PRE_V3_POSITIONS = "DROP TABLE positions__pre_v3"
+_DROP_PRE_V3_ORDER_INTENTS = "DROP TABLE order_intents__pre_v3"
+_DROP_PRE_V3_BROKER_ORDERS = "DROP TABLE broker_orders__pre_v3"
 
 _PRAGMA_FOREIGN_KEYS = "PRAGMA foreign_keys = ON"
+_PRAGMA_FOREIGN_KEYS_OFF = "PRAGMA foreign_keys = OFF"
+_PRAGMA_FOREIGN_KEY_CHECK = "PRAGMA foreign_key_check"
+# Renaming a table normally rewrites every reference to it in other tables'
+# foreign-key clauses. During the rebuild that is exactly wrong: `broker_orders`
+# must keep pointing at `order_intents`, which is about to be recreated under
+# that name. Legacy rename semantics leave those references alone.
+_PRAGMA_LEGACY_ALTER_TABLE_ON = "PRAGMA legacy_alter_table = ON"
+_PRAGMA_LEGACY_ALTER_TABLE_OFF = "PRAGMA legacy_alter_table = OFF"
 _PRAGMA_JOURNAL_MODE = "PRAGMA journal_mode = WAL"
 # A PRAGMA argument cannot be a bound parameter, so the timeout is spelled out
 # here and `BUSY_TIMEOUT_MS` is checked against the live value by a test.
@@ -693,36 +990,202 @@ def _require_expected_tables(connection: sqlite3.Connection, version: int) -> No
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
-    """Add the Phase 7 order tables to a v1 database, in place.
+    """Add the order tables to a v1 database, in place.
 
-    Additive only: it creates `order_intents` and `broker_orders` and re-stamps
-    the version marker. No existing table is dropped, recreated, renamed, or
-    rewritten, so every Phase 6 row is left exactly as it was.
+    Additive only: it creates `order_intents` and `broker_orders`. No existing
+    table is dropped, recreated, renamed, or rewritten, so every v1 row is left
+    exactly as it was. The tables are created in their **historical v2 shape**;
+    the v2 -> v3 step that follows is what brings them to the current one, so
+    an upgrade from v1 and an upgrade from v2 converge on the same result.
 
     The caller runs this inside `transaction()`, and SQLite's DDL is
-    transactional, so a failure part-way through leaves the database on v1
-    with neither new table present rather than half-upgraded.
+    transactional, so a failure part-way through leaves the database on v1 with
+    neither new table present rather than half-upgraded.
     """
     existing = _existing_table_names(connection)
     conflicting = sorted(table for table in V2_TABLES if table in existing)
     if conflicting:
         raise DatabaseStateError(
-            f"Cannot upgrade this database to schema version {SCHEMA_VERSION}: it is "
+            "Cannot upgrade this database to schema version 2: it is "
             f"marked version {MIN_MIGRATABLE_SCHEMA_VERSION} but already contains "
             f"table(s) {', '.join(conflicting)}. Refusing to migrate over an "
             "inconsistent database."
         )
     for statement in _V2_SCHEMA_STATEMENTS:
         connection.execute(statement)
-    connection.execute(_UPDATE_SCHEMA_VERSION, (SCHEMA_VERSION,))
+
+
+def _legacy_quantity_text(value: object, field: str) -> str:
+    """Convert a v1/v2 integer quantity to the canonical decimal string.
+
+    Both older schemas stored quantities as `INTEGER` and enforced whole
+    numbers in Python and in SQL, so every stored value is an exact integer:
+    ``1`` becomes ``"1"`` and ``100`` becomes ``"100"``, with no scale invented
+    and no value changed. Anything else means the column already holds
+    something this module never wrote, and the migration fails closed rather
+    than guessing at it - which rolls the whole upgrade back.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DatabaseStateError(
+            f"Cannot migrate {field} {value!r} to an exact decimal quantity: the "
+            "pre-v3 schema stored whole numbers, and this value is not one. Refusing "
+            "to guess; the database is unchanged."
+        )
+    return to_decimal_text(Decimal(value), field)
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Rebuild the quantity columns as exact decimal text, and add the baseline table.
+
+    Crypto quantities are fractional, and `INTEGER` cannot hold 0.0001 of a
+    coin. SQLite cannot retype a column in place, so `positions`,
+    `order_intents`, and `broker_orders` are rebuilt: renamed aside, recreated
+    from the current literals, copied across row by row with quantities
+    converted, and the old copies dropped.
+
+    **Every row survives.** The copy is explicit and column-by-column, ids
+    included, so foreign keys and `client_order_id` values are preserved
+    exactly. Only the quantity columns change representation, and an integer
+    quantity converts to the same number written as decimal text.
+
+    Runs inside the caller's transaction with foreign-key enforcement and
+    modern rename semantics suspended, and the caller re-checks referential
+    integrity before committing.
+    """
+    existing = _existing_table_names(connection)
+    conflicting = sorted(table for table in (*V3_TABLES, *_PRE_V3_TABLES) if table in existing)
+    if conflicting:
+        raise DatabaseStateError(
+            f"Cannot upgrade this database to schema version {SCHEMA_VERSION}: it "
+            f"already contains table(s) {', '.join(conflicting)}. Refusing to "
+            "migrate over an inconsistent database."
+        )
+
+    connection.execute(_RENAME_POSITIONS_PRE_V3)
+    connection.execute(_RENAME_ORDER_INTENTS_PRE_V3)
+    connection.execute(_RENAME_BROKER_ORDERS_PRE_V3)
+
+    connection.execute(_CREATE_POSITIONS)
+    connection.execute(_CREATE_ORDER_INTENTS)
+    connection.execute(_CREATE_BROKER_ORDERS)
+    connection.execute(_CREATE_DAILY_RISK_BASELINES)
+
+    positions = connection.execute(_SELECT_PRE_V3_POSITIONS).fetchall()
+    intents = connection.execute(_SELECT_PRE_V3_ORDER_INTENTS).fetchall()
+    orders = connection.execute(_SELECT_PRE_V3_BROKER_ORDERS).fetchall()
+
+    for row in positions:
+        connection.execute(
+            _INSERT_MIGRATED_POSITION,
+            (
+                row["symbol"],
+                _legacy_quantity_text(row["quantity"], "positions.quantity"),
+                row["average_price"],
+                row["updated_at"],
+            ),
+        )
+    for row in intents:
+        connection.execute(
+            _INSERT_MIGRATED_ORDER_INTENT,
+            (
+                row["id"],
+                row["client_order_id"],
+                row["strategy_run_id"],
+                row["created_at"],
+                row["symbol"],
+                row["side"],
+                _legacy_quantity_text(
+                    row["requested_quantity"], "order_intents.requested_quantity"
+                ),
+                _legacy_quantity_text(row["approved_quantity"], "order_intents.approved_quantity"),
+                row["reference_price"],
+                row["risk_reason_code"],
+                row["status"],
+                row["updated_at"],
+            ),
+        )
+    for row in orders:
+        connection.execute(
+            _INSERT_MIGRATED_BROKER_ORDER,
+            (
+                row["id"],
+                row["order_intent_id"],
+                row["broker_order_id"],
+                row["client_order_id"],
+                row["symbol"],
+                row["side"],
+                _legacy_quantity_text(row["quantity"], "broker_orders.quantity"),
+                _legacy_quantity_text(row["filled_quantity"], "broker_orders.filled_quantity"),
+                row["filled_average_price"],
+                row["status"],
+                row["submitted_at"],
+                row["filled_at"],
+                row["updated_at"],
+                row["created_at"],
+            ),
+        )
+
+    connection.execute(_DROP_PRE_V3_BROKER_ORDERS)
+    connection.execute(_DROP_PRE_V3_ORDER_INTENTS)
+    connection.execute(_DROP_PRE_V3_POSITIONS)
+    connection.execute(_CREATE_INDEX_ORDER_INTENTS_STATUS)
+
+
+#: Each supported upgrade, in order: the version it produces and how to get
+#: there. `initialize_database` runs every step above the database's current
+#: version, in one transaction, so v1 -> v3 is v1 -> v2 -> v3 and never a
+#: separate third path that could drift from either.
+_MIGRATIONS = (
+    (2, _migrate_v1_to_v2),
+    (3, _migrate_v2_to_v3),
+)
+
+
+def _require_no_foreign_key_violations(connection: sqlite3.Connection) -> None:
+    """Refuse to commit a migration that broke a reference.
+
+    Referential enforcement is suspended while tables are rebuilt, so it is
+    re-checked explicitly before the transaction commits. A violation raises,
+    which rolls the whole upgrade back.
+    """
+    violations = connection.execute(_PRAGMA_FOREIGN_KEY_CHECK).fetchall()
+    if violations:
+        raise DatabaseStateError(
+            f"The schema migration left {len(violations)} foreign-key violation(s). "
+            "The upgrade was rolled back and the database is unchanged."
+        )
+
+
+def _apply_migrations(connection: sqlite3.Connection, version: int) -> None:
+    """Run every upgrade above `version`, atomically.
+
+    The two PRAGMAs are set **before** `BEGIN` because SQLite ignores both
+    inside a transaction. They are restored afterwards whatever happens, so a
+    failed migration cannot leave a connection with foreign keys silently off.
+    The migration itself is one transaction: SQLite's DDL is transactional, so
+    a failure anywhere rolls back to the original version with no table half
+    rebuilt and no version marker moved.
+    """
+    connection.execute(_PRAGMA_FOREIGN_KEYS_OFF)
+    connection.execute(_PRAGMA_LEGACY_ALTER_TABLE_ON)
+    try:
+        with transaction(connection):
+            for target, migrate in _MIGRATIONS:
+                if version < target:
+                    migrate(connection)
+            connection.execute(_UPDATE_SCHEMA_VERSION, (SCHEMA_VERSION,))
+            _require_no_foreign_key_violations(connection)
+    finally:
+        connection.execute(_PRAGMA_LEGACY_ALTER_TABLE_OFF)
+        connection.execute(_PRAGMA_FOREIGN_KEYS)
 
 
 def _verify_or_migrate_schema(connection: sqlite3.Connection) -> None:
     """Bring an already-initialized database to the supported version, or refuse it.
 
     A **newer** database is refused and left untouched: downgrading would
-    discard data this code cannot understand. A database at exactly
-    `MIN_MIGRATABLE_SCHEMA_VERSION` is upgraded through the one explicit
+    discard data this code cannot understand. A database at or above
+    `MIN_MIGRATABLE_SCHEMA_VERSION` is upgraded through the explicit ordered
     migration path. Anything older has no path and is refused rather than
     guessed at.
     """
@@ -739,7 +1202,7 @@ def _verify_or_migrate_schema(connection: sqlite3.Connection) -> None:
             f"version {MIN_MIGRATABLE_SCHEMA_VERSION}, and there is no migration path."
         )
     if version < SCHEMA_VERSION:
-        _migrate_v1_to_v2(connection)
+        _apply_migrations(connection, version)
     _require_expected_tables(connection, SCHEMA_VERSION)
 
 
@@ -747,7 +1210,7 @@ def _create_schema(connection: sqlite3.Connection, existing: set[str]) -> None:
     """Create the current schema in a database that has none of it yet.
 
     A new database is built directly at `SCHEMA_VERSION`; it is never created
-    at v1 and then migrated.
+    at an older version and then migrated.
     """
     conflicting = sorted(table for table in REQUIRED_TABLES if table in existing)
     if conflicting:
@@ -765,11 +1228,12 @@ def initialize_database(path: str | Path) -> Path:
     """Create or verify the operational-state database at `path`.
 
     A new database is created directly at the current `SCHEMA_VERSION`. An
-    existing database at the previous version is upgraded through one small
-    explicit migration, additively: no Phase 6 table is dropped, recreated, or
-    rewritten, so existing rows survive untouched. The whole thing runs in a
-    single transaction, so a failed upgrade rolls back and leaves the database
-    on its original version rather than half-migrated.
+    existing older database is upgraded through the explicit ordered migration
+    path, in a single transaction, so a failed upgrade rolls back and leaves
+    the database on its original version rather than half-migrated. Every row
+    survives an upgrade; v3 rebuilds three tables to widen their quantity
+    columns and copies every row across unchanged apart from that
+    representation.
 
     Idempotent: once at the current version, repeated calls verify and change
     nothing. A database written by a **newer** schema version is refused and
@@ -780,12 +1244,15 @@ def initialize_database(path: str | Path) -> Path:
     database_path = Path(path)
     if str(database_path) != ":memory:":
         database_path.parent.mkdir(parents=True, exist_ok=True)
-    with connect(database_path) as connection, transaction(connection):
+    with connect(database_path) as connection:
         existing = _existing_table_names(connection)
         if "schema_metadata" in existing:
+            # Not wrapped in one outer transaction: a migration has to toggle
+            # PRAGMAs that SQLite ignores inside one, so it opens its own.
             _verify_or_migrate_schema(connection)
         else:
-            _create_schema(connection, existing)
+            with transaction(connection):
+                _create_schema(connection, existing)
     return database_path
 
 
@@ -950,7 +1417,7 @@ def record_signal(
     cannot be stored twice: a repeat raises `DuplicateSignalError` rather than
     silently creating a second copy. This is a storage invariant only; the
     order idempotency required before any live trading (docs/SPEC.md section
-    6E) is Phase 7's problem and is not attempted here.
+    6E) is the execution layer's problem and is not attempted here.
     """
     ticker = _require_symbol(symbol)
     kind = _require_choice(signal_type, "signal_type", SIGNAL_TYPES)
@@ -1039,7 +1506,7 @@ def record_risk_event(
     """Append a risk-decision record to the audit trail.
 
     Deliberately generic. `decision` and `reason_code` are opaque non-empty
-    strings whose vocabulary belongs to the risk engine (Phase 5), which is
+    strings whose vocabulary belongs to the risk engine (C5), which is
     developed independently and is not imported, mirrored, or constrained
     here. `strategy_run_id` and `symbol` are nullable, because a risk decision
     can be global (a daily loss limit) rather than tied to one run or one
@@ -1150,7 +1617,7 @@ def _to_position(row: sqlite3.Row) -> Position:
     average_price = row["average_price"]
     return Position(
         symbol=str(row["symbol"]),
-        quantity=int(row["quantity"]),
+        quantity=from_decimal_text(row["quantity"], "positions.quantity"),
         average_price=None if average_price is None else float(average_price),
         updated_at=from_utc_text(row["updated_at"]),
     )
@@ -1160,29 +1627,30 @@ def upsert_position(
     connection: sqlite3.Connection,
     *,
     symbol: str,
-    quantity: int,
+    quantity: Decimal | int,
     updated_at: datetime,
     average_price: float | None = None,
 ) -> None:
     """Store the latest local position snapshot for `symbol`.
 
     One row per symbol: an existing snapshot is replaced, not appended to.
-    This is **local** state. Phase 6 populates nothing from a broker, and
+    This is **local** state. Nothing here populates it from a broker, and
     reconciling this table against a broker's authoritative positions is
     Phase 8's job (docs/SPEC.md section 6E).
 
-    `quantity` must be a non-negative whole number - the system is long only -
-    and `average_price` is either NULL, which is the natural value for a flat
-    position, or a finite number greater than zero. Both rules are also CHECK
-    constraints in the schema, so a write that bypassed this function still
-    cannot store a short position. No P&L is computed or stored.
+    `quantity` is an exact `Decimal` and must be non-negative - the system is
+    long only - and is stored as canonical decimal text so a fractional coin
+    round-trips exactly. `average_price` is either NULL, which is the natural
+    value for a flat position, or a finite number greater than zero. Both rules
+    are also CHECK constraints in the schema, so a write that bypassed this
+    function still cannot store a short position. No P&L is computed or stored.
     """
     ticker = _require_symbol(symbol)
-    shares = _require_quantity(quantity)
+    amount = to_decimal_text(_require_quantity(quantity), "quantity")
     price = _require_average_price(average_price)
     updated_text = to_utc_text(updated_at, "updated_at")
     with transaction(connection):
-        connection.execute(_UPSERT_POSITION, (ticker, shares, price, updated_text))
+        connection.execute(_UPSERT_POSITION, (ticker, amount, price, updated_text))
 
 
 def get_position(connection: sqlite3.Connection, symbol: str) -> Position | None:
@@ -1245,8 +1713,12 @@ def _to_stored_order_intent(row: sqlite3.Row) -> StoredOrderIntent:
         created_at=from_utc_text(row["created_at"]),
         symbol=str(row["symbol"]),
         side=str(row["side"]),
-        requested_quantity=int(row["requested_quantity"]),
-        approved_quantity=int(row["approved_quantity"]),
+        requested_quantity=from_decimal_text(
+            row["requested_quantity"], "order_intents.requested_quantity"
+        ),
+        approved_quantity=from_decimal_text(
+            row["approved_quantity"], "order_intents.approved_quantity"
+        ),
         reference_price=float(row["reference_price"]),
         risk_reason_code=str(row["risk_reason_code"]),
         status=str(row["status"]),
@@ -1261,14 +1733,17 @@ def record_order_intent(
     created_at: datetime,
     symbol: str,
     side: str,
-    requested_quantity: int,
-    approved_quantity: int,
+    requested_quantity: Decimal | int,
+    approved_quantity: Decimal | int,
     reference_price: float,
     risk_reason_code: str,
     strategy_run_id: int | None = None,
     status: str = INTENT_STATUS_CREATED,
 ) -> int:
     """Store one order intent and return its row id.
+
+    Quantities are exact `Decimal` values, stored as canonical decimal text:
+    a fractional crypto order size round-trips unchanged.
 
     `approved_quantity` is the risk engine's number and may never exceed
     `requested_quantity` - enforced here and again as a CHECK constraint, so a
@@ -1289,6 +1764,8 @@ def record_order_intent(
             f"approved_quantity ({approved}) must not exceed requested_quantity "
             f"({requested}); risk may only ever size an order down."
         )
+    requested_text = to_decimal_text(requested, "requested_quantity")
+    approved_text = to_decimal_text(approved, "approved_quantity")
     price = _require_positive_price(reference_price, "reference_price")
     reason = _require_text(risk_reason_code, "risk_reason_code")
     intent_status = _require_choice(status, "status", ORDER_INTENT_STATUSES)
@@ -1304,8 +1781,8 @@ def record_order_intent(
                     created_text,
                     ticker,
                     order_side,
-                    requested,
-                    approved,
+                    requested_text,
+                    approved_text,
                     price,
                     reason,
                     intent_status,
@@ -1381,7 +1858,7 @@ def list_order_intents(connection: sqlite3.Connection) -> list[StoredOrderIntent
 # Broker orders (schema v2)
 #
 # The latest normalized snapshot of what the broker reported. One row per
-# intent: Phase 7 submits at most one order per intent, and re-reading that
+# intent: execution submits at most one order per intent, and re-reading that
 # order updates the snapshot rather than appending a second row. There is no
 # fills or executions table - a snapshot is not an execution history.
 # --------------------------------------------------------------------------
@@ -1436,8 +1913,8 @@ def _to_stored_broker_order(row: sqlite3.Row) -> StoredBrokerOrder:
         client_order_id=str(row["client_order_id"]),
         symbol=str(row["symbol"]),
         side=str(row["side"]),
-        quantity=int(row["quantity"]),
-        filled_quantity=int(row["filled_quantity"]),
+        quantity=from_decimal_text(row["quantity"], "broker_orders.quantity"),
+        filled_quantity=from_decimal_text(row["filled_quantity"], "broker_orders.filled_quantity"),
         filled_average_price=None if average_price is None else float(average_price),
         status=str(row["status"]),
         submitted_at=None if submitted_at is None else from_utc_text(submitted_at),
@@ -1455,10 +1932,10 @@ def upsert_broker_order(
     client_order_id: str,
     symbol: str,
     side: str,
-    quantity: int,
+    quantity: Decimal | int,
     status: str,
     updated_at: datetime,
-    filled_quantity: int = 0,
+    filled_quantity: Decimal | int = 0,
     filled_average_price: float | None = None,
     submitted_at: datetime | None = None,
     filled_at: datetime | None = None,
@@ -1473,15 +1950,17 @@ def upsert_broker_order(
     Re-reading the same broker order updates the mutable fields in place. A
     *different* `broker_order_id` for the same intent - or the same broker
     order arriving under a different intent - raises
-    `DuplicateBrokerOrderError`, because Phase 7 submits exactly one order per
+    `DuplicateBrokerOrderError`, because execution submits exactly one order per
     intent and a second one would be a contradiction, not an update.
     """
     broker_id = _require_text(broker_order_id, "broker_order_id")
     client_id = _require_text(client_order_id, "client_order_id")
     ticker = _require_symbol(symbol)
     order_side = _require_choice(side, "side", ORDER_SIDES)
-    shares = _require_positive_quantity(quantity, "quantity")
-    filled = _require_quantity(filled_quantity, "filled_quantity")
+    amount = to_decimal_text(_require_positive_quantity(quantity, "quantity"), "quantity")
+    filled = to_decimal_text(
+        _require_quantity(filled_quantity, "filled_quantity"), "filled_quantity"
+    )
     average_price = _require_average_price(filled_average_price, "filled_average_price")
     status_text = _require_text(status, "status")
     updated_text = to_utc_text(updated_at, "updated_at")
@@ -1498,7 +1977,7 @@ def upsert_broker_order(
                     client_id,
                     ticker,
                     order_side,
-                    shares,
+                    amount,
                     filled,
                     average_price,
                     status_text,
@@ -1514,8 +1993,8 @@ def upsert_broker_order(
             if cursor.rowcount != 1:
                 raise DuplicateBrokerOrderError(
                     f"Order intent {order_intent_id!r} is already recorded against a "
-                    f"different broker order than {broker_id!r}. Phase 7 allows exactly "
-                    "one broker order per intent."
+                    f"different broker order than {broker_id!r}. Exactly one broker "
+                    "order per intent is allowed."
                 )
             # `lastrowid` is only meaningful for the INSERT path, so the row id
             # is read back rather than inferred.
@@ -1561,6 +2040,99 @@ def list_broker_orders(connection: sqlite3.Connection) -> list[StoredBrokerOrder
     return [_to_stored_broker_order(row) for row in connection.execute(_SELECT_BROKER_ORDERS)]
 
 
+# --------------------------------------------------------------------------
+# Daily risk baselines (schema v3)
+#
+# Crypto trades 24/7, so a "trading day" is a UTC calendar day and there is no
+# equity-market previous close to measure a day's P&L against. The first
+# account equity observed on a UTC date is recorded here and reused for the
+# rest of that date, which is what makes the daily-loss halt reproducible
+# across process restarts.
+#
+# This is a persistence primitive only. Nothing here schedules anything,
+# watches a clock, or decides when an observation should happen.
+# --------------------------------------------------------------------------
+
+_INSERT_DAILY_RISK_BASELINE = """
+INSERT INTO daily_risk_baselines (risk_date_utc, baseline_equity, captured_at)
+VALUES (?, ?, ?)
+ON CONFLICT (risk_date_utc) DO NOTHING
+"""
+_SELECT_DAILY_RISK_BASELINE = """
+SELECT risk_date_utc, baseline_equity, captured_at
+FROM daily_risk_baselines
+WHERE risk_date_utc = ?
+"""
+_SELECT_DAILY_RISK_BASELINES = """
+SELECT risk_date_utc, baseline_equity, captured_at
+FROM daily_risk_baselines
+ORDER BY risk_date_utc
+"""
+
+
+def _to_daily_risk_baseline(row: sqlite3.Row) -> DailyRiskBaseline:
+    return DailyRiskBaseline(
+        risk_date_utc=from_risk_date_text(row["risk_date_utc"]),
+        baseline_equity=from_decimal_text(
+            row["baseline_equity"], "daily_risk_baselines.baseline_equity"
+        ),
+        captured_at=from_utc_text(row["captured_at"]),
+    )
+
+
+def ensure_daily_risk_baseline(
+    connection: sqlite3.Connection,
+    *,
+    risk_date_utc: date,
+    baseline_equity: Decimal | int,
+    captured_at: datetime,
+) -> DailyRiskBaseline:
+    """Return the baseline for `risk_date_utc`, establishing it if there is none.
+
+    **First observation wins, permanently.** If a row already exists for that
+    UTC date it is returned untouched and the supplied equity is discarded; a
+    baseline that drifted during the day would silently reset the daily-loss
+    halt, which is the one thing it exists to prevent.
+
+    Exactly one row per UTC date, enforced by the primary key as well as here.
+    The insert and the read run in one transaction, so two callers racing on a
+    fresh date still agree on the same baseline.
+
+    Honest limitation: this records the first equity this system *observed*,
+    not the equity at exactly 00:00 UTC. Nothing in this milestone runs
+    continuously, so if the first observation of a day happens hours in, the
+    baseline is that later figure. A 24/7 runner (Phase 9) is what will make
+    the first observation land near the boundary; until then, the recorded
+    `captured_at` is what says how close it actually was.
+    """
+    date_text = to_risk_date_text(risk_date_utc)
+    equity_text = to_decimal_text(_require_positive_quantity(baseline_equity, "baseline_equity"))
+    captured_text = to_utc_text(captured_at, "captured_at")
+    with transaction(connection):
+        connection.execute(_INSERT_DAILY_RISK_BASELINE, (date_text, equity_text, captured_text))
+        row = connection.execute(_SELECT_DAILY_RISK_BASELINE, (date_text,)).fetchone()
+    if row is None:  # pragma: no cover - the insert above guarantees a row
+        raise DatabaseStateError(f"No daily risk baseline could be established for {date_text}.")
+    return _to_daily_risk_baseline(row)
+
+
+def get_daily_risk_baseline(
+    connection: sqlite3.Connection, risk_date_utc: date
+) -> DailyRiskBaseline | None:
+    """Return the stored baseline for one UTC date, or None when there is none."""
+    row = connection.execute(
+        _SELECT_DAILY_RISK_BASELINE, (to_risk_date_text(risk_date_utc),)
+    ).fetchone()
+    return None if row is None else _to_daily_risk_baseline(row)
+
+
+def list_daily_risk_baselines(connection: sqlite3.Connection) -> list[DailyRiskBaseline]:
+    """Every stored baseline, oldest UTC date first."""
+    return [
+        _to_daily_risk_baseline(row) for row in connection.execute(_SELECT_DAILY_RISK_BASELINES)
+    ]
+
+
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "DEFAULT_DATABASE_PATH",
@@ -1583,6 +2155,8 @@ __all__ = [
     "TERMINAL_RUN_STATUSES",
     "TIMESTAMP_FORMAT",
     "V2_TABLES",
+    "V3_TABLES",
+    "DailyRiskBaseline",
     "DatabaseStateError",
     "DuplicateBrokerOrderError",
     "DuplicateOrderIntentError",
@@ -1601,16 +2175,21 @@ __all__ = [
     "UnsupportedSchemaVersionError",
     "connect",
     "finish_strategy_run",
+    "ensure_daily_risk_baseline",
+    "from_decimal_text",
+    "from_risk_date_text",
     "from_utc_text",
     "get_broker_order_by_client_id",
     "get_broker_order_by_intent",
     "get_order_intent",
+    "get_daily_risk_baseline",
     "get_order_intent_by_client_id",
     "get_position",
     "get_schema_version",
     "get_strategy_run",
     "initialize_database",
     "list_broker_orders",
+    "list_daily_risk_baselines",
     "list_order_intents",
     "list_positions",
     "list_risk_events",
@@ -1622,9 +2201,12 @@ __all__ = [
     "record_signal",
     "record_strategy_run",
     "record_system_event",
+    "to_decimal_text",
+    "to_risk_date_text",
     "to_utc_text",
     "transaction",
     "update_order_intent_status",
     "upsert_broker_order",
     "upsert_position",
+    "utc_risk_date",
 ]

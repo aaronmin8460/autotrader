@@ -1,21 +1,32 @@
-"""Phase 5: the deterministic risk engine.
+"""C5: the deterministic risk engine.
 
 A strategy says *what* it wants to do; this module says *whether it may*, and
 *how large it may be*. It answers exactly one question:
 
     may this proposed trade be allowed, and if so, what is the largest safe
-    whole-share quantity under the V0.1 limits?
+    quantity under the V0.2 limits?
 
 **It is a calculator, nothing else.** It submits no order, constructs no
 broker client, contacts no network, opens no database, writes no file, and
 mutates neither the request nor the context it is handed. Given the same
 inputs it always returns the same decision. Turning an approved decision into
-an actual order belongs to a later phase (docs/SPEC.md section 6A); this
-module is the stage before that one and deliberately cannot reach past it.
+an actual order belongs to the execution boundary (docs/SPEC.md section 6A);
+this module is the stage before that one and deliberately cannot reach past it.
 
-**It is not connected to Phase 4.** The backtester keeps its own all-cash
-sizing baseline and is not re-plumbed through these limits, so no Phase 4
-result changes. Wiring risk into live sizing is a later concern.
+**It is not connected to the backtester.** C4 keeps its own all-cash sizing
+baseline and is not re-plumbed through these limits, so no backtest result
+changes.
+
+**Crypto quantities are fractional Decimals.** The archived equity milestone
+floored every quantity to whole shares; crypto is fractionable, so that rule is
+gone. Quantities are `decimal.Decimal`, never binary floats: a float quantity
+is a rounding artefact, not an exact broker quantity, and accepting one here
+would let an inexact number become the size of a real order.
+
+**The limits themselves are notional, in USD.** The 5% and 30% caps bound the
+market *value* of a position, not a count of units, so the arithmetic is
+``quantity * reference_price`` measured against a dollar ceiling. Only the
+quantity representation changed in the pivot; the policy did not.
 
 **Entries are gated; exits are not.** Every limit here exists to stop the
 account from *adding* risk. None of them may stop it from *removing* risk, so
@@ -33,32 +44,38 @@ limit: when the safe maximum is zero, the request is rejected.
 
 **Long only, structurally.** There is no short side to request - `RiskSide`
 has exactly `BUY` and `SELL`, a SELL is always an exit against an existing
-long, and it can never be approved for more shares than are held. Because a
-short cannot be expressed, there is no reachable "long-only violation" to
-report; an attempt to sell while flat surfaces as `NO_POSITION_TO_EXIT`.
+long, and it can never be approved for more than is held. Because a short
+cannot be expressed, there is no reachable "long-only violation" to report; an
+attempt to sell while flat surfaces as `NO_POSITION_TO_EXIT`.
+
+**The risk day is a UTC calendar day.** `daily_pnl` and `start_of_day_equity`
+are supplied by the caller and this module does not decide what "today" means -
+but for crypto that baseline is the first equity observed after 00:00 UTC, not
+a broker's equity-market `last_equity`. The durable baseline lives in
+`autotrader.state` (`daily_risk_baselines`) and is resolved at the execution
+boundary.
 
 **Malformed input is not a risk denial.** A context that cannot describe a
 real account - negative cash, zero equity, a symbol exposure larger than the
 total - is a programming error and raises `RiskInputError`. A well-formed
 context carrying a badly formed request produces an ordinary rejected
 decision with `INVALID_REQUEST`. Ordinary risk denials never raise.
-
-Plain floats are used throughout, matching the rest of the project. The only
-rounding is the floor to whole shares.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from enum import Enum
 
 # --------------------------------------------------------------------------
-# V0.1 policy defaults
+# V0.2 policy defaults
 #
 # These are engineering safety limits, not investment advice and not a
 # recommended allocation. They are deliberately conservative, deliberately
-# strategy-independent, and deliberately not loaded from the environment.
+# strategy-independent, and deliberately not loaded from the environment. The
+# pivot to crypto did not loosen any of them.
 # --------------------------------------------------------------------------
 
 #: Largest market value of any one symbol, as a fraction of current equity.
@@ -67,8 +84,18 @@ MAX_POSITION_FRACTION = 0.05
 #: Largest aggregate long exposure, as a fraction of current equity.
 MAX_TOTAL_EXPOSURE_FRACTION = 0.30
 
-#: Daily loss at which new entries halt, as a fraction of start-of-day equity.
+#: Daily loss at which new entries halt, as a fraction of the UTC-day baseline.
 MAX_DAILY_LOSS_FRACTION = 0.02
+
+#: Approved quantities are quantized **down** to this exponent.
+#:
+#: Fine enough to be continuous for any crypto pair, and coarse enough to keep
+#: a decision reproducible. It is deliberately *not* a broker increment: the
+#: broker's own asset metadata is the runtime authority on order precision, and
+#: the execution boundary normalizes against it after this decision is made.
+QUANTITY_EXPONENT = Decimal("1E-18")
+
+_QUANTITY_STEP = QUANTITY_EXPONENT
 
 #: Stable, machine-readable decision codes. Messages may be reworded; codes may not.
 APPROVED = "APPROVED"
@@ -100,6 +127,8 @@ _LIMIT_DESCRIPTIONS = {
     INSUFFICIENT_CASH: "available cash",
 }
 
+_ZERO = Decimal(0)
+
 
 class RiskInputError(Exception):
     """The request or account context could not describe a real situation.
@@ -128,10 +157,13 @@ class RiskSide(Enum):
 class RiskPolicy:
     """The limits a decision is measured against.
 
-    Fractions are decimal, not percentages: ``0.05`` is 5%. The three boolean
-    fields record the V0.1 stance explicitly rather than leaving it implicit in
+    Fractions are decimal, not percentages: ``0.05`` is 5%. The two boolean
+    fields record the V0.2 stance explicitly rather than leaving it implicit in
     the code; the engine implements only that stance, so flipping one is
     rejected as an unsupported policy rather than quietly ignored.
+
+    There is deliberately no `whole_shares_only`: crypto is fractionable, and a
+    flag whose only supported value is "off" is not a policy.
     """
 
     max_position_fraction: float = MAX_POSITION_FRACTION
@@ -139,11 +171,10 @@ class RiskPolicy:
     max_daily_loss_fraction: float = MAX_DAILY_LOSS_FRACTION
     long_only: bool = True
     allow_leverage: bool = False
-    whole_shares_only: bool = True
 
 
-#: The V0.1 policy: 5% per symbol, 30% total, a 2% daily-loss halt, long only,
-#: no leverage, whole shares. There is no other policy in this milestone.
+#: The V0.2 policy: 5% per symbol, 30% total, a 2% daily-loss halt, long only,
+#: no leverage. There is no other policy in this milestone.
 DEFAULT_POLICY = RiskPolicy()
 
 
@@ -153,14 +184,15 @@ class RiskRequest:
 
     This is a question about a hypothetical trade, **not** an order and not an
     intent to be persisted: it carries no order type, no time in force, no
-    identifier, and no broker field. `reference_price` is the price the sizing
-    arithmetic is done against - a mark, not a promised fill.
+    identifier, and no broker field. `reference_price` is the USD price the
+    sizing arithmetic is done against - a mark, not a promised fill.
+    `requested_quantity` is a fractional `Decimal` amount of the base asset.
     """
 
     symbol: str
     side: RiskSide
     reference_price: float
-    requested_quantity: int
+    requested_quantity: Decimal
 
 
 @dataclass(frozen=True)
@@ -168,17 +200,23 @@ class RiskContext:
     """The account state a decision is measured against.
 
     A flat snapshot, not a portfolio model: it holds no per-symbol collection,
-    no order history, and no position objects. `symbol_exposure` is the current
-    market value of the requested symbol and is part of `total_exposure`;
-    `current_position_quantity` is that same holding in shares. `daily_pnl` is
+    no order history, and no position objects. Every monetary field is USD.
+    `symbol_exposure` is the current market value of the requested symbol and
+    is part of `total_exposure`; `current_position_quantity` is that same
+    holding as a fractional `Decimal` amount of the base asset. `daily_pnl` is
     the only field that may be negative.
+
+    `start_of_day_equity` is the **UTC-day** baseline - the first equity
+    observed on or after 00:00 UTC - and `daily_pnl` is measured against it.
+    Resolving that baseline durably is the caller's job; see
+    `autotrader.state.sqlite.ensure_daily_risk_baseline`.
     """
 
     equity: float
     cash: float
     total_exposure: float
     symbol_exposure: float
-    current_position_quantity: int
+    current_position_quantity: Decimal
     daily_pnl: float
     start_of_day_equity: float
     trading_enabled: bool
@@ -188,8 +226,8 @@ class RiskContext:
 class RiskDecision:
     """The engine's answer.
 
-    `approved_quantity` is the whole-share quantity that may proceed, and is
-    ``0`` whenever `approved` is False. It may be **smaller** than the
+    `approved_quantity` is the fractional quantity that may proceed, and is
+    ``Decimal(0)`` whenever `approved` is False. It may be **smaller** than the
     requested quantity: an oversized request is clamped rather than refused,
     and `reason_code` then names the constraint that bound it instead of
     `APPROVED`. `max_allowed_quantity` is the cap that applied - the sizing
@@ -201,10 +239,67 @@ class RiskDecision:
     """
 
     approved: bool
-    approved_quantity: int
+    approved_quantity: Decimal
     reason_code: str
     message: str
-    max_allowed_quantity: int
+    max_allowed_quantity: Decimal
+
+
+# --------------------------------------------------------------------------
+# Decimal helpers
+# --------------------------------------------------------------------------
+
+
+def _decimal(value: float) -> Decimal:
+    """A finite float as an exact Decimal, via its shortest round-tripping form.
+
+    `Decimal(0.05)` is the binary value a hair away from five percent;
+    `Decimal("0.05")` is five percent. Money and policy fractions arrive here
+    as floats and are converted this way so a cap means what it reads as.
+    """
+    return Decimal(str(float(value)))
+
+
+def format_quantity(value: Decimal) -> str:
+    """Render a quantity for humans: no exponent, no trailing-zero noise."""
+    if value == 0:
+        return "0"
+    return format(value.normalize(), "f")
+
+
+def normalize_quantity(value: object) -> Decimal | None:
+    """`value` as an exact non-negative quantity, or None when it is not one.
+
+    Only exact representations are accepted - `Decimal` and `int`. A `float`
+    is refused rather than converted: a binary float is an approximation, and
+    treating one as an exact broker quantity is precisely the confusion this
+    milestone's Decimal policy exists to prevent. A numeric *string* is refused
+    for the same reason the rest of the engine refuses one: text arriving where
+    a number belongs means something upstream lost its type.
+
+    NaN, both infinities, and negative values are rejected here rather than
+    being allowed to propagate into a comparison, where a NaN would quietly
+    evaluate False and read as a passing check.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return Decimal(value)
+    if not isinstance(value, Decimal):
+        return None
+    if not value.is_finite():
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _quantize_down(quantity: Decimal) -> Decimal:
+    """Round a quantity **down** to `QUANTITY_EXPONENT`."""
+    try:
+        return quantity.quantize(QUANTITY_EXPONENT, rounding=ROUND_DOWN)
+    except InvalidOperation:  # pragma: no cover - guarded by finiteness checks
+        return _ZERO
 
 
 # --------------------------------------------------------------------------
@@ -234,24 +329,12 @@ def _finite(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _whole_quantity(value: object) -> int | None:
-    """`value` as a share count, or None if it is not a whole number of shares.
-
-    Fractional shares are out of scope, so a float quantity is refused rather
-    than rounded. `bool` is an `int` subclass in Python and is refused too - a
-    flag reaching a share count is a type confusion, not a quantity of one.
-    """
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value
-
-
 def _require_supported_policy(policy: RiskPolicy) -> None:
     """Reject a policy this engine does not actually implement.
 
     Honouring only part of a policy would be worse than refusing it: a caller
     that set `allow_leverage` would otherwise get long-only, unlevered
-    behaviour while believing otherwise. V0.1 implements exactly one stance.
+    behaviour while believing otherwise. V0.2 implements exactly one stance.
     """
     fractions = (
         ("max_position_fraction", policy.max_position_fraction),
@@ -268,10 +351,6 @@ def _require_supported_policy(policy: RiskPolicy) -> None:
         raise RiskInputError("policy.long_only must be True; short selling is out of scope.")
     if policy.allow_leverage:
         raise RiskInputError("policy.allow_leverage must be False; leverage is out of scope.")
-    if not policy.whole_shares_only:
-        raise RiskInputError(
-            "policy.whole_shares_only must be True; fractional shares are out of scope."
-        )
 
 
 def _require_coherent_context(context: RiskContext) -> None:
@@ -308,11 +387,10 @@ def _require_coherent_context(context: RiskContext) -> None:
             "is part of the total."
         )
 
-    quantity = _whole_quantity(context.current_position_quantity)
-    if quantity is None or quantity < 0:
+    if normalize_quantity(context.current_position_quantity) is None:
         raise RiskInputError(
-            "context.current_position_quantity must be a non-negative whole number of shares, "
-            f"got {context.current_position_quantity!r}."
+            "context.current_position_quantity must be a non-negative, finite Decimal "
+            f"quantity, got {context.current_position_quantity!r}."
         )
 
     # Only P&L may be negative, so it is checked for finiteness alone.
@@ -338,14 +416,15 @@ def _describe_malformed_request(request: RiskRequest) -> str | None:
         return (
             f"reference_price must be a positive, finite number, got {request.reference_price!r}."
         )
-    quantity = _whole_quantity(request.requested_quantity)
+    quantity = normalize_quantity(request.requested_quantity)
     if quantity is None:
         return (
-            "requested_quantity must be a whole number of shares; fractional shares are out "
-            f"of scope. Got {request.requested_quantity!r}."
+            "requested_quantity must be an exact non-negative Decimal quantity; a float "
+            "is an approximation, not an exact broker quantity. Got "
+            f"{request.requested_quantity!r}."
         )
     if quantity <= 0:
-        return f"requested_quantity must be greater than zero, got {quantity!r}."
+        return f"requested_quantity must be greater than zero, got {format_quantity(quantity)}."
     return None
 
 
@@ -354,40 +433,41 @@ def _describe_malformed_request(request: RiskRequest) -> str | None:
 # --------------------------------------------------------------------------
 
 
-def _whole_shares(notional: float, price: float) -> int:
-    """The largest whole-share quantity `notional` buys at `price`.
+def max_quantity_for_notional(notional: Decimal, price: Decimal) -> Decimal:
+    """The largest quantity `notional` USD buys at `price`.
 
-    Floored, because fractional shares are out of scope. Floating point can
-    land the quotient a hair above what the notional actually covers, so the
-    result steps back until it does not - a limit must never be exceeded by a
-    rounding artefact.
+    Quantized **down**, then stepped back until the notional genuinely covers
+    it. The step-back is defensive - quantizing down already guarantees it -
+    because an exposure cap must never be exceeded by a rounding artefact.
     """
-    if notional <= 0:
-        return 0
-    quantity = int(notional // price)
+    if notional <= 0 or price <= 0:
+        return _ZERO
+    quantity = _quantize_down(notional / price)
     while quantity > 0 and quantity * price > notional:
-        quantity -= 1
-    return quantity
+        quantity -= _QUANTITY_STEP
+    return quantity if quantity > 0 else _ZERO
 
 
-def _entry_headroom(context: RiskContext, policy: RiskPolicy) -> tuple[float, str]:
-    """The notional an entry may still use, and the constraint that caps it.
+def _entry_headroom(context: RiskContext, policy: RiskPolicy) -> tuple[Decimal, str]:
+    """The USD notional an entry may still use, and the constraint that caps it.
 
     Three ceilings apply at once - the per-symbol cap, the total-exposure cap,
     and cash - and the tightest one wins. Ties resolve in that fixed order so
     the reported constraint is deterministic.
     """
+    equity = _decimal(context.equity)
     position_remaining = max(
-        0.0, context.equity * policy.max_position_fraction - context.symbol_exposure
+        _ZERO, equity * _decimal(policy.max_position_fraction) - _decimal(context.symbol_exposure)
     )
     portfolio_remaining = max(
-        0.0, context.equity * policy.max_total_exposure_fraction - context.total_exposure
+        _ZERO,
+        equity * _decimal(policy.max_total_exposure_fraction) - _decimal(context.total_exposure),
     )
     # Cash is the no-leverage rule: an entry may only spend money already held.
     limits = (
         (position_remaining, POSITION_LIMIT),
         (portfolio_remaining, TOTAL_EXPOSURE_LIMIT),
-        (float(context.cash), INSUFFICIENT_CASH),
+        (_decimal(context.cash), INSUFFICIENT_CASH),
     )
     return min(limits, key=lambda limit: limit[0])
 
@@ -402,64 +482,66 @@ def _evaluate_entry(request: RiskRequest, context: RiskContext, policy: RiskPoli
     if not context.trading_enabled:
         return RiskDecision(
             approved=False,
-            approved_quantity=0,
+            approved_quantity=_ZERO,
             reason_code=TRADING_DISABLED,
             message=(
                 "New entries are halted because trading_enabled is False. Exits that reduce "
                 "an existing position are still allowed."
             ),
-            max_allowed_quantity=0,
+            max_allowed_quantity=_ZERO,
         )
 
-    loss_ratio = context.daily_pnl / context.start_of_day_equity
-    if loss_ratio <= -policy.max_daily_loss_fraction:
+    loss_ratio = _decimal(context.daily_pnl) / _decimal(context.start_of_day_equity)
+    if loss_ratio <= -_decimal(policy.max_daily_loss_fraction):
         return RiskDecision(
             approved=False,
-            approved_quantity=0,
+            approved_quantity=_ZERO,
             reason_code=DAILY_LOSS_LIMIT,
             message=(
-                f"New entries are halted: the day is down {loss_ratio:.2%} against a "
+                f"New entries are halted: the UTC day is down {loss_ratio:.2%} against a "
                 f"{-policy.max_daily_loss_fraction:.2%} limit. Exits remain allowed."
             ),
-            max_allowed_quantity=0,
+            max_allowed_quantity=_ZERO,
         )
 
     max_notional, binding_code = _entry_headroom(context, policy)
-    price = float(request.reference_price)
-    max_quantity = _whole_shares(max_notional, price)
+    price = _decimal(request.reference_price)
+    max_quantity = max_quantity_for_notional(max_notional, price)
     constraint = _LIMIT_DESCRIPTIONS[binding_code]
+    requested = Decimal(request.requested_quantity)
 
     if max_quantity <= 0:
         return RiskDecision(
             approved=False,
-            approved_quantity=0,
+            approved_quantity=_ZERO,
             reason_code=binding_code,
             message=(
                 f"BUY rejected: {constraint} leaves ${max_notional:,.2f} of headroom, which "
-                f"is not one whole share of {request.symbol} at ${price:,.2f}."
+                f"buys none of {request.symbol} at ${price:,.2f}."
             ),
-            max_allowed_quantity=0,
+            max_allowed_quantity=_ZERO,
         )
 
-    if request.requested_quantity > max_quantity:
+    if requested > max_quantity:
         return RiskDecision(
             approved=True,
             approved_quantity=max_quantity,
             reason_code=binding_code,
             message=(
-                f"BUY sized down from {request.requested_quantity} to {max_quantity} share(s) "
-                f"of {request.symbol}: {constraint} allows no more at ${price:,.2f}."
+                f"BUY sized down from {format_quantity(requested)} to "
+                f"{format_quantity(max_quantity)} {request.symbol}: {constraint} allows no "
+                f"more at ${price:,.2f}."
             ),
             max_allowed_quantity=max_quantity,
         )
 
     return RiskDecision(
         approved=True,
-        approved_quantity=request.requested_quantity,
+        approved_quantity=requested,
         reason_code=APPROVED,
         message=(
-            f"BUY {request.requested_quantity} share(s) of {request.symbol} approved; up to "
-            f"{max_quantity} would have been allowed."
+            f"BUY {format_quantity(requested)} {request.symbol} approved; up to "
+            f"{format_quantity(max_quantity)} would have been allowed."
         ),
         max_allowed_quantity=max_quantity,
     )
@@ -472,38 +554,40 @@ def _evaluate_exit(request: RiskRequest, context: RiskContext) -> RiskDecision:
     gates and are deliberately not consulted here. The one thing an exit may
     not do is cross below zero into a short, so it is clamped to the position.
     """
-    position = context.current_position_quantity
+    position = Decimal(context.current_position_quantity)
     if position <= 0:
         return RiskDecision(
             approved=False,
-            approved_quantity=0,
+            approved_quantity=_ZERO,
             reason_code=NO_POSITION_TO_EXIT,
             message=(
                 f"SELL rejected: there is no long position in {request.symbol} to reduce. "
                 "Selling while flat would open a short, which is out of scope."
             ),
-            max_allowed_quantity=0,
+            max_allowed_quantity=_ZERO,
         )
 
-    if request.requested_quantity > position:
+    requested = Decimal(request.requested_quantity)
+    if requested > position:
         return RiskDecision(
             approved=True,
             approved_quantity=position,
             reason_code=EXIT_QUANTITY_EXCEEDS_POSITION,
             message=(
-                f"SELL sized down from {request.requested_quantity} to {position} share(s) of "
-                f"{request.symbol}: an exit may flatten the position but never cross below zero."
+                f"SELL sized down from {format_quantity(requested)} to "
+                f"{format_quantity(position)} {request.symbol}: an exit may flatten the "
+                "position but never cross below zero."
             ),
             max_allowed_quantity=position,
         )
 
     return RiskDecision(
         approved=True,
-        approved_quantity=request.requested_quantity,
+        approved_quantity=requested,
         reason_code=APPROVED,
         message=(
-            f"SELL {request.requested_quantity} share(s) of {request.symbol} approved against "
-            f"a {position} share position."
+            f"SELL {format_quantity(requested)} {request.symbol} approved against a "
+            f"{format_quantity(position)} position."
         ),
         max_allowed_quantity=position,
     )
@@ -519,16 +603,17 @@ def evaluate_risk(
     context: RiskContext,
     policy: RiskPolicy = DEFAULT_POLICY,
 ) -> RiskDecision:
-    """Decide whether `request` may proceed, and at what whole-share quantity.
+    """Decide whether `request` may proceed, and at what fractional quantity.
 
     A **BUY** must clear every gate in order: the `trading_enabled` kill
-    switch, the daily-loss halt, and then sizing against the tightest of the
-    per-symbol cap, the total-exposure cap, and available cash::
+    switch, the UTC-day loss halt, and then sizing against the tightest of the
+    per-symbol cap, the total-exposure cap, and available cash - all measured
+    as USD notional::
 
         position_remaining  = max(0, equity * 0.05 - symbol_exposure)
         portfolio_remaining = max(0, equity * 0.30 - total_exposure)
         max_notional        = min(position_remaining, portfolio_remaining, cash)
-        max_quantity        = floor(max_notional / reference_price)
+        max_quantity        = max_notional / reference_price   (rounded down)
 
     An oversized BUY is **clamped** to `max_quantity` and approved, with
     `reason_code` naming the binding constraint; a `max_quantity` of zero is
@@ -554,10 +639,10 @@ def evaluate_risk(
     if malformed is not None:
         return RiskDecision(
             approved=False,
-            approved_quantity=0,
+            approved_quantity=_ZERO,
             reason_code=INVALID_REQUEST,
             message=f"Request rejected: {malformed}",
-            max_allowed_quantity=0,
+            max_allowed_quantity=_ZERO,
         )
 
     if request.side is RiskSide.SELL:
@@ -577,6 +662,7 @@ __all__ = [
     "MAX_TOTAL_EXPOSURE_FRACTION",
     "NO_POSITION_TO_EXIT",
     "POSITION_LIMIT",
+    "QUANTITY_EXPONENT",
     "REASON_CODES",
     "TOTAL_EXPOSURE_LIMIT",
     "TRADING_DISABLED",
@@ -587,4 +673,7 @@ __all__ = [
     "RiskRequest",
     "RiskSide",
     "evaluate_risk",
+    "format_quantity",
+    "max_quantity_for_notional",
+    "normalize_quantity",
 ]

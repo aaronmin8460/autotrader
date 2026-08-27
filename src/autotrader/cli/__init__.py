@@ -1,18 +1,23 @@
-"""Command-line entry point.
+"""Command-line entry point for the 24/7 crypto system.
 
-Phase 1 exposes application metadata and a historical market-data download,
-Phase 2 read-only validation of an already-downloaded dataset, Phase 4 a local
-backtest of the EMA crossover strategy over a stored dataset, and Phase 7 a
-single, deliberately awkward **paper** order submission.
+The commands are application metadata, a historical crypto market-data
+download, read-only validation of an already-downloaded dataset, a local
+backtest of the EMA crossover strategy over a stored dataset, and a single,
+deliberately awkward **paper** order submission.
+
+Everything here is crypto spot: BTC/USD and ETH/USD, 15-minute bars, UTC
+dates, 24/7. There is no asset-class selector and no equity command; the
+completed equity milestone is archived at the Git tag `equity-v0.1-phase7`.
 
 `paper-submit` is the only command that can reach a broker, and it can only
 ever reach Alpaca **paper**. It requires an environment gate and an explicit
 confirmation token, both closed by default, and there is no `--live` option,
 no `--paper` option, and no way to ask for anything but paper (docs/SPEC.md
-section 8, Phase 7).
+section 8, C7).
 """
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
@@ -22,6 +27,7 @@ from autotrader import __version__
 from autotrader.backtest import (
     DEFAULT_INITIAL_CASH,
     STRATEGY_NAME,
+    TAKER_FEE_RATE,
     BacktestInputError,
     BacktestResult,
     run_backtest,
@@ -39,7 +45,7 @@ from autotrader.data.validation import (
     validate_parquet_file,
 )
 from autotrader.execution import paper as paper_execution
-from autotrader.execution.models import ExecutionError
+from autotrader.execution.models import ExecutionError, format_quantity, parse_quantity
 from autotrader.execution.paper import (
     AmbiguousSubmissionError,
     ExecutionOutcome,
@@ -82,11 +88,11 @@ app = typer.Typer(
 
 @app.callback()
 def cli() -> None:
-    """Personal automated trading system.
+    """Personal automated 24/7 crypto trading system.
 
-    Historical market data, dataset validation, EMA crossover signals, local
-    backtesting, a deterministic risk engine, local SQLite state, and Alpaca
-    **paper** order submission.
+    Historical crypto market data, dataset validation, EMA crossover signals,
+    local backtesting, a deterministic risk engine, local SQLite state, and
+    Alpaca **paper** order submission. Crypto spot only: BTC/USD and ETH/USD.
 
     There is no live trading. `paper-submit` talks to Alpaca's paper
     environment only, behind an environment gate and an explicit confirmation
@@ -106,17 +112,17 @@ def download(
     symbol: str = typer.Option(
         ...,
         "--symbol",
-        help=f"Ticker to download. One of: {', '.join(SUPPORTED_SYMBOLS)}.",
+        help=f"Crypto pair to download. One of: {', '.join(SUPPORTED_SYMBOLS)}.",
     ),
     start: str = typer.Option(
         ...,
         "--start",
-        help="First market date to include, YYYY-MM-DD (America/New_York).",
+        help="First UTC calendar date to include, YYYY-MM-DD.",
     ),
     end: str = typer.Option(
         ...,
         "--end",
-        help="Last market date to include, YYYY-MM-DD (America/New_York). Inclusive.",
+        help="Last UTC calendar date to include, YYYY-MM-DD. Inclusive.",
     ),
     timeframe: str = typer.Option(
         SUPPORTED_TIMEFRAME,
@@ -124,10 +130,13 @@ def download(
         help=f"Bar timeframe. Only {SUPPORTED_TIMEFRAME!r} is supported.",
     ),
 ) -> None:
-    """Download historical bars from Alpaca and store them as Parquet.
+    """Download historical crypto bars from Alpaca and store them as Parquet.
 
-    Credentials are read from the ALPACA_API_KEY and ALPACA_SECRET_KEY
-    environment variables. Downloaded files stay local and are git-ignored.
+    Crypto market data does not require credentials. If ALPACA_API_KEY and
+    ALPACA_SECRET_KEY are set they are used, which raises the provider's rate
+    limit. Downloaded files stay local and are git-ignored, and the pair's
+    slash becomes an underscore in the filename (BTC/USD -> BTC_USD) while the
+    stored data keeps the canonical BTC/USD symbol.
     """
     try:
         result = download_bars(
@@ -148,7 +157,7 @@ def download(
     typer.echo(f"Start:     {result.start.isoformat()}")
     typer.echo(f"End:       {result.end.isoformat()}")
     typer.echo(f"Rows:      {result.row_count}")
-    typer.echo(f"Feed:      {result.feed.upper()}")
+    typer.echo(f"Feed:      alpaca crypto ({result.feed})")
     typer.echo(f"Saved:     {result.parquet_path}")
     typer.echo(f"Metadata:  {result.metadata_path}")
 
@@ -200,7 +209,7 @@ def _field(label: str, value: str) -> str:
     return f"{label + ':':<{_LABEL_WIDTH}}{value}"
 
 
-def _money(amount: float) -> str:
+def _money(amount: object) -> str:
     return f"${amount:,.2f}"
 
 
@@ -220,6 +229,7 @@ def _echo_backtest_report(result: BacktestResult) -> None:
     typer.echo(_field("Initial Cash", _money(result.initial_cash)))
     typer.echo(_field("Final Cash", _money(result.final_cash)))
     typer.echo(_field("Final Equity", _money(result.final_equity)))
+    typer.echo(_field("Total Fees", _money(result.total_fees)))
     typer.echo("")
     typer.echo(_field("Total Return", _percent(result.total_return)))
     typer.echo(_field("Max Drawdown", _percent(result.max_drawdown)))
@@ -228,19 +238,22 @@ def _echo_backtest_report(result: BacktestResult) -> None:
     typer.echo(_field("BUY Executions", str(result.buy_execution_count)))
     typer.echo(_field("SELL Executions", str(result.sell_execution_count)))
     typer.echo(_field("Completed Round Trips", str(result.completed_round_trips)))
-    typer.echo(_field("Ending Position", f"{result.ending_position_quantity} shares"))
+    typer.echo(
+        _field("Ending Position", f"{format_quantity(result.ending_position_quantity)} units")
+    )
     if result.unexecuted_last_bar_signal_count:
         # No bar follows the last one, so its signal could not be filled.
         typer.echo(_field("Unexecuted Last Bar", str(result.unexecuted_last_bar_signal_count)))
     typer.echo("")
     typer.echo("Execution model:")
-    typer.echo("Next-bar open")
+    typer.echo("Next-bar open, fractional quantity")
     typer.echo("")
-    typer.echo("Fees / Slippage:")
-    typer.echo("0 / 0")
+    typer.echo("Taker fee / Slippage:")
+    typer.echo(f"{_percent(float(TAKER_FEE_RATE))} per side / 0")
     typer.echo("")
     typer.echo("Engineering validation only. Not a profitability claim, and not")
-    typer.echo("advice: no order was created and no broker was contacted.")
+    typer.echo("advice: no order was created and no broker was contacted. The fee")
+    typer.echo("is a conservative flat assumption, not a provider fee schedule.")
 
 
 @app.command()
@@ -258,8 +271,9 @@ def backtest(
 
     The dataset is validated first and the backtest is abandoned if it fails.
     Signals fill at the next bar's open - never on the signal's own bar - with
-    zero commission, fees, and slippage. Long only, whole shares, no leverage.
-    This is a local simulation: nothing is downloaded, written, or ordered.
+    a conservative flat taker fee on both sides and zero slippage. Long only,
+    fractional Decimal quantities, no leverage. This is a local simulation:
+    nothing is downloaded, written, or ordered.
 
     Exits 0 on a completed simulation, 1 when the dataset or the starting cash
     is unusable, and 2 when the file cannot be read at all.
@@ -287,24 +301,30 @@ def _echo_paper_preview(result: PaperExecutionResult, *, dry_run: bool) -> None:
     order about to be sent is the one they meant.
     """
     decision = result.risk_decision
-    typer.echo("AUTO TRADER - PAPER ORDER")
+    typer.echo("AUTO TRADER - PAPER CRYPTO ORDER")
     typer.echo("")
     typer.echo(_field("Environment", "PAPER ONLY"))
-    typer.echo(_field("Market", "OPEN" if result.clock.is_open else "CLOSED"))
+    typer.echo(_field("Trading", "CRYPTO SPOT, 24/7"))
     typer.echo(_field("Symbol", result.symbol))
     typer.echo(_field("Side", result.side.value))
-    typer.echo(_field("Requested Qty", str(result.requested_quantity)))
+    typer.echo(_field("Requested Qty", format_quantity(result.requested_quantity)))
     typer.echo(_field("Reference Price", _money(result.reference_price)))
     typer.echo("")
     typer.echo(_field("Account Equity", _money(result.account.equity)))
     typer.echo(_field("Account Cash", _money(result.account.cash)))
-    typer.echo(_field("Start-of-Day Equity", _money(result.account.start_of_day_equity)))
-    typer.echo(_field("Daily P&L", _money(result.account.daily_pnl)))
+    typer.echo(_field("UTC Day Baseline", _money(result.daily_baseline_equity)))
+    daily_pnl = Decimal(str(result.account.equity)) - result.daily_baseline_equity
+    typer.echo(_field("Daily P&L", _money(daily_pnl)))
     typer.echo("")
+    if result.asset is not None:
+        typer.echo(_field("Asset Min Order", format_quantity(result.asset.min_order_size)))
+        typer.echo(_field("Asset Increment", format_quantity(result.asset.min_trade_increment)))
+        typer.echo("")
     typer.echo(_field("Risk Decision", "APPROVED" if decision.approved else "REJECTED"))
     typer.echo(_field("Risk Reason", decision.reason_code))
-    typer.echo(_field("Approved Qty", str(decision.approved_quantity)))
+    typer.echo(_field("Approved Qty", format_quantity(decision.approved_quantity)))
     if result.intent is not None:
+        typer.echo(_field("Broker Qty", format_quantity(result.intent.approved_quantity)))
         typer.echo(_field("Client Order ID", result.intent.client_order_id))
     if dry_run:
         typer.echo("")
@@ -316,10 +336,17 @@ def paper_submit(
     symbol: str = typer.Option(
         ...,
         "--symbol",
-        help=f"Ticker to trade. One of: {', '.join(SUPPORTED_SYMBOLS)}.",
+        help=f"Crypto pair to trade. One of: {', '.join(SUPPORTED_SYMBOLS)}.",
     ),
     side: str = typer.Option(..., "--side", help="BUY or SELL. Long only; no shorts."),
-    qty: int = typer.Option(..., "--qty", help="Whole shares to request. Must be > 0."),
+    qty: str = typer.Option(
+        ...,
+        "--qty",
+        help=(
+            "Quantity of the base asset to request, as a decimal number "
+            "(e.g. 0.0001). Must be > 0; fractional quantities are supported."
+        ),
+    ),
     confirm_paper: str = typer.Option(
         "",
         "--confirm-paper",
@@ -338,7 +365,7 @@ def paper_submit(
         typer.Option("--db", help="Local operational-state database."),
     ] = DEFAULT_DATABASE_PATH,
 ) -> None:
-    """Submit one market order to the Alpaca **PAPER** account.
+    """Submit one MARKET order to the Alpaca **PAPER** crypto account.
 
     This is the only command that reaches a broker, and it can only reach the
     paper environment. There is no live mode: no flag, option, or environment
@@ -353,13 +380,17 @@ def paper_submit(
       2. --confirm-paper PAPER on the command line
 
     `--dry-run` needs neither, because it cannot submit: it reads the account,
-    positions, the clock, and the current price, runs the risk engine, prints
-    the preview, and stops without persisting an intent or calling the broker.
-    Running it first is the intended way to check an order.
+    positions, the asset's broker metadata, and the current price, runs the
+    risk engine, prints the preview, and stops without persisting an intent or
+    calling the broker. Running it first is the intended way to check an order.
 
-    The quantity sent to the broker is always the risk engine's approved
-    quantity, which may be smaller than `--qty`. If risk approves nothing, no
-    broker request is created at all.
+    The quantity sent to the broker is never larger than the risk engine's
+    approved quantity, which may itself be smaller than `--qty`; it is then
+    rounded **down** to the broker's own trade increment. If risk approves
+    nothing, no broker request is created at all.
+
+    Crypto trades continuously, so there is no market session to wait for and
+    nothing here consults one.
 
     Exits 0 when the order was submitted, already existed, or a dry run
     completed; 1 on a controlled refusal; and 2 when the outcome is UNKNOWN -
@@ -375,6 +406,12 @@ def paper_submit(
             raise typer.Exit(code=PAPER_SUBMIT_REFUSED_EXIT_CODE) from None
 
     try:
+        quantity = parse_quantity(qty, "--qty")
+    except ExecutionError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=PAPER_SUBMIT_REFUSED_EXIT_CODE) from None
+
+    try:
         initialize_database(database)
     except StateError as error:
         typer.secho(str(error), fg=typer.colors.RED, err=True)
@@ -386,7 +423,7 @@ def paper_submit(
                 connection,
                 symbol=symbol,
                 side=side,
-                requested_quantity=qty,
+                requested_quantity=quantity,
                 dry_run=dry_run,
                 now=datetime.now(UTC),
             )
@@ -422,9 +459,9 @@ def paper_submit(
         typer.echo("")
         typer.echo(_field("Broker Order ID", snapshot.broker_order_id))
         typer.echo(_field("Client Order ID", snapshot.client_order_id))
-        typer.echo(_field("Submitted Qty", str(snapshot.quantity)))
+        typer.echo(_field("Submitted Qty", format_quantity(snapshot.quantity)))
         typer.echo(_field("Broker Status", snapshot.status))
-        typer.echo(_field("Filled Qty", str(snapshot.filled_quantity)))
+        typer.echo(_field("Filled Qty", format_quantity(snapshot.filled_quantity)))
     typer.echo("")
     typer.echo("Accepted is not filled. Local positions are not updated from an")
     typer.echo("accepted order; reconciliation against the broker is a later phase.")

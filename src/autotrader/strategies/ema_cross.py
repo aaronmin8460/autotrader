@@ -1,8 +1,13 @@
-"""Phase 3: deterministic EMA 20 / EMA 50 crossover signals.
+"""C3: deterministic EMA 20 / EMA 50 crossover signals.
 
 This is the project's only strategy (docs/SPEC.md section 3.3). It exists to
 validate the engineering pipeline end to end - data -> signal - and it is a
 test fixture, not an edge. No claim is made or implied that it is profitable.
+
+**Unchanged by the crypto pivot.** Nothing here was ever asset-class specific:
+the strategy reads `close` and a symbol string, so `BTC/USD` works exactly as
+any other symbol did. No crypto-specific indicator, no RSI, no MACD, no
+sentiment, no ML, and no parameter optimization was added.
 
 **Scope.** The strategy reads canonical historical bars and emits signals.
 Nothing else: no execution price, no order, no fill, no position, no cash, and
@@ -15,13 +20,13 @@ produced the crossover, because that close is the first moment the crossover
 is knowable. That timestamp is *not* an execution timestamp and the signal
 carries no price: a signal at bar *t* asserts only that the crossover was
 observable once bar *t* had closed. Deciding when, and at what price, such a
-signal could be acted on belongs to Phase 4 backtesting, which must fill at
+signal could be acted on belongs to C4 backtesting, which must fill at
 *t+1* or later (docs/SPEC.md section 6F).
 
 **Validation.** The checks here are deliberately minimal - only enough to keep
 an input-contract violation from surfacing as an obscure pandas error. Full
-data-quality validation (duplicate timestamps, OHLC relationships, session
-gaps) is Phase 2 and is intentionally not duplicated here.
+data-quality validation (duplicate timestamps, OHLC relationships) is C2 and is
+intentionally not duplicated here.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from enum import Enum
 
 import pandas as pd
 
-#: EMA periods. Fixed for V0.1; deliberately not configurable.
+#: EMA periods. Fixed for V0.2; deliberately not configurable.
 FAST_PERIOD = 20
 SLOW_PERIOD = 50
 
@@ -93,7 +98,7 @@ def _require_columns(bars: pd.DataFrame) -> None:
 def _require_single_symbol(bars: pd.DataFrame) -> str:
     """Return the one symbol in `bars`, rejecting a multi-symbol frame.
 
-    Phase 1 produces one-symbol datasets. Grouped multi-symbol processing is
+    C1 produces one-symbol datasets. Grouped multi-symbol processing is
     not implemented, so a mixed frame is a contract violation rather than
     something to silently split.
     """
@@ -112,7 +117,7 @@ def _require_ascending_timestamps(bars: pd.DataFrame) -> None:
 
     Sorting here would hide an upstream data-contract violation, so the
     strategy fails loudly instead. Duplicate timestamps are accepted at this
-    layer; detecting them is Phase 2's job.
+    layer; detecting them is C2's job.
     """
     if not bars["timestamp"].is_monotonic_increasing:
         raise StrategyInputError(

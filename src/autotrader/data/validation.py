@@ -1,18 +1,24 @@
-"""Phase 2: structural validation of stored historical bar datasets.
+"""C2: structural validation of stored historical crypto bar datasets.
 
-Phase 1 writes canonical Parquet bar files. This module answers exactly one
+C1 writes canonical Parquet bar files. This module answers exactly one
 question about a file that already exists on disk: is it structurally and
-internally consistent enough for later phases to consume?
+internally consistent enough for later stages to consume?
 
 It only reads. It never downloads, never repairs, and never mutates the frame
 it is handed. Every check is deterministic and local to a single dataset:
 schema, timestamps, symbol, OHLC relationships, volume, trade_count, vwap.
+The architecture is unchanged from the archived equity milestone; only the
+supported-symbol set moved to the crypto pairs.
 
-Deliberately out of scope (docs/SPEC.md section 8, Phase 2): exchange
-calendars, session completeness, missing-bar detection, outlier and anomaly
-heuristics, corporate-action correctness, and cross-provider comparison. Real
-market data has weekends, holidays, and overnight gaps, so bar-to-bar spacing
-is not checked.
+**Crypto is continuous, so there is no session to validate against.** There is
+no exchange calendar here, no NYSE or Nasdaq session logic, and a weekend or
+overnight bar is ordinary data rather than a finding.
+
+Deliberately out of scope (docs/SPEC.md section 8, C2): bar-to-bar spacing and
+missing-interval detection, bar freshness, outlier and anomaly heuristics, and
+cross-provider comparison. A provider outage can legitimately leave a gap, and
+"did we receive the newest completed bar?" is a runtime question that belongs
+to the future 24/7 runner, not to structural validation.
 """
 
 from __future__ import annotations
@@ -262,7 +268,7 @@ def _check_symbol(frame: pd.DataFrame, errors: list[ValidationIssue]) -> None:
         errors.append(
             ValidationIssue(
                 INVALID_SYMBOL,
-                f"Symbol outside the supported universe: {', '.join(unsupported)}. "
+                f"Symbol outside the supported pair universe: {', '.join(unsupported)}. "
                 f"Supported symbols are: {supported}.",
             )
         )

@@ -1,11 +1,18 @@
-"""Phase 2 tests: validation of stored canonical bar datasets and the CLI.
+"""C2 tests: validation of stored canonical crypto bar datasets and the CLI.
 
 Every test is offline and builds small synthetic frames. Nothing here
 downloads, and no test needs Alpaca credentials.
+
+The validator's architecture is unchanged from the archived equity milestone -
+that is deliberate, and the structural tests below are the same ones. What
+changed is the supported-symbol set, and what must *not* have appeared is any
+exchange-session rule: crypto is continuous, so a weekend bar, a 03:00 UTC bar,
+and a missing 15-minute interval are all ordinary, not findings.
 """
 
 from __future__ import annotations
 
+import ast
 import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +23,7 @@ import pytest
 from typer.testing import CliRunner
 
 from autotrader.cli import app
+from autotrader.data import validation as validation_module
 from autotrader.data.historical import CANONICAL_COLUMNS
 from autotrader.data.validation import (
     DUPLICATE_TIMESTAMP,
@@ -39,8 +47,8 @@ from autotrader.data.validation import (
 FIRST_BAR = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
 
 
-def canonical_frame(row_count: int = 3, symbol: str = "SPY") -> pd.DataFrame:
-    """A minimal dataset that satisfies the Phase 1 contract in full."""
+def canonical_frame(row_count: int = 3, symbol: str = "BTC/USD") -> pd.DataFrame:
+    """A minimal dataset that satisfies the C1 contract in full."""
     offsets = list(range(row_count))
     return pd.DataFrame(
         {
@@ -87,14 +95,37 @@ def test_canonical_dataset_is_valid() -> None:
     assert result.errors == ()
     assert result.error_count == 0
     assert result.row_count == 3
-    assert result.symbol == "SPY"
+    assert result.symbol == "BTC/USD"
 
 
-@pytest.mark.parametrize("symbol", ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"])
-def test_every_supported_symbol_is_accepted(symbol: str) -> None:
+@pytest.mark.parametrize("symbol", ["BTC/USD", "ETH/USD"])
+def test_every_supported_pair_is_accepted(symbol: str) -> None:
     result = validate_frame(canonical_frame(symbol=symbol))
     assert result.valid, result.errors
     assert result.symbol == symbol
+
+
+@pytest.mark.parametrize("symbol", ["SPY", "QQQ", "AAPL", "MSFT", "NVDA"])
+def test_every_archived_equity_symbol_is_now_rejected(symbol: str) -> None:
+    """The equity universe is no longer valid data for this system to consume."""
+    result = validate_frame(canonical_frame(symbol=symbol))
+    assert not result.valid
+    assert INVALID_SYMBOL in result.codes()
+
+
+@pytest.mark.parametrize("symbol", ["BTCUSD", "ETHUSD", "BTC-USD", "SOL/USD"])
+def test_a_non_canonical_pair_spelling_is_rejected(symbol: str) -> None:
+    """`BTCUSD` in stored data means something upstream dropped the slash."""
+    result = validate_frame(canonical_frame(symbol=symbol))
+    assert not result.valid
+    assert INVALID_SYMBOL in result.codes()
+
+
+def test_a_slash_in_the_symbol_is_not_treated_as_lowercase_or_invalid() -> None:
+    """`"BTC/USD".upper()` is itself, so the uppercase rule passes unchanged."""
+    result = validate_frame(canonical_frame(symbol="BTC/USD"))
+    assert result.valid, result.errors
+    assert not any("uppercase" in issue.message for issue in result.errors)
 
 
 def test_a_single_bar_is_a_valid_dataset() -> None:
@@ -102,12 +133,65 @@ def test_a_single_bar_is_a_valid_dataset() -> None:
 
 
 def test_large_timestamp_gaps_are_allowed() -> None:
-    # Weekends, holidays, and overnight closures are normal; Phase 2 does not
-    # require continuous 15-minute spacing.
+    # A provider outage can legitimately leave a gap, and bar freshness is a
+    # runtime question for the future 24/7 runner. C2 does not require
+    # continuous 15-minute spacing and must not start now that the market is
+    # continuous: rejecting every missing interval globally would make a
+    # transient outage indistinguishable from corrupt data.
     frame = canonical_frame(row_count=2)
     frame.loc[1, "timestamp"] = pd.Timestamp(FIRST_BAR + timedelta(days=4))
 
     assert validate_frame(frame).valid
+
+
+def test_a_weekend_dataset_is_valid() -> None:
+    """2025-01-04/05 is a Saturday and Sunday. Crypto trades; nothing objects."""
+    frame = canonical_frame(row_count=3)
+    saturday = datetime(2025, 1, 4, 3, 0, tzinfo=UTC)
+    frame["timestamp"] = pd.to_datetime(
+        pd.Series([saturday + timedelta(minutes=15 * n) for n in range(3)]), utc=True
+    )
+    assert validate_frame(frame).valid
+
+
+def test_an_overnight_bar_is_valid() -> None:
+    """There is no session to be outside of, so 02:15 UTC is an ordinary bar."""
+    frame = canonical_frame(row_count=1)
+    frame.loc[0, "timestamp"] = pd.Timestamp(datetime(2025, 3, 12, 2, 15, tzinfo=UTC))
+    assert validate_frame(frame).valid
+
+
+def test_the_validator_has_no_exchange_calendar_dependency() -> None:
+    """No NYSE/Nasdaq session logic crept in with the pivot.
+
+    Scanned over executable code only: the module's own docstring says it has
+    no session logic, and a naive substring scan would trip over that sentence.
+    """
+    tree = ast.parse(Path(validation_module.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            node.body = body[1:] or [ast.Pass()]
+    source = ast.unparse(tree)
+    for forbidden in (
+        "America/New_York",
+        "ZoneInfo",
+        "NYSE",
+        "Nasdaq",
+        "market_calendar",
+        "pandas_market_calendars",
+        "exchange_calendars",
+        "is_open",
+        "session",
+    ):
+        assert forbidden not in source, forbidden
 
 
 # --------------------------------------------------------------------------
@@ -231,7 +315,7 @@ def test_null_symbol_is_rejected() -> None:
 
 
 def test_multiple_symbols_are_rejected() -> None:
-    result = validate_frame(altered(canonical_frame(), "symbol", 2, "QQQ"))
+    result = validate_frame(altered(canonical_frame(), "symbol", 2, "ETH/USD"))
 
     assert not result.valid
     assert INVALID_SYMBOL in result.codes()
@@ -240,11 +324,11 @@ def test_multiple_symbols_are_rejected() -> None:
 
 
 def test_unsupported_symbol_is_rejected() -> None:
-    result = validate_frame(canonical_frame(symbol="TSLA"))
+    result = validate_frame(canonical_frame(symbol="SOL/USD"))
 
     assert not result.valid
     assert INVALID_SYMBOL in result.codes()
-    assert any("supported universe" in issue.message for issue in result.errors)
+    assert any("supported pair universe" in issue.message for issue in result.errors)
 
 
 def test_lowercase_symbol_is_rejected() -> None:
@@ -466,13 +550,13 @@ def test_issue_renders_as_code_and_message() -> None:
 
 
 def test_valid_parquet_file_round_trips(tmp_path) -> None:
-    path = write_parquet(canonical_frame(), tmp_path / "SPY_15m_2025-01-02_2025-01-02.parquet")
+    path = write_parquet(canonical_frame(), tmp_path / "BTC_USD_15m_2025-01-02_2025-01-02.parquet")
 
     result = validate_parquet_file(path)
 
     assert result.valid, result.errors
     assert result.row_count == 3
-    assert result.symbol == "SPY"
+    assert result.symbol == "BTC/USD"
 
 
 def test_missing_file_raises_a_controlled_error(tmp_path) -> None:
@@ -514,7 +598,7 @@ def test_cli_validate_help_describes_the_command() -> None:
 
 
 def test_cli_validate_accepts_a_valid_dataset(tmp_path) -> None:
-    path = write_parquet(canonical_frame(), tmp_path / "SPY_15m_2025-01-02_2025-01-02.parquet")
+    path = write_parquet(canonical_frame(), tmp_path / "BTC_USD_15m_2025-01-02_2025-01-02.parquet")
 
     result = CliRunner().invoke(app, ["validate", str(path)])
 
@@ -522,13 +606,13 @@ def test_cli_validate_accepts_a_valid_dataset(tmp_path) -> None:
     assert "VALID" in result.output
     assert "INVALID" not in result.output
     assert "Rows:   3" in result.output
-    assert "Symbol: SPY" in result.output
+    assert "Symbol: BTC/USD" in result.output
     assert "Errors: 0" in result.output
 
 
 def test_cli_validate_rejects_an_invalid_dataset(tmp_path) -> None:
     frame = altered(canonical_frame(), "high", 0, 1.0)
-    path = write_parquet(frame, tmp_path / "SPY_15m_2025-01-02_2025-01-02.parquet")
+    path = write_parquet(frame, tmp_path / "BTC_USD_15m_2025-01-02_2025-01-02.parquet")
 
     result = CliRunner().invoke(app, ["validate", str(path)])
 
@@ -569,7 +653,7 @@ def test_validation_never_touches_the_network(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(socket, "socket", forbidden)
     monkeypatch.setattr(socket, "create_connection", forbidden)
 
-    path = write_parquet(canonical_frame(), tmp_path / "SPY_15m_2025-01-02_2025-01-02.parquet")
+    path = write_parquet(canonical_frame(), tmp_path / "BTC_USD_15m_2025-01-02_2025-01-02.parquet")
     assert validate_parquet_file(path).valid
 
     result = CliRunner().invoke(app, ["validate", str(path)])

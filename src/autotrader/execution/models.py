@@ -1,4 +1,4 @@
-"""Phase 7 execution domain models. No broker SDK, no network, no database.
+"""C7 execution domain models. No broker SDK, no network, no database.
 
 This module is the vocabulary the execution layer thinks in, and it is
 deliberately **provider-neutral**: it imports only the standard library, and
@@ -15,8 +15,11 @@ data. Its `client_order_id` is generated exactly once, at construction, and is
 the anchor that lets a later phase ask the broker what became of a submission
 this process did not live to see the answer to (docs/SPEC.md section 6E).
 
-**Quantities are already risk-approved.** `approved_quantity` is the risk
-engine's number and can never exceed `requested_quantity`. That invariant is
+**Quantities are exact Decimals, and already risk-approved.** Crypto is
+fractionable, so a quantity is a `decimal.Decimal` amount of the base asset
+rather than a share count. A `float` is refused rather than converted: a binary
+float is an approximation, and an approximation is not a broker quantity.
+`approved_quantity` can never exceed `requested_quantity`; that invariant is
 enforced here, again in the database, and again by the submission path, so an
 order larger than risk allowed cannot be expressed at any layer.
 """
@@ -27,15 +30,16 @@ import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 
-#: The frozen V0.1 universe (docs/SPEC.md section 3.1).
+#: The frozen V0.2 pair universe (docs/SPEC.md section 3.1).
 #:
 #: Duplicated from `autotrader.data.historical` on purpose: this module is
-#: stdlib-only by design, and importing the Phase 1 downloader would drag
-#: pandas and the Alpaca data SDK into the domain layer. A test asserts the two
-#: tuples are equal, so the duplication cannot silently drift.
-SUPPORTED_SYMBOLS: tuple[str, ...] = ("SPY", "QQQ", "AAPL", "MSFT", "NVDA")
+#: stdlib-only by design, and importing the data layer would drag pandas and
+#: the Alpaca data SDK into the domain layer. A test asserts the two tuples are
+#: equal, so the duplication cannot silently drift.
+SUPPORTED_SYMBOLS: tuple[str, ...] = ("BTC/USD", "ETH/USD")
 
 #: Every `client_order_id` this system generates starts with this. It makes an
 #: order recognisably ours in the broker's UI and in Phase 8 reconciliation.
@@ -47,7 +51,7 @@ MAX_CLIENT_ORDER_ID_LENGTH = 128
 
 
 class ExecutionError(Exception):
-    """Base class for every controlled Phase 7 failure.
+    """Base class for every controlled C7 failure.
 
     The CLI reports these as a concise message rather than a traceback: they
     describe an operational situation - a closed gate, a missing credential, a
@@ -56,7 +60,7 @@ class ExecutionError(Exception):
 
 
 class ExecutionInputError(ExecutionError):
-    """A caller-supplied value is not a thing this phase can execute."""
+    """A caller-supplied value is not a thing this milestone can execute."""
 
 
 class OrderSide(Enum):
@@ -64,7 +68,7 @@ class OrderSide(Enum):
 
     Kept distinct from `RiskSide` (a question about a hypothetical trade),
     from the backtester's `ExecutionSide` (a simulated fill), and from the
-    Phase 3 `BUY`/`EXIT` signal vocabulary. Same words, different stages: a
+    strategy's `BUY`/`EXIT` signal vocabulary. Same words, different stages: a
     signal is not a risk question, and a risk question is not an order.
 
     There is no short side, which is how long-only is enforced structurally -
@@ -102,7 +106,11 @@ def validate_client_order_id(value: str) -> str:
 
 
 def normalize_symbol(symbol: str) -> str:
-    """Uppercase `symbol` and confirm it is one this phase may trade."""
+    """Uppercase `symbol` and confirm it is a pair this milestone may trade.
+
+    Only the canonical pair form is accepted; `BTCUSD` is not silently
+    rewritten as `BTC/USD`, because the slash is part of the broker's symbol.
+    """
     if not isinstance(symbol, str):
         raise ExecutionInputError(f"symbol must be a string, got {type(symbol).__name__}.")
     normalized = symbol.strip().upper()
@@ -133,22 +141,58 @@ def normalize_side(side: str | OrderSide) -> OrderSide:
         ) from None
 
 
-def require_whole_share_quantity(value: int, field_name: str = "quantity") -> int:
-    """Require a whole number of shares greater than zero.
+def parse_quantity(value: str, field_name: str = "quantity") -> Decimal:
+    """Parse a user-supplied quantity string into an exact `Decimal`.
 
-    Fractional shares are out of scope, so a float is **refused rather than
-    rounded**: silently turning 1.5 into 1 would execute an order nobody asked
-    for. `bool` is refused too - it is an `int` subclass, and a flag reaching a
-    share count is a type confusion, not a quantity of one.
+    Text is parsed once, here, so a fractional quantity typed at the command
+    line never passes through a binary float on its way to the broker: the
+    string ``0.0001`` becomes exactly ``0.0001``, not the double nearest to it.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, Decimal):
+        return require_quantity(value, field_name)
+    if not isinstance(value, str) or not value.strip():
+        raise ExecutionInputError(f"{field_name} must be a decimal number, got {value!r}.")
+    try:
+        parsed = Decimal(value.strip())
+    except InvalidOperation:
         raise ExecutionInputError(
-            f"{field_name} must be a whole number of shares; fractional shares are out "
-            f"of scope. Got {value!r}."
+            f"{field_name} must be a decimal number, got {value!r}."
+        ) from None
+    return require_quantity(parsed, field_name)
+
+
+def require_quantity(value: Decimal, field_name: str = "quantity") -> Decimal:
+    """Require an exact `Decimal` quantity greater than zero.
+
+    Crypto quantities are fractional, so nothing is floored - but a `float` is
+    **refused rather than converted**: a binary float is an approximation of the
+    number the caller meant, and an approximation must never become the size of
+    a real order. `bool` is refused too - it is an `int` subclass, and a flag
+    reaching a quantity is a type confusion, not an amount of one.
+
+    NaN and both infinities are rejected explicitly; either would compare False
+    against every check and read as a passing one.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, Decimal)):
+        raise ExecutionInputError(
+            f"{field_name} must be an exact Decimal quantity; a float is an "
+            f"approximation, not a broker quantity. Got {value!r}."
         )
-    if value <= 0:
-        raise ExecutionInputError(f"{field_name} must be greater than zero, got {value}.")
-    return value
+    quantity = Decimal(value)
+    if not quantity.is_finite():
+        raise ExecutionInputError(f"{field_name} must be finite, got {value!r}.")
+    if quantity <= 0:
+        raise ExecutionInputError(
+            f"{field_name} must be greater than zero, got {format_quantity(quantity)}."
+        )
+    return quantity
+
+
+def format_quantity(value: Decimal) -> str:
+    """Render a quantity for humans: no exponent, no trailing-zero noise."""
+    if value == 0:
+        return "0"
+    return format(value.normalize(), "f")
 
 
 def require_reference_price(value: float, field_name: str = "reference_price") -> float:
@@ -176,17 +220,19 @@ class OrderIntent:
     Frozen: an intent is a record of a decision already made, and its
     `client_order_id` in particular must never change once persisted.
 
-    `reference_price` is the mark the risk engine sized against - it is not a
-    limit price and not a promised fill. `risk_reason_code` is the Phase 5 code
-    that produced `approved_quantity`, kept so the audit trail can later show
-    *why* an order was this size (`APPROVED`, or the constraint that clamped
-    it).
+    `approved_quantity` is the exact quantity that will be sent - the risk
+    engine's number after normalization to the broker's own trade increment,
+    never larger than either. `reference_price` is the USD mark risk sized
+    against; it is not a limit price and not a promised fill.
+    `risk_reason_code` is the code that produced the approval, kept so the
+    audit trail can later show *why* an order was this size (`APPROVED`, or the
+    constraint that clamped it).
     """
 
     symbol: str
     side: OrderSide
-    requested_quantity: int
-    approved_quantity: int
+    requested_quantity: Decimal
+    approved_quantity: Decimal
     reference_price: float
     risk_reason_code: str
     created_at: datetime
@@ -200,21 +246,21 @@ class OrderIntent:
         object.__setattr__(
             self,
             "requested_quantity",
-            require_whole_share_quantity(self.requested_quantity, "requested_quantity"),
+            require_quantity(self.requested_quantity, "requested_quantity"),
         )
         object.__setattr__(
             self,
             "approved_quantity",
-            require_whole_share_quantity(self.approved_quantity, "approved_quantity"),
+            require_quantity(self.approved_quantity, "approved_quantity"),
         )
         object.__setattr__(self, "reference_price", require_reference_price(self.reference_price))
         object.__setattr__(self, "client_order_id", validate_client_order_id(self.client_order_id))
 
         if self.approved_quantity > self.requested_quantity:
             raise ExecutionInputError(
-                f"approved_quantity ({self.approved_quantity}) must not exceed "
-                f"requested_quantity ({self.requested_quantity}); risk may only ever "
-                "size an order down."
+                f"approved_quantity ({format_quantity(self.approved_quantity)}) must not "
+                f"exceed requested_quantity ({format_quantity(self.requested_quantity)}); "
+                "risk may only ever size an order down."
             )
         if not isinstance(self.risk_reason_code, str) or not self.risk_reason_code.strip():
             raise ExecutionInputError("risk_reason_code must be a non-empty string.")
@@ -233,10 +279,12 @@ __all__ = [
     "ExecutionInputError",
     "OrderIntent",
     "OrderSide",
+    "format_quantity",
     "new_client_order_id",
     "normalize_side",
     "normalize_symbol",
+    "parse_quantity",
+    "require_quantity",
     "require_reference_price",
-    "require_whole_share_quantity",
     "validate_client_order_id",
 ]

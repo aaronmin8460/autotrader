@@ -1,13 +1,28 @@
-"""Phase 1: Alpaca historical 15-minute bars -> canonical Parquet.
+"""C1: Alpaca historical 15-minute **crypto** bars -> canonical Parquet.
 
 This module is the only place the project talks to a market-data provider. It
-is deliberately narrow: one provider (Alpaca), one asset class (US equities),
-one feed (IEX), one timeframe (15m), and one fixed universe. There is no
-trading client here and no order path anywhere in this repository.
+is deliberately narrow: one provider (Alpaca), one asset class (crypto spot),
+one feed (Alpaca's US crypto feed), one timeframe (15m), and one fixed pair
+universe. There is no trading client here.
 
-Data-quality validation (duplicates, OHLC relationships, session gaps) is
-Phase 2 and is intentionally absent. This module performs only the minimal
-normalization required to produce a stable canonical dataset.
+**Crypto, not equities.** V0.2 replaced the equity path outright rather than
+growing an asset-class switch; the completed equity milestone is archived at
+the Git tag `equity-v0.1-phase7`. There is no `StockHistoricalDataClient`, no
+IEX feed, and no stock symbol in the active system.
+
+**Crypto trades continuously.** `--start` and `--end` are **UTC** calendar
+dates, not exchange-session dates: there is no market open, no close, and no
+holiday. Weekend and overnight bars are ordinary data.
+
+**Credentials are optional here.** Alpaca serves crypto market data without
+authentication, so a download works with no key configured. When
+`ALPACA_API_KEY` / `ALPACA_SECRET_KEY` are present they are passed through,
+because an authenticated client gets better provider rate limits. Paper order
+submission still requires them (`autotrader.execution`).
+
+Data-quality validation (duplicates, OHLC relationships, gaps) is C2 and is
+intentionally absent. This module performs only the minimal normalization
+required to produce a stable canonical dataset.
 """
 
 from __future__ import annotations
@@ -20,27 +35,38 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 from alpaca.common.exceptions import APIError
-from alpaca.data.enums import DataFeed
-from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.enums import CryptoFeed
+from alpaca.data.historical.crypto import CryptoHistoricalDataClient
 from alpaca.data.models.bars import Bar
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 PROVIDER = "alpaca"
-FEED = DataFeed.IEX
 
-#: The frozen V0.1 universe (docs/SPEC.md section 3.1).
-SUPPORTED_SYMBOLS: tuple[str, ...] = ("SPY", "QQQ", "AAPL", "MSFT", "NVDA")
+#: Alpaca's crypto feed. There is exactly one, and it is not an equity feed.
+FEED = CryptoFeed.US
 
-#: The only timeframe this phase supports (docs/SPEC.md section 3.2).
+#: The frozen V0.2 universe (docs/SPEC.md section 3.1). Canonical pair form.
+SUPPORTED_SYMBOLS: tuple[str, ...] = ("BTC/USD", "ETH/USD")
+
+#: The only quote currency this milestone supports.
+QUOTE_CURRENCY = "USD"
+
+#: The only timeframe this milestone supports (docs/SPEC.md section 3.2).
 SUPPORTED_TIMEFRAME = "15m"
 
-#: `--start` / `--end` are US market calendar dates in this timezone.
-MARKET_TIMEZONE = ZoneInfo("America/New_York")
+#: The smallest instant the provider's timestamps distinguish. Used only to
+#: turn "up to and including this day" into a boundary an inclusive-`end` API
+#: understands.
+RESOLUTION = timedelta(microseconds=1)
+
+#: A slash cannot appear in a flat filename, so the canonical pair symbol is
+#: slugged for the filesystem only. The domain symbol is never rewritten.
+SYMBOL_SEPARATOR = "/"
+SLUG_SEPARATOR = "_"
 
 #: The canonical historical-bar contract. Order is part of the contract.
 CANONICAL_COLUMNS: tuple[str, ...] = (
@@ -70,10 +96,6 @@ _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _API_KEY_ENV = "ALPACA_API_KEY"
 _SECRET_KEY_ENV = "ALPACA_SECRET_KEY"
 
-MISSING_CREDENTIALS_MESSAGE = (
-    f"Alpaca credentials are not configured.\nSet {_API_KEY_ENV} and {_SECRET_KEY_ENV}."
-)
-
 
 class HistoricalDataError(Exception):
     """An expected, user-facing failure. The CLI reports these without a traceback."""
@@ -99,7 +121,15 @@ class DownloadResult:
 
 
 def normalize_symbol(symbol: str) -> str:
-    """Uppercase `symbol` and confirm it is in the V0.1 universe."""
+    """Uppercase `symbol` and confirm it is in the V0.2 pair universe.
+
+    Only the canonical pair form is accepted. `BTCUSD` is **not** silently
+    reinterpreted as `BTC/USD`: the slash is part of the provider's symbol,
+    and quietly rewriting it would let two spellings of one market drift apart
+    in stored data.
+    """
+    if not isinstance(symbol, str):
+        raise HistoricalDataError(f"symbol must be a string, got {type(symbol).__name__}.")
     normalized = symbol.strip().upper()
     if normalized not in SUPPORTED_SYMBOLS:
         supported = ", ".join(SUPPORTED_SYMBOLS)
@@ -109,8 +139,17 @@ def normalize_symbol(symbol: str) -> str:
     return normalized
 
 
+def filesystem_slug(symbol: str) -> str:
+    """The filesystem-safe form of a canonical pair, e.g. ``BTC/USD`` -> ``BTC_USD``.
+
+    Used for filenames only. The stored DataFrame, the metadata sidecar, and
+    every domain model keep the canonical `BTC/USD` spelling.
+    """
+    return normalize_symbol(symbol).replace(SYMBOL_SEPARATOR, SLUG_SEPARATOR)
+
+
 def normalize_timeframe(timeframe: str) -> str:
-    """Confirm `timeframe` is the single timeframe this phase supports."""
+    """Confirm `timeframe` is the single timeframe this milestone supports."""
     normalized = timeframe.strip().lower()
     if normalized != SUPPORTED_TIMEFRAME:
         raise HistoricalDataError(
@@ -119,8 +158,12 @@ def normalize_timeframe(timeframe: str) -> str:
     return normalized
 
 
-def parse_market_date(value: str, field: str) -> date:
-    """Parse a strict ``YYYY-MM-DD`` US market calendar date."""
+def parse_utc_date(value: str, field: str) -> date:
+    """Parse a strict ``YYYY-MM-DD`` UTC calendar date.
+
+    Crypto trades continuously, so a day is a UTC calendar day - there is no
+    exchange session to anchor it to.
+    """
     candidate = value.strip()
     if not _DATE_PATTERN.fullmatch(candidate):
         raise HistoricalDataError(
@@ -136,8 +179,8 @@ def parse_market_date(value: str, field: str) -> date:
 
 def resolve_date_range(start: str, end: str) -> tuple[date, date]:
     """Parse both boundaries and reject an inverted range."""
-    start_date = parse_market_date(start, "start")
-    end_date = parse_market_date(end, "end")
+    start_date = parse_utc_date(start, "start")
+    end_date = parse_utc_date(end, "end")
     if end_date < start_date:
         raise HistoricalDataError(
             f"Invalid date range: --end {end_date.isoformat()} is before "
@@ -147,14 +190,18 @@ def resolve_date_range(start: str, end: str) -> tuple[date, date]:
 
 
 def to_request_window(start_date: date, end_date: date) -> tuple[datetime, datetime]:
-    """Convert inclusive market calendar dates to a UTC ``[start, end)`` window.
+    """Convert inclusive UTC calendar dates to the closed UTC window to request.
 
-    `end_date` is inclusive for the user, so the request boundary becomes
-    midnight America/New_York on the following day, expressed in UTC.
+    Alpaca's crypto bars endpoint treats `end` as **inclusive**, and a 24/7
+    market has a bar stamped exactly at midnight. Asking for the next day's
+    midnight would therefore return one bar belonging to the day after the one
+    the user asked for - a bar dated 2026-01-01 inside a file named
+    ``..._2025-12-31``. The boundary is the last instant of `end_date` instead,
+    so a one-day request returns exactly the 96 bars of that day.
     """
-    start_local = datetime.combine(start_date, time.min, tzinfo=MARKET_TIMEZONE)
-    end_local = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=MARKET_TIMEZONE)
-    return start_local.astimezone(UTC), end_local.astimezone(UTC)
+    start_utc = datetime.combine(start_date, time.min, tzinfo=UTC)
+    next_midnight = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=UTC)
+    return start_utc, next_midnight - RESOLUTION
 
 
 # --------------------------------------------------------------------------
@@ -169,29 +216,36 @@ def credentials_configured() -> bool:
     )
 
 
-def create_client() -> StockHistoricalDataClient:
-    """Build a market-data-only Alpaca client from the process environment."""
-    if not credentials_configured():
-        raise HistoricalDataError(MISSING_CREDENTIALS_MESSAGE)
-    return StockHistoricalDataClient(
-        api_key=os.environ[_API_KEY_ENV].strip(),
-        secret_key=os.environ[_SECRET_KEY_ENV].strip(),
-    )
+def create_client() -> CryptoHistoricalDataClient:
+    """Build a market-data-only Alpaca crypto client.
+
+    Alpaca serves crypto bars unauthenticated, so this never requires a
+    credential to succeed. Configured credentials are passed through when both
+    are present, which raises the provider's rate limit; a half-configured
+    environment is treated as unconfigured rather than sent as a broken
+    credential pair.
+    """
+    if credentials_configured():
+        return CryptoHistoricalDataClient(
+            api_key=os.environ[_API_KEY_ENV].strip(),
+            secret_key=os.environ[_SECRET_KEY_ENV].strip(),
+        )
+    return CryptoHistoricalDataClient()
 
 
-def build_bars_request(symbol: str, start: datetime, end: datetime) -> StockBarsRequest:
-    """Build the 15-minute IEX stock-bars request for one symbol.
+def build_bars_request(symbol: str, start: datetime, end: datetime) -> CryptoBarsRequest:
+    """Build the 15-minute crypto-bars request for one pair.
 
     `start` and `end` must be timezone-aware. alpaca-py converts them to naive
     UTC on the request object, so passing aware datetimes is what keeps the
-    window unambiguous.
+    window unambiguous. The feed is not a request field for crypto - it is an
+    argument to the client call.
     """
-    return StockBarsRequest(
+    return CryptoBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame(15, TimeFrameUnit.Minute),
         start=start,
         end=end,
-        feed=FEED,
     )
 
 
@@ -203,7 +257,7 @@ def _api_error_text(exc: APIError) -> str:
 
 
 def fetch_bars(
-    client: StockHistoricalDataClient,
+    client: CryptoHistoricalDataClient,
     symbol: str,
     start: datetime,
     end: datetime,
@@ -211,7 +265,7 @@ def fetch_bars(
     """Request bars from Alpaca and return them in the canonical schema."""
     request = build_bars_request(symbol, start, end)
     try:
-        barset = client.get_stock_bars(request)
+        barset = client.get_crypto_bars(request, feed=FEED)
     except APIError as exc:
         raise HistoricalDataError(
             f"Alpaca rejected the historical data request: {_api_error_text(exc)}"
@@ -229,8 +283,9 @@ def bars_to_dataframe(bars: Iterable[Bar], symbol: str) -> pd.DataFrame:
     """Convert Alpaca bars to the canonical DataFrame.
 
     Timestamps become timezone-aware UTC, rows are ordered ascending, and the
-    columns are exactly `CANONICAL_COLUMNS` in that order. `trade_count` and
-    `vwap` stay nullable because Alpaca does not always provide them.
+    columns are exactly `CANONICAL_COLUMNS` in that order. The stored `symbol`
+    is the canonical pair form, slash included. `trade_count` and `vwap` stay
+    nullable because Alpaca does not always provide them.
     """
     normalized_symbol = normalize_symbol(symbol)
     records = [
@@ -261,8 +316,8 @@ def bars_to_dataframe(bars: Iterable[Bar], symbol: str) -> pd.DataFrame:
 
 
 def output_stem(symbol: str, timeframe: str, start: date, end: date) -> str:
-    """Deterministic, date-ranged basename, e.g. ``SPY_15m_2025-01-01_2025-12-31``."""
-    return f"{symbol}_{timeframe}_{start.isoformat()}_{end.isoformat()}"
+    """Deterministic, date-ranged basename, e.g. ``BTC_USD_15m_2025-01-01_2025-12-31``."""
+    return f"{filesystem_slug(symbol)}_{timeframe}_{start.isoformat()}_{end.isoformat()}"
 
 
 def output_paths(
@@ -302,11 +357,16 @@ def build_metadata(
     parquet_filename: str,
     retrieved_at: datetime,
 ) -> dict[str, object]:
-    """Build the reproducibility sidecar. Never include credentials or account data."""
+    """Build the reproducibility sidecar. Never include credentials or account data.
+
+    `symbol` is the canonical pair; `symbol_slug` records the filesystem form
+    so the two spellings are documented together rather than inferred.
+    """
     return {
         "provider": PROVIDER,
         "feed": FEED.value,
-        "symbol": symbol,
+        "symbol": normalize_symbol(symbol),
+        "symbol_slug": filesystem_slug(symbol),
         "timeframe": timeframe,
         "requested_start": start.isoformat(),
         "requested_end": end.isoformat(),
@@ -334,9 +394,9 @@ def download_bars(
     start: str,
     end: str,
     output_dir: Path,
-    client: StockHistoricalDataClient | None = None,
+    client: CryptoHistoricalDataClient | None = None,
 ) -> DownloadResult:
-    """Download one symbol's bars and write the Parquet file plus its metadata sidecar."""
+    """Download one pair's bars and write the Parquet file plus its metadata sidecar."""
     resolved_symbol = normalize_symbol(symbol)
     resolved_timeframe = normalize_timeframe(timeframe)
     start_date, end_date = resolve_date_range(start, end)
@@ -347,8 +407,8 @@ def download_bars(
     if frame.empty:
         raise HistoricalDataError(
             f"Alpaca returned no {resolved_timeframe} bars for {resolved_symbol} between "
-            f"{start_date.isoformat()} and {end_date.isoformat()} on the {FEED.value} feed. "
-            "No files were written."
+            f"{start_date.isoformat()} and {end_date.isoformat()} on the {FEED.value} crypto "
+            "feed. No files were written."
         )
 
     parquet_path, metadata_path = output_paths(
@@ -382,11 +442,12 @@ def download_bars(
 __all__ = [
     "CANONICAL_COLUMNS",
     "FEED",
-    "MARKET_TIMEZONE",
-    "MISSING_CREDENTIALS_MESSAGE",
     "PROVIDER",
+    "QUOTE_CURRENCY",
+    "SLUG_SEPARATOR",
     "SUPPORTED_SYMBOLS",
     "SUPPORTED_TIMEFRAME",
+    "SYMBOL_SEPARATOR",
     "DownloadResult",
     "HistoricalDataError",
     "bars_to_dataframe",
@@ -396,11 +457,12 @@ __all__ = [
     "credentials_configured",
     "download_bars",
     "fetch_bars",
+    "filesystem_slug",
     "normalize_symbol",
     "normalize_timeframe",
     "output_paths",
     "output_stem",
-    "parse_market_date",
+    "parse_utc_date",
     "resolve_date_range",
     "to_request_window",
     "write_metadata",

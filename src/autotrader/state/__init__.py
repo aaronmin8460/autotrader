@@ -1,10 +1,15 @@
 """Local operational state, stored in a single SQLite file.
 
-The persistence layer only: schema creation, schema versioning and one small
-explicit v1 -> v2 migration, WAL journalling, enforced foreign keys,
-transactional writes, and a set of durable operational records - strategy
-runs, signals, risk events, system events, local position snapshots, and
-(schema v2, Phase 7) order intents and broker-order snapshots.
+The persistence layer only: schema creation, schema versioning and a small
+explicit v1 -> v2 -> v3 migration path, WAL journalling, enforced foreign
+keys, transactional writes, and a set of durable operational records -
+strategy runs, signals, risk events, system events, local position snapshots,
+order intents, broker-order snapshots, and (schema v3) the UTC-day risk
+baselines the crypto daily-loss halt measures against.
+
+Quantities are exact `decimal.Decimal` values, stored as canonical decimal
+text: crypto positions are fractional, and a binary float cannot hold one
+exactly.
 
 Nothing here trades. Storing an order intent is not placing an order: this
 package contacts no broker, holds no credentials, and opens no socket. There
@@ -34,6 +39,8 @@ from autotrader.state.sqlite import (
     TERMINAL_RUN_STATUSES,
     TIMESTAMP_FORMAT,
     V2_TABLES,
+    V3_TABLES,
+    DailyRiskBaseline,
     DatabaseStateError,
     DuplicateBrokerOrderError,
     DuplicateOrderIntentError,
@@ -51,10 +58,14 @@ from autotrader.state.sqlite import (
     UnknownStrategyRunError,
     UnsupportedSchemaVersionError,
     connect,
+    ensure_daily_risk_baseline,
     finish_strategy_run,
+    from_decimal_text,
+    from_risk_date_text,
     from_utc_text,
     get_broker_order_by_client_id,
     get_broker_order_by_intent,
+    get_daily_risk_baseline,
     get_order_intent,
     get_order_intent_by_client_id,
     get_position,
@@ -62,6 +73,7 @@ from autotrader.state.sqlite import (
     get_strategy_run,
     initialize_database,
     list_broker_orders,
+    list_daily_risk_baselines,
     list_order_intents,
     list_positions,
     list_risk_events,
@@ -73,11 +85,14 @@ from autotrader.state.sqlite import (
     record_signal,
     record_strategy_run,
     record_system_event,
+    to_decimal_text,
+    to_risk_date_text,
     to_utc_text,
     transaction,
     update_order_intent_status,
     upsert_broker_order,
     upsert_position,
+    utc_risk_date,
 )
 
 __all__ = [
@@ -102,6 +117,8 @@ __all__ = [
     "TERMINAL_RUN_STATUSES",
     "TIMESTAMP_FORMAT",
     "V2_TABLES",
+    "V3_TABLES",
+    "DailyRiskBaseline",
     "DatabaseStateError",
     "DuplicateBrokerOrderError",
     "DuplicateOrderIntentError",
@@ -119,10 +136,14 @@ __all__ = [
     "UnknownStrategyRunError",
     "UnsupportedSchemaVersionError",
     "connect",
+    "ensure_daily_risk_baseline",
     "finish_strategy_run",
+    "from_decimal_text",
+    "from_risk_date_text",
     "from_utc_text",
     "get_broker_order_by_client_id",
     "get_broker_order_by_intent",
+    "get_daily_risk_baseline",
     "get_order_intent",
     "get_order_intent_by_client_id",
     "get_position",
@@ -130,6 +151,7 @@ __all__ = [
     "get_strategy_run",
     "initialize_database",
     "list_broker_orders",
+    "list_daily_risk_baselines",
     "list_order_intents",
     "list_positions",
     "list_risk_events",
@@ -141,9 +163,12 @@ __all__ = [
     "record_signal",
     "record_strategy_run",
     "record_system_event",
+    "to_decimal_text",
+    "to_risk_date_text",
     "to_utc_text",
     "transaction",
     "update_order_intent_status",
     "upsert_broker_order",
     "upsert_position",
+    "utc_risk_date",
 ]
