@@ -12,10 +12,11 @@ There is **no trading in this repository, and none is planned within the
 current milestone** - no live trading and no paper trading. No order is ever
 submitted, and no Alpaca trading client is constructed anywhere in the code.
 
-What exists today is one read-only capability: downloading historical
+What exists today is one read-only capability - downloading historical
 15-minute US-equity bars from Alpaca's IEX feed and storing them locally as
-Parquet. Data validation, strategies, backtesting, and risk logic belong to
-later phases and are not implemented.
+Parquet - plus the Phase 3 EMA 20 / EMA 50 signal generator, an offline domain
+module that turns those bars into BUY/EXIT signals and nothing more. Data
+validation (Phase 2), backtesting, and risk logic are not implemented.
 
 ## Scope summary
 
@@ -110,6 +111,32 @@ re-fetch.
 The `autotrader` console script is installed as an equivalent entry point.
 There are no strategy, backtest, or trading commands.
 
+## Strategy signals (Phase 3)
+
+`autotrader.strategies.ema_cross` generates EMA 20 / EMA 50 crossover signals
+from a canonical bar frame. It exists to validate the engineering pipeline and
+is **not a claim of profitability**.
+
+```python
+from autotrader.strategies import generate_ema_cross_signals
+
+signals = generate_ema_cross_signals(bars)  # -> list[Signal], ascending by timestamp
+```
+
+Long only, two signal types. `BUY` when the fast EMA moves from at-or-below to
+strictly above the slow EMA; `EXIT` when it moves from at-or-above to strictly
+below. Both EMAs use `adjust=False` and stay undefined through their warm-up,
+so no signal can be produced before 50 bars have been observed. A crossover
+produces at most one signal - nothing repeats while the relation merely holds.
+
+A signal's timestamp is the bar whose **close** made the crossover knowable.
+It is **not an execution timestamp**, and a signal carries no price: choosing
+when and at what price to act belongs to Phase 4 backtesting. The module emits
+signals only - no orders, positions, or P&L - imports no broker client, and
+requires no credentials or network access. See
+[docs/SPEC.md](docs/SPEC.md) section 8, "Phase 3 - Strategy", for the full
+contract.
+
 ## Development
 
 Run the tests:
@@ -135,7 +162,7 @@ ruff format --check .
 ```
 src/autotrader/data/        Alpaca historical bars -> canonical Parquet (Phase 1)
 src/autotrader/cli/         Typer CLI (version, download)
-src/autotrader/strategies/  empty stub (Phase 3)
+src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals (Phase 3)
 src/autotrader/backtest/    empty stub (Phase 4)
 src/autotrader/risk/        empty stub (Phase 5)
 tests/                      offline tests; no test contacts the network
