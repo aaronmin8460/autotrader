@@ -1,0 +1,93 @@
+# AutoTrader dashboard API - read-only FastAPI backend, loopback only.
+#
+# Install to /etc/systemd/system/autotrader-dashboard-api.service.
+#
+# Requires the `autotrader.dashboard` package and the `dashboard` extra
+# (fastapi, uvicorn), which arrive with Dashboard V0.1.
+#
+# **This service is operationally independent of trading.** Nothing here is
+# ordered before, after, bound to, or required by autotrader-crypto.service or
+# autotrader-equity.service, and that is a deliberate absence rather than an
+# oversight: a dashboard that could stop the runtimes by failing would be a
+# monitoring tool that causes the outage it reports.
+
+[Unit]
+Description=AutoTrader dashboard API (read-only, 127.0.0.1)
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+After=network.target
+
+ConditionPathExists=/etc/autotrader/autotrader.env
+ConditionPathExists=/opt/autotrader/venv/bin/python
+
+[Service]
+Type=simple
+User=autotrader
+Group=autotrader
+WorkingDirectory=/opt/autotrader/app
+
+# Two files, not three. The credentials are here because the dashboard reads
+# the broker for account value and held positions - both reads, through an
+# import list that never touches a submission entry point.
+#
+# `autotrader.trading.env` is deliberately NOT loaded. The dashboard has no
+# use for the paper submission gate, and a process that cannot submit an order
+# should not be carrying the variable that authorizes one.
+EnvironmentFile=/etc/autotrader/autotrader.env
+EnvironmentFile=-/etc/autotrader/autotrader.secrets.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# The API reads its database from AUTOTRADER_DASHBOARD_DB, which
+# /etc/autotrader/autotrader.env points at the same file the runtimes write.
+# One database, one truth; see docs/DEPLOYMENT.md, "One database".
+#
+# There is no --host argument, and its absence is the point: the entry point
+# hardcodes 127.0.0.1 so that "listen on every interface" cannot become a
+# one-flag decision on an API that has no authentication. Reaching it from
+# anywhere else is Caddy's job (deploy/caddy/Caddyfile.example).
+ExecStart=/opt/autotrader/venv/bin/python -m autotrader.dashboard --port ${AUTOTRADER_DASHBOARD_API_PORT}
+
+# `always`, unlike the trading units. The distinction is what the process can
+# do when it comes back: this one serves GET routes over a database it cannot
+# write, so restarting it can at worst re-read stale rows. A trading runtime
+# restarting into unreconciled state can submit an order, which is why those
+# units get `on-failure` with exit 2 held down.
+Restart=always
+RestartSec=5
+
+StateDirectory=autotrader
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+# The state directory is NOT mounted read-only here, and that is a SQLite
+# constraint rather than a permissions oversight. A reader of a WAL database
+# still writes: it maps and updates the `-shm` shared-memory index, and it may
+# need to create it when it is the first connection since the last clean
+# close. `ReadOnlyPaths=/var/lib/autotrader` makes the API fail to open the
+# database at all, and it fails at start, not under load.
+#
+# What keeps this process read-only is the code - every route is a GET and the
+# broker import list carries no submission entry point - not the filesystem.
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-dashboard-api
+
+[Install]
+WantedBy=multi-user.target

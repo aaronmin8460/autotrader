@@ -1,0 +1,82 @@
+# AutoTrader dashboard frontend - production Next.js server, loopback only.
+#
+# Install to /etc/systemd/system/autotrader-dashboard-web.service.
+#
+# Serves the built Next.js application from /opt/autotrader/app/dashboard/
+# frontend/.next, which `autotrader-deploy` produces with `npm run build`. It
+# is a server, not a static export: next.config.mjs rewrites
+# /api/dashboard/* to the loopback FastAPI process, so the browser only ever
+# sees one origin and there is no CORS policy to get wrong.
+
+[Unit]
+Description=AutoTrader dashboard frontend (Next.js production server, 127.0.0.1)
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+After=network.target autotrader-dashboard-api.service
+
+# `Wants`, not `Requires`. Starting the frontend pulls the API up with it,
+# which is what an operator means by "start the dashboard". But the frontend
+# survives the API going down afterwards - by design, the page keeps the last
+# good payload on screen and says the connection dropped, which is exactly the
+# context you need to diagnose why. `Requires` would tear that page down at
+# the moment it became useful.
+Wants=autotrader-dashboard-api.service
+
+ConditionPathExists=/opt/autotrader/app/dashboard/frontend/.next
+ConditionPathExists=/opt/autotrader/app/dashboard/frontend/node_modules/.bin/next
+
+[Service]
+Type=simple
+User=autotrader
+Group=autotrader
+WorkingDirectory=/opt/autotrader/app/dashboard/frontend
+
+# **No credentials, and no trading gate.** This is the one process in the
+# deployment that renders bytes into a browser, so it is the one process that
+# must never hold an Alpaca key. It gets the non-secret file and nothing else;
+# autotrader.secrets.env and autotrader.trading.env are both absent above, and
+# their absence is the security boundary.
+EnvironmentFile=/etc/autotrader/autotrader.env
+
+Environment=NODE_ENV=production
+# Read at server start, never shipped to the browser: it is not NEXT_PUBLIC_.
+Environment=DASHBOARD_API_ORIGIN=http://127.0.0.1:8000
+
+# `--hostname 127.0.0.1` is load-bearing and must not be dropped. `next start`
+# binds 0.0.0.0 by default, which on a VPS means the unauthenticated dashboard
+# is on the public internet the moment the service comes up - no firewall
+# mistake required, just the default. Public exposure goes through Caddy, with
+# authentication in front (deploy/caddy/Caddyfile.example).
+ExecStart=/opt/autotrader/app/dashboard/frontend/node_modules/.bin/next start --hostname 127.0.0.1 --port ${AUTOTRADER_DASHBOARD_WEB_PORT}
+
+# Safe for the same reason the API's is: this process renders state it cannot
+# change, and it holds no credential with which to change any.
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+# Next.js writes a small cache under .next/cache at runtime. Nothing else in
+# the checkout is writable, and the trading state directory is not mounted
+# here at all: the frontend has no reason to see the database.
+ReadWritePaths=/opt/autotrader/app/dashboard/frontend/.next
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-dashboard-web
+
+[Install]
+WantedBy=multi-user.target

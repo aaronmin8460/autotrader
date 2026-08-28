@@ -1,0 +1,25 @@
+# Daily SQLite backup.
+#
+# Install to /etc/systemd/system/autotrader-backup.timer, then:
+#   systemctl enable --now autotrader-backup.timer
+#
+# Daily is deliberate rather than aspirational. The database is durable intent
+# and an audit trail, not the authority on positions - the broker is that, and
+# reconciliation rebuilds local rows from it after any crash. Losing a day of
+# audit rows costs an operator some history; it does not cost a position.
+
+[Unit]
+Description=Daily AutoTrader SQLite backup
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+
+[Timer]
+OnCalendar=daily
+# Spread the load, and avoid stacking the backup on top of the 00:00 UTC bar
+# boundary that every runtime wakes for.
+RandomizedDelaySec=900
+# Run on the next boot if the machine was down when the timer was due.
+Persistent=true
+Unit=autotrader-backup.service
+
+[Install]
+WantedBy=timers.target

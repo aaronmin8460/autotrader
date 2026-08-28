@@ -1,0 +1,47 @@
+# AutoTrader SQLite backup - consistent, timestamped, non-destructive.
+#
+# Install to /etc/systemd/system/autotrader-backup.service, alongside
+# autotrader-backup.timer. Started by the timer; `systemctl start
+# autotrader-backup` runs one on demand.
+#
+# The runtimes keep running while this executes. That is the whole reason it
+# uses SQLite's online backup API rather than `cp`; see deploy/bin/
+# autotrader-backup for what goes wrong with the copy.
+
+[Unit]
+Description=AutoTrader SQLite backup (online backup API)
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+ConditionPathExists=/etc/autotrader/autotrader.env
+
+[Service]
+Type=oneshot
+User=autotrader
+Group=autotrader
+
+EnvironmentFile=/etc/autotrader/autotrader.env
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/autotrader/venv/bin/python /opt/autotrader/app/deploy/bin/autotrader-backup --db ${AUTOTRADER_DB} --into ${AUTOTRADER_BACKUP_DIR} --keep ${AUTOTRADER_BACKUP_KEEP}
+
+StateDirectory=autotrader
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-backup
