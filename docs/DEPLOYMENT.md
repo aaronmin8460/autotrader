@@ -449,6 +449,50 @@ by anyone scanning the range. That is exactly why `basic_auth` is not optional:
 obscurity was never the boundary, and with an IP-derived hostname there is no
 obscurity left to lean on.
 
+### Verify it in a browser, not with curl
+
+`curl` cannot tell a working dashboard from a blank one. The first publish of
+this hostname passed every network check — 401, 200, certificate, six API
+routes, 405 on writes, closed ports — while the page rendered nothing, because
+`default-src 'self'` blocked Next.js's inline bootstrap scripts and a blocked
+script still arrives inside an HTTP 200.
+
+```bash
+pip install '.[browser]' && playwright install chromium
+export AUTOTRADER_DASHBOARD_URL=https://dash.example.com
+export AUTOTRADER_DASHBOARD_USER=...
+export AUTOTRADER_DASHBOARD_PASSWORD=...        # from a 0600 file, never argv
+pytest -q tests/test_web_publish_browser.py
+```
+
+It drives Chromium against the live hostname and fails on a CSP violation, an
+uncaught exception, markup React never hydrated, or a client poll that did not
+reach the API — alongside the boundary checks that were already green. Without
+Playwright or those three variables it skips, so the offline suite stays
+runnable on a laptop. Playwright is its own extra rather than part of `dev`,
+because `autotrader-deploy --run-tests` installs `dev` on the trading host and
+a trading host has no reason to carry a browser.
+
+### The policy allows inline scripts, deliberately
+
+`script-src 'self' 'unsafe-inline'`. Next.js App Router emits its React Server
+Component payload as inline `<script>` blocks with no nonce, and without the
+allowance the page is blank in every browser. The two alternatives both cost
+more than they buy here: hashes would need regenerating on every frontend build
+and the payload embeds the build ID, so a stale Caddyfile would blank the page
+again at the next deploy; a nonce means `middleware.ts` in the frontend, which
+moves the header into the process that deliberately holds no credentials, makes
+every route dynamic, and needs a frontend rebuild on a host where the npm build
+is already fragile.
+
+What it costs is small and specific: the page renders no user-supplied content,
+every value on it comes from this operator's own database and broker, it is
+behind `basic_auth`, and it is GET-only at the edge. Everything else was
+measured against the real build in Chromium and left out because it changed
+nothing — `'unsafe-eval'`, `style-src 'unsafe-inline'`, and `img-src data:` are
+all absent, which makes the policy stricter than the one it replaced everywhere
+except that single directive.
+
 ### What stays private
 
 Publishing is additive. The dashboard processes are not restarted, not
