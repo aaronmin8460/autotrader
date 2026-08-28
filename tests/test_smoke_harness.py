@@ -2625,3 +2625,48 @@ def test_preflight_does_not_call_a_tracked_market_untracked(
     positions = check_named(report, "broker.positions")
     assert "0.000322094" in positions.detail, positions.detail
     assert "untracked" not in positions.detail, positions.detail
+
+
+def test_a_tracked_market_is_reported_in_the_canonical_spelling() -> None:
+    """The generated cleanup command has to be runnable.
+
+    The execution layer accepts `BTC/USD` and refuses `BTCUSD`, so a plan
+    rendered in the broker's own position spelling prints a line that fails.
+    """
+    client = FakeBrokerClient(
+        positions=[make_position(BROKER_BTC, qty="0.000322094", market_value="24.92")]
+    )
+    live = broker_module.read_positions(client)
+
+    snapshot = broker_module.position_for(live, BTC)
+    assert snapshot.symbol == BTC, snapshot.symbol
+
+
+def test_an_untracked_market_keeps_the_brokers_own_spelling() -> None:
+    """There is nothing to map it to, and inventing a pair form is a guess."""
+    client = FakeBrokerClient(positions=[make_position("DOGEUSD", qty="1", market_value="1")])
+    live = broker_module.read_positions(client)
+
+    assert [p.symbol for p in live.values()] == ["DOGEUSD"]
+
+
+def test_the_cleanup_plan_names_a_symbol_the_submit_path_accepts() -> None:
+    """End to end: broker spelling in, canonical spelling out."""
+    client = FakeBrokerClient(
+        positions=[make_position(BROKER_BTC, qty="0.000322094", market_value="24.92")]
+    )
+    live = broker_module.read_positions(client)
+
+    plan = plan_cleanup(
+        position=broker_module.position_for(live, BTC),
+        asset=crypto_asset(),
+        quoted_price=77432.9,
+    )
+    assert plan.verdict is CleanupVerdict.REQUIRED
+    assert plan.symbol == BTC, plan.symbol
+    assert plan.position_quantity == Decimal("0.000322094")
+    assert plan.plan_quantity == Decimal("0.000322094")
+    assert plan.residual_quantity == Decimal(0)
+    # The command an operator is invited to paste must name the tradable form.
+    assert plan.command is not None
+    assert f"--symbol {BTC}" in plan.command, plan.command

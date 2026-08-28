@@ -26,7 +26,7 @@ from decimal import Decimal
 from enum import Enum
 
 from autotrader.execution import paper
-from autotrader.execution.models import ExecutionError
+from autotrader.execution.models import TRADABLE_SYMBOLS, ExecutionError
 from autotrader.execution.paper import broker_symbol_key
 from autotrader.smoke.models import (
     BrokerReadClient,
@@ -99,6 +99,27 @@ def read_account(client: BrokerReadClient) -> paper.PaperAccountState:
         ) from None
 
 
+#: Canonical spelling for every market this build trades, keyed by market.
+_CANONICAL_BY_MARKET = {broker_symbol_key(symbol): symbol for symbol in TRADABLE_SYMBOLS}
+
+
+def display_symbol(symbol: str) -> str:
+    """Render a broker symbol the way the rest of the system spells it.
+
+    The broker returns `BTCUSD` for a position and `BTC/USD` for the order that
+    created it. Reports should read in one vocabulary, and the cleanup command
+    this harness prints has to use the spelling the execution layer will
+    actually accept: the submit path takes only the canonical pair form and
+    refuses `BTCUSD` outright, so a plan rendered in the broker's spelling
+    hands the operator a line that cannot run.
+
+    A market this build does not track keeps the broker's own spelling. There
+    is nothing to map it to, and inventing a pair form would be a guess printed
+    as fact.
+    """
+    return _CANONICAL_BY_MARKET.get(broker_symbol_key(symbol), normalize_smoke_symbol(symbol))
+
+
 def read_positions(client: BrokerReadClient) -> dict[str, PositionSnapshot]:
     """Every open broker position, keyed by `broker_symbol_key`.
 
@@ -125,7 +146,7 @@ def read_positions(client: BrokerReadClient) -> dict[str, PositionSnapshot]:
         ) from None
     return {
         broker_symbol_key(position.symbol): PositionSnapshot(
-            symbol=normalize_smoke_symbol(position.symbol),
+            symbol=display_symbol(position.symbol),
             quantity=position.quantity,
             market_value=position.market_value,
             average_entry_price=position.average_entry_price,
@@ -247,6 +268,7 @@ __all__ = [
     "credentials_present",
     "open_paper_client",
     "paper_gate_open",
+    "display_symbol",
     "position_for",
     "read_account",
     "read_asset_spec",
