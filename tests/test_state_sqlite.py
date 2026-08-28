@@ -75,14 +75,15 @@ T0 = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
 STEP = timedelta(minutes=15)
 
 #: Tables whose semantics belong to a part of the broker relationship this
-#: repository still does not model. `order_intents` and `broker_orders` were
-#: earned by actually reading the broker's vocabulary; these remain Phase 8's,
-#: and guessing them now would be worse than waiting.
+#: repository still does not model. `order_intents`, `broker_orders`, and
+#: (schema v4) the reconciliation tables were each earned by actually reading
+#: the broker's vocabulary. These were not: reconciliation settles order-level
+#: `filled_quantity`, so a fill- or execution-level history would be a shape
+#: guessed at rather than needed.
 FORBIDDEN_BROKER_TABLES = (
     "fills",
     "executions",
     "broker_accounts",
-    "reconciliation_runs",
     "orders",
 )
 
@@ -135,11 +136,11 @@ def test_initialize_database_creates_the_file(tmp_path: Path) -> None:
     assert path.is_file()
 
 
-def test_a_fresh_database_initializes_directly_at_version_three(
+def test_a_fresh_database_initializes_directly_at_the_current_version(
     connection: sqlite3.Connection,
 ) -> None:
-    assert SCHEMA_VERSION == 3
-    assert get_schema_version(connection) == 3
+    assert SCHEMA_VERSION == 4
+    assert get_schema_version(connection) == 4
 
 
 def test_initialization_is_idempotent(tmp_path: Path) -> None:
@@ -1431,7 +1432,7 @@ def test_hostile_strategy_name_is_stored_verbatim(connection: sqlite3.Connection
 # --------------------------------------------------------------------------
 
 
-def test_no_phase_eight_reconciliation_tables_exist(connection: sqlite3.Connection) -> None:
+def test_no_unearned_broker_tables_exist(connection: sqlite3.Connection) -> None:
     present = table_names(connection)
     for forbidden in FORBIDDEN_BROKER_TABLES:
         assert forbidden not in present, forbidden

@@ -65,10 +65,18 @@ an order. Nothing in this module infers a position from that: the local
 positions table is only ever written from a position actually *observed* at the
 broker.
 
+**Reconciliation lives elsewhere, and reads through here.** Nothing in this
+module resolves an `UNKNOWN` intent or repairs a position;
+`autotrader.reconciliation` does that, and it reaches the broker through the
+read-only helpers below - `fetch_paper_account_state`, `fetch_paper_positions`,
+`find_broker_order_by_client_id` - so that the broker boundary stays one file.
+`verify_paper_environment` is the check it runs first: a process about to
+rewrite local state from what a broker says must prove which broker that is.
+
 Scope: crypto spot, BTC/USD and ETH/USD, fractional quantities, MARKET orders,
 GTC time in force, long only. No DAY and no IOC, no notional orders, no
-limit/stop/bracket/OCO orders, no options, no equities, no shorts, no
-streaming, and no reconciliation - see docs/SPEC.md section 8, "C7".
+limit/stop/bracket/OCO orders, no options, no equities, no shorts, and no
+streaming - see docs/SPEC.md section 8, "C7".
 """
 
 from __future__ import annotations
@@ -81,6 +89,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from enum import Enum
 
+from alpaca.common.enums import BaseURL
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import CryptoFeed
 from alpaca.data.historical.crypto import CryptoHistoricalDataClient
@@ -133,6 +142,11 @@ CONFIRMATION_TOKEN = "PAPER"
 _API_KEY_ENV = "ALPACA_API_KEY"
 _SECRET_KEY_ENV = "ALPACA_SECRET_KEY"
 
+#: The one host this system may reach. Taken from the SDK's own enum rather
+#: than typed out, so it cannot drift from the URL `paper=True` actually
+#: selects; a test asserts the client the factory builds matches it.
+PAPER_TRADING_BASE_URL = BaseURL.TRADING_PAPER.value
+
 #: Market-data feed for the reference price. Alpaca's crypto feed, matching the
 #: historical feed, so sizing and research see the same source.
 REFERENCE_PRICE_FEED = CryptoFeed.US
@@ -165,6 +179,16 @@ _ZERO = Decimal(0)
 
 class PaperTradingDisabledError(ExecutionError):
     """The environment gate is closed, so nothing may be submitted."""
+
+
+class NotPaperEnvironmentError(ExecutionError):
+    """A trading client could not be **proven** to reach Alpaca paper.
+
+    Raised by `verify_paper_environment`, and deliberately not the same as
+    "this client is live": a client whose environment cannot be read at all
+    fails here too. Proving paper is the caller's burden, and an unproven
+    client is refused rather than assumed harmless.
+    """
 
 
 class MissingCredentialsError(ExecutionError):
@@ -327,6 +351,44 @@ def create_paper_trading_client() -> TradingClient:
     return client
 
 
+def verify_paper_environment(client: TradingClient) -> str:
+    """Return the paper base URL, or raise unless `client` provably reaches it.
+
+    `create_paper_trading_client` is the only client factory here and it
+    hardcodes ``paper=True``, so within this repository a live client cannot be
+    constructed. This function checks the resulting object anyway, because a
+    process that is about to **rewrite local state from what a broker says**
+    should confirm which broker it is talking to rather than infer it from the
+    fact that no other factory exists. A caller may pass any client in - a
+    later phase, a test double - and the check must not depend on where the
+    object came from.
+
+    Two facts are required, and both are read defensively: the base URL the
+    client will actually send requests to must be Alpaca's paper host, and the
+    SDK's own sandbox flag must be set. An attribute that is missing, of an
+    unexpected type, or pointing anywhere else **fails closed** - there is no
+    "probably paper".
+
+    Read-only. It sends no request, so it costs nothing and cannot itself fail
+    on the network.
+    """
+    base_url = getattr(client, "_base_url", None)
+    if isinstance(base_url, Enum):
+        base_url = base_url.value
+    if not isinstance(base_url, str) or base_url.strip().rstrip("/") != PAPER_TRADING_BASE_URL:
+        raise NotPaperEnvironmentError(
+            "Refusing to reconcile: this trading client could not be proven to reach "
+            f"the Alpaca paper environment ({PAPER_TRADING_BASE_URL}). Local state is "
+            "only ever repaired from paper broker truth."
+        )
+    if getattr(client, "_sandbox", None) is not True:
+        raise NotPaperEnvironmentError(
+            "Refusing to reconcile: this trading client points at the Alpaca paper host "
+            "but does not report itself as a sandbox client. Nothing was changed."
+        )
+    return PAPER_TRADING_BASE_URL
+
+
 def create_market_data_client() -> CryptoHistoricalDataClient:
     """Build the crypto market-data client used for the current reference price.
 
@@ -485,6 +547,13 @@ class BrokerOrderSnapshot:
 
     `status` is the broker's own vocabulary, kept as opaque text. A snapshot
     means the order was **accepted**; it never means it filled.
+
+    `broker_updated_at` is the broker's *own* last-modified time for the order,
+    which is not the same thing as when this system wrote the snapshot down.
+    It is carried for the audit trail and deliberately not persisted: the
+    `broker_orders.updated_at` column already means "when this snapshot was
+    refreshed", and overloading one column with two different clocks would make
+    both unreadable.
     """
 
     broker_order_id: str
@@ -497,6 +566,7 @@ class BrokerOrderSnapshot:
     status: str
     submitted_at: datetime | None
     filled_at: datetime | None
+    broker_updated_at: datetime | None = None
 
 
 def fetch_paper_account_state(client: TradingClient) -> PaperAccountState:
@@ -946,6 +1016,7 @@ def _to_snapshot(order: Order) -> BrokerOrderSnapshot:
         status=status,
         submitted_at=order.submitted_at,
         filled_at=order.filled_at,
+        broker_updated_at=order.updated_at,
     )
 
 
@@ -1404,6 +1475,7 @@ def execute_paper_order(
 
 __all__ = [
     "CONFIRMATION_TOKEN",
+    "PAPER_TRADING_BASE_URL",
     "EVENT_DUPLICATE",
     "EVENT_REJECTED",
     "EVENT_SUBMITTED",
@@ -1423,6 +1495,7 @@ __all__ = [
     "DuplicatePreflightUnavailableError",
     "ExecutionOutcome",
     "MissingCredentialsError",
+    "NotPaperEnvironmentError",
     "PaperAccountState",
     "PaperExecutionResult",
     "PaperPosition",
@@ -1452,4 +1525,5 @@ __all__ = [
     "submit_order_intent",
     "to_broker_decimal",
     "to_wire_quantity",
+    "verify_paper_environment",
 ]

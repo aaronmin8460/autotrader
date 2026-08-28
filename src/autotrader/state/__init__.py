@@ -1,25 +1,29 @@
 """Local operational state, stored in a single SQLite file.
 
 The persistence layer only: schema creation, schema versioning and a small
-explicit v1 -> v2 -> v3 migration path, WAL journalling, enforced foreign
+explicit v1 -> v2 -> v3 -> v4 migration path, WAL journalling, enforced foreign
 keys, transactional writes, and a set of durable operational records -
 strategy runs, signals, risk events, system events, local position snapshots,
-order intents, broker-order snapshots, and (schema v3) the UTC-day risk
-baselines the crypto daily-loss halt measures against.
+order intents, broker-order snapshots, the (schema v3) UTC-day risk baselines
+the crypto daily-loss halt measures against, and the (schema v4) reconciliation
+runs and events that record what crash recovery concluded.
 
 Quantities are exact `decimal.Decimal` values, stored as canonical decimal
 text: crypto positions are fractional, and a binary float cannot hold one
 exactly.
 
-Nothing here trades. Storing an order intent is not placing an order: this
-package contacts no broker, holds no credentials, and opens no socket. There
-is still no fill, execution, or reconciliation table - Phase 8 owns that
-vocabulary. See docs/SPEC.md section 8.
+Nothing here trades, and nothing here reconciles. Storing an order intent is
+not placing an order, and storing a reconciliation run is not performing one:
+this package contacts no broker, holds no credentials, and opens no socket.
+`autotrader.reconciliation` decides what broker truth is and hands the
+conclusion here to be written down. There is still no fill, execution, or
+broker-account table. See docs/SPEC.md section 8.
 """
 
 from autotrader.state.sqlite import (
     BUSY_TIMEOUT_MS,
     DEFAULT_DATABASE_PATH,
+    INTENT_STATUS_CONFIRMED_NOT_SUBMITTED,
     INTENT_STATUS_CREATED,
     INTENT_STATUS_REJECTED,
     INTENT_STATUS_SUBMITTED,
@@ -28,6 +32,13 @@ from autotrader.state.sqlite import (
     MIN_MIGRATABLE_SCHEMA_VERSION,
     ORDER_INTENT_STATUSES,
     ORDER_SIDES,
+    RECONCILIATION_CATEGORIES,
+    RECONCILIATION_OUTCOMES,
+    RECONCILIATION_STATUS_CLEAN,
+    RECONCILIATION_STATUS_FAILED,
+    RECONCILIATION_STATUS_REPAIRED,
+    RECONCILIATION_STATUS_UNRESOLVED,
+    RECONCILIATION_STATUSES,
     REQUIRED_TABLES,
     RUN_MODES,
     RUN_STATUS_COMPLETED,
@@ -36,16 +47,20 @@ from autotrader.state.sqlite import (
     RUN_STATUSES,
     SCHEMA_VERSION,
     SIGNAL_TYPES,
+    TERMINAL_INTENT_STATUSES,
     TERMINAL_RUN_STATUSES,
     TIMESTAMP_FORMAT,
     V2_TABLES,
     V3_TABLES,
+    V4_TABLES,
     DailyRiskBaseline,
     DatabaseStateError,
     DuplicateBrokerOrderError,
     DuplicateOrderIntentError,
     DuplicateSignalError,
     Position,
+    ReconciliationEvent,
+    ReconciliationRun,
     RiskEvent,
     StateError,
     StateInputError,
@@ -55,6 +70,7 @@ from autotrader.state.sqlite import (
     StrategyRun,
     SystemEvent,
     UnknownOrderIntentError,
+    UnknownReconciliationRunError,
     UnknownStrategyRunError,
     UnsupportedSchemaVersionError,
     connect,
@@ -69,18 +85,24 @@ from autotrader.state.sqlite import (
     get_order_intent,
     get_order_intent_by_client_id,
     get_position,
+    get_reconciliation_run,
     get_schema_version,
     get_strategy_run,
     initialize_database,
+    latest_reconciliation_run,
     list_broker_orders,
     list_daily_risk_baselines,
     list_order_intents,
     list_positions,
+    list_reconciliation_events,
+    list_reconciliation_runs,
     list_risk_events,
     list_signals,
     list_strategy_runs,
     list_system_events,
     record_order_intent,
+    record_reconciliation_event,
+    record_reconciliation_run,
     record_risk_event,
     record_signal,
     record_strategy_run,
@@ -98,6 +120,7 @@ from autotrader.state.sqlite import (
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "DEFAULT_DATABASE_PATH",
+    "INTENT_STATUS_CONFIRMED_NOT_SUBMITTED",
     "INTENT_STATUS_CREATED",
     "INTENT_STATUS_REJECTED",
     "INTENT_STATUS_SUBMITTED",
@@ -106,6 +129,13 @@ __all__ = [
     "MIN_MIGRATABLE_SCHEMA_VERSION",
     "ORDER_INTENT_STATUSES",
     "ORDER_SIDES",
+    "RECONCILIATION_CATEGORIES",
+    "RECONCILIATION_OUTCOMES",
+    "RECONCILIATION_STATUSES",
+    "RECONCILIATION_STATUS_CLEAN",
+    "RECONCILIATION_STATUS_FAILED",
+    "RECONCILIATION_STATUS_REPAIRED",
+    "RECONCILIATION_STATUS_UNRESOLVED",
     "REQUIRED_TABLES",
     "RUN_MODES",
     "RUN_STATUSES",
@@ -114,16 +144,20 @@ __all__ = [
     "RUN_STATUS_RUNNING",
     "SCHEMA_VERSION",
     "SIGNAL_TYPES",
+    "TERMINAL_INTENT_STATUSES",
     "TERMINAL_RUN_STATUSES",
     "TIMESTAMP_FORMAT",
     "V2_TABLES",
     "V3_TABLES",
+    "V4_TABLES",
     "DailyRiskBaseline",
     "DatabaseStateError",
     "DuplicateBrokerOrderError",
     "DuplicateOrderIntentError",
     "DuplicateSignalError",
     "Position",
+    "ReconciliationEvent",
+    "ReconciliationRun",
     "RiskEvent",
     "StateError",
     "StateInputError",
@@ -133,6 +167,7 @@ __all__ = [
     "StrategyRun",
     "SystemEvent",
     "UnknownOrderIntentError",
+    "UnknownReconciliationRunError",
     "UnknownStrategyRunError",
     "UnsupportedSchemaVersionError",
     "connect",
@@ -147,18 +182,24 @@ __all__ = [
     "get_order_intent",
     "get_order_intent_by_client_id",
     "get_position",
+    "get_reconciliation_run",
     "get_schema_version",
     "get_strategy_run",
     "initialize_database",
+    "latest_reconciliation_run",
     "list_broker_orders",
     "list_daily_risk_baselines",
     "list_order_intents",
     "list_positions",
+    "list_reconciliation_events",
+    "list_reconciliation_runs",
     "list_risk_events",
     "list_signals",
     "list_strategy_runs",
     "list_system_events",
     "record_order_intent",
+    "record_reconciliation_event",
+    "record_reconciliation_run",
     "record_risk_event",
     "record_signal",
     "record_strategy_run",
