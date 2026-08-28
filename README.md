@@ -54,7 +54,9 @@ Submitting a paper order requires **two independent gates**, both closed by
 default: the `AUTOTRADER_PAPER_TRADING_ENABLED=true` environment variable and
 `--confirm-paper PAPER` on the command line. Every submission is sized by the
 risk engine, then rounded **down** to the broker's own trade increment, so the
-quantity sent is never more than the risk-approved one. The order intent and
+quantity sent is never more than the risk-approved one. An order worth less than
+Alpaca's $10 USD minimum cost basis is refused locally, before any broker
+request exists, and is never enlarged to clear it. The order intent and
 its `client_order_id` are committed to SQLite *before* the broker is called.
 
 **Reconciliation resolves state; it never invents a trade.** `autotrader
@@ -611,6 +613,7 @@ paper account + positions + asset metadata + current crypto price
         -> evaluate_risk
         -> RiskDecision              (persisted to risk_events)
         -> round DOWN to the broker's trade increment
+        -> refuse below the broker's effective minimum quantity
         -> OrderIntent               (persisted and COMMITTED first)
         -> duplicate preflight       (by client_order_id)
         -> Alpaca PAPER MARKET order, GTC
@@ -640,6 +643,51 @@ the live metadata is the authority. The risk-approved quantity is rounded
 **down** to that increment - never up, because rounding up would send more than
 risk allowed - and if the result lands below the broker's minimum there is no
 valid order and that is reported rather than papered over.
+
+### The $10 USD minimum order notional
+
+That metadata is necessary and **not sufficient**. Alpaca also enforces a
+minimum **cost basis of $10** on a USD-quoted crypto order, and does not report
+it: `min_order_size` still carries an older ~$1-notional floor - 0.000012417 BTC,
+about $1 at an $78,000 BTC. An order can clear every published constraint and
+still come back as
+
+```
+cost basis must be >= minimal amount of order 10. No order was created.
+```
+
+So the floor is written down once, as `USD_MINIMUM_ORDER_NOTIONAL`, and the
+effective minimum for a USD pair combines both sources:
+
+```
+effective_min_qty = max(
+    asset.min_order_size,                                  # live broker metadata
+    ceil_to_increment(USD_MINIMUM_ORDER_NOTIONAL / price)  # the $10 cost basis
+)
+```
+
+- **`Decimal` throughout.** A binary float would make a threshold that decides
+  whether a real order is sent depend on a rounding artefact.
+- **The threshold rounds up** to the next whole `min_trade_increment`; rounding
+  it down would produce a floor itself worth less than $10. The *submitted*
+  quantity still rounds **down**, and never exceeds
+  `RiskDecision.approved_quantity`. These are different operations on different
+  values.
+- **An undersized order is refused locally**, before any broker request exists:
+  zero `submit_order` calls, no intent persisted, and a known outcome rather
+  than an `UNKNOWN` one.
+- **The quantity is never enlarged** to clear the floor. Doing so would send
+  more than risk approved, so the caller is told to request more instead.
+- **No trustworthy price, no submission.** The threshold cannot be computed
+  without one, and that fails closed.
+
+The floor applies to **both sides** - Alpaca states the USD-pair minimum without
+a side distinction and describes the cost-basis check as covering buy and sell
+orders alike. A position worth less than $10 therefore cannot be closed until it
+recovers; that is Alpaca's constraint rather than this system's, and it is why
+an opening order should be sized with room above the floor (about $12-$15)
+rather than at it. The rule is scoped to USD-quoted pairs: Alpaca documents a
+separate `0.000000002` floor for its BTC, ETH, and USDT pairs.
 
 The SDK's request field is typed as a float, so the exact `Decimal` becomes one
 at the very last step - and only after checking that the value the broker will

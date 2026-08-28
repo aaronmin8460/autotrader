@@ -57,6 +57,7 @@ from autotrader.execution import models as execution_models
 from autotrader.execution import paper
 from autotrader.execution.models import (
     CLIENT_ORDER_ID_PREFIX,
+    ExecutionError,
     ExecutionInputError,
     OrderIntent,
     OrderSide,
@@ -66,6 +67,7 @@ from autotrader.execution.paper import (
     ORDER_TIME_IN_FORCE,
     PAPER_TRADING_ENABLED_ENV,
     PAPER_TRADING_ENABLED_VALUE,
+    USD_MINIMUM_ORDER_NOTIONAL,
     AccountNotTradableError,
     AmbiguousSubmissionError,
     AssetNotTradableError,
@@ -74,6 +76,7 @@ from autotrader.execution.paper import (
     CryptoAssetSpec,
     DuplicatePreflightUnavailableError,
     ExecutionOutcome,
+    MinimumNotionalError,
     MissingCredentialsError,
     PaperTradingDisabledError,
     QuantityBelowMinimumError,
@@ -81,12 +84,15 @@ from autotrader.execution.paper import (
     UnsupportedBrokerStateError,
     build_market_order_request,
     build_risk_context,
+    effective_minimum_quantity,
     execute_paper_order,
     fetch_crypto_asset,
     fetch_paper_account_state,
     fetch_paper_positions,
     fetch_reference_price,
     find_broker_order_by_client_id,
+    is_usd_quoted,
+    minimum_quantity_from_notional,
     normalize_broker_quantity,
     paper_trading_enabled,
     to_wire_quantity,
@@ -586,6 +592,339 @@ def test_the_broker_quantity_never_exceeds_the_risk_decision(
         assert result.intent.approved_quantity == sent
 
 
+# --------------------------------------------------------------------------
+# Alpaca's USD crypto minimum order notional
+#
+# The defect these four cover, exactly as it happened: a real BTC/USD BUY of
+# 0.000014901 BTC at roughly $78,000 - about $1.16 - cleared every published
+# broker constraint, because Alpaca's `min_order_size` of 0.000012417 BTC still
+# encodes an older ~$1 floor. The dry run approved it. The paper endpoint then
+# refused it outright:
+#
+#     cost basis must be >= minimal amount of order 10. No order was created.
+#
+# The broker's real floor is $10 of cost basis, which its asset metadata does
+# not report. It has to be enforced locally, before the request exists.
+# --------------------------------------------------------------------------
+
+#: The exact BTC/USD quantity the integrated paper smoke attempted, and the
+#: approximate price it attempted it at. Written down here so the regression is
+#: anchored to the real event rather than to a convenient round number.
+DEFECT_QUANTITY = Decimal("0.000014901")
+DEFECT_PRICE = 78_000.0
+
+#: Alpaca's live BTC/USD constraints at the time of the defect. `min_order_size`
+#: is worth about $1.16 at `DEFECT_PRICE` - which is the whole problem.
+DEFECT_MIN_ORDER_SIZE = 0.000012417
+DEFECT_MIN_TRADE_INCREMENT = 0.000000001
+
+
+def defect_asset_spec() -> CryptoAssetSpec:
+    """BTC/USD exactly as the broker reported it when the order was refused."""
+    return CryptoAssetSpec(
+        symbol=SYMBOL,
+        asset_class="crypto",
+        status="active",
+        tradable=True,
+        fractionable=True,
+        min_order_size=Decimal(str(DEFECT_MIN_ORDER_SIZE)),
+        min_trade_increment=Decimal(str(DEFECT_MIN_TRADE_INCREMENT)),
+    )
+
+
+def test_usd_crypto_order_below_ten_dollars_is_refused_before_submission(
+    connection: sqlite3.Connection, enabled_gate: None
+) -> None:
+    """CRITICAL REGRESSION #1. The exact order the broker refused, refused locally.
+
+    BTC/USD BUY of 0.000014901 at ~$78,000 - about $1.16 of cost basis. The
+    risk engine approves it: it is far below every cap, and risk knows nothing
+    about broker minimums. The asset metadata permits it too, because
+    `min_order_size` is smaller still. The order must nonetheless never leave
+    this process.
+
+    What is asserted is the whole contract: a deterministic local refusal, a
+    `submit_order` call count of exactly zero, no order intent persisted, and
+    an error that is emphatically **not** `AmbiguousSubmissionError` - the
+    outcome is known, not unknown.
+    """
+    client = FakeTradingClient(
+        asset=make_asset(
+            min_order_size=DEFECT_MIN_ORDER_SIZE,
+            min_trade_increment=DEFECT_MIN_TRADE_INCREMENT,
+        )
+    )
+    data_client = FakeDataClient(price=DEFECT_PRICE)
+
+    with pytest.raises(MinimumNotionalError) as error:
+        run_execution(
+            connection,
+            client,
+            data_client,
+            requested_quantity=DEFECT_QUANTITY,
+        )
+
+    # A definite local rejection, never an ambiguous one.
+    assert not isinstance(error.value, AmbiguousSubmissionError)
+    assert isinstance(error.value, ExecutionError)
+
+    # The number that matters: the broker was never asked.
+    assert client.submit_calls == []
+    assert client.preflight_calls == []
+
+    # Nothing durable was created either, so there is nothing to reconcile.
+    assert list_order_intents(connection) == []
+    assert list_broker_orders(connection) == []
+
+    message = str(error.value)
+    assert "10" in message
+    assert "No order was submitted" in message
+    # The risk engine would have allowed it; the broker constraint is what did not.
+    assert "Request a larger quantity" in message
+
+
+def test_usd_crypto_minimum_quantity_uses_decimal_and_rounds_threshold_up() -> None:
+    """CRITICAL REGRESSION #2. The threshold rounds UP, in Decimal, with no float.
+
+    $10 at $78,000 is 0.000128205128... BTC, which does not land on the
+    broker's 1e-9 increment. Rounding that threshold *down* to 0.000128205
+    would produce a floor worth $9.99999... - a minimum that is itself below
+    the minimum. It must round up, to 0.000128206.
+
+    The arithmetic is exact: one increment below the threshold is worth less
+    than $10 and the threshold itself is worth at least $10, and both
+    comparisons are made in `Decimal`. Redoing either in binary floating point
+    is what would make a $10 floor depend on a rounding artefact.
+    """
+    asset = defect_asset_spec()
+    increment = asset.min_trade_increment
+
+    threshold = minimum_quantity_from_notional(asset, reference_price=DEFECT_PRICE)
+
+    assert isinstance(threshold, Decimal)
+    assert threshold == Decimal("0.000128206")
+
+    # It rounded UP: the exact quotient is strictly smaller than the threshold.
+    price = Decimal(str(DEFECT_PRICE))
+    assert threshold > USD_MINIMUM_ORDER_NOTIONAL / price
+    assert threshold - increment < USD_MINIMUM_ORDER_NOTIONAL / price
+
+    # And it rounded up to a *valid* increment, not to an arbitrary value.
+    assert threshold % increment == 0
+
+    # The threshold clears $10 and one increment below it does not. Exact.
+    assert threshold * price >= USD_MINIMUM_ORDER_NOTIONAL
+    assert (threshold - increment) * price < USD_MINIMUM_ORDER_NOTIONAL
+
+    # Decimal is the authority everywhere: the constant, the threshold, and the
+    # effective minimum are all exact, and none of them is a float.
+    assert isinstance(USD_MINIMUM_ORDER_NOTIONAL, Decimal)
+    effective = effective_minimum_quantity(asset, reference_price=DEFECT_PRICE)
+    assert isinstance(effective, Decimal)
+    # The notional floor binds here, not the asset's own - which is the defect.
+    assert effective == threshold
+    assert effective > asset.min_order_size
+
+
+def test_broker_normalization_never_increases_risk_approved_quantity(
+    connection: sqlite3.Connection, enabled_gate: None
+) -> None:
+    """CRITICAL REGRESSION #3. An undersized order is refused, never enlarged.
+
+    The tempting fix for a below-minimum order is to round it up to the
+    minimum. That would send more than the risk engine approved, which is the
+    one direction this boundary may never move in - so the refusal stands and
+    the quantity is left alone.
+
+    Asserted twice over: directly, that `normalize_broker_quantity` raises
+    rather than returning anything larger than its input; and through the whole
+    pipeline, that no request was ever built and nothing was persisted.
+    """
+    asset = defect_asset_spec()
+    approved = DEFECT_QUANTITY
+
+    with pytest.raises(MinimumNotionalError):
+        normalize_broker_quantity(approved, asset, reference_price=DEFECT_PRICE)
+
+    # Nothing enlarged it on the way past: the effective minimum is strictly
+    # larger than what risk approved, and that gap is a refusal, not a nudge.
+    effective = effective_minimum_quantity(asset, reference_price=DEFECT_PRICE)
+    assert effective > approved
+
+    client = FakeTradingClient(
+        asset=make_asset(
+            min_order_size=DEFECT_MIN_ORDER_SIZE,
+            min_trade_increment=DEFECT_MIN_TRADE_INCREMENT,
+        )
+    )
+    with pytest.raises(MinimumNotionalError):
+        run_execution(
+            connection,
+            client,
+            FakeDataClient(price=DEFECT_PRICE),
+            requested_quantity=approved,
+        )
+
+    assert client.submit_calls == []
+    assert list_order_intents(connection) == []
+
+
+def test_a_usd_crypto_order_above_the_minimum_still_submits(
+    connection: sqlite3.Connection, enabled_gate: None
+) -> None:
+    """CRITICAL REGRESSION #4. The fix refuses undersized orders and nothing else.
+
+    A BTC/USD BUY comfortably above the $10 floor - about $12 at the defect
+    price, the same cushion the smoke uses - travels the existing path
+    unchanged: risk approves it, it normalizes to the broker's increment, an
+    intent is persisted, and exactly one order is submitted.
+
+    The invariant that survives all of it: what reached the broker is not more
+    than what risk approved.
+    """
+    quantity = Decimal("0.000154")  # ~$12.01 at DEFECT_PRICE
+    client = FakeTradingClient(
+        asset=make_asset(
+            min_order_size=DEFECT_MIN_ORDER_SIZE,
+            min_trade_increment=DEFECT_MIN_TRADE_INCREMENT,
+        )
+    )
+
+    result = run_execution(
+        connection,
+        client,
+        FakeDataClient(price=DEFECT_PRICE),
+        requested_quantity=quantity,
+    )
+
+    assert result.outcome is ExecutionOutcome.SUBMITTED
+    [request] = client.submit_calls
+
+    sent = Decimal(repr(request.qty))
+    assert sent <= result.risk_decision.approved_quantity
+    assert sent <= quantity
+    assert result.intent is not None
+    assert result.intent.approved_quantity == sent
+
+    # It cleared the broker's floor by construction, and the result says so.
+    price = Decimal(str(DEFECT_PRICE))
+    assert sent * price >= USD_MINIMUM_ORDER_NOTIONAL
+    assert result.effective_minimum_quantity is not None
+    assert sent >= result.effective_minimum_quantity
+
+
+def test_the_ten_dollar_minimum_applies_to_sells_as_well_as_buys(
+    connection: sqlite3.Connection, enabled_gate: None
+) -> None:
+    """Alpaca enforces the cost-basis floor on both sides, so this does too.
+
+    Their crypto documentation states the USD-pair minimum without a side
+    distinction, and Alpaca staff describe the cost-basis check as applying to
+    buy orders, sell orders, and limit orders alike. A SELL below $10 would be
+    refused by the endpoint exactly as a BUY is, so refusing it locally sends
+    no request rather than making one that cannot succeed.
+
+    This is the broker's constraint and not this system's, and the consequence
+    is real: a position worth less than $10 cannot be closed until it recovers.
+    That is why an opening order is sized with room above the floor rather than
+    at it - see the smoke sizing in README.md.
+    """
+    dust = Decimal("0.00002")  # ~$1.56 at DEFECT_PRICE, above min_order_size
+    asset = defect_asset_spec()
+    assert dust > asset.min_order_size, "the asset floor must not be what refuses this"
+
+    client = FakeTradingClient(
+        positions=[make_position(qty="0.00002", market_value="1.56")],
+        asset=make_asset(
+            min_order_size=DEFECT_MIN_ORDER_SIZE,
+            min_trade_increment=DEFECT_MIN_TRADE_INCREMENT,
+        ),
+    )
+
+    with pytest.raises(MinimumNotionalError):
+        run_execution(
+            connection,
+            client,
+            FakeDataClient(price=DEFECT_PRICE),
+            side="SELL",
+            requested_quantity=dust,
+        )
+
+    assert client.submit_calls == []
+    assert list_order_intents(connection) == []
+
+
+def test_the_usd_minimum_is_scoped_to_usd_quoted_pairs() -> None:
+    """The rule is Alpaca's USD-pair rule, not a generic broker minimum.
+
+    Alpaca documents a separate `0.000000002` floor for its BTC, ETH, and USDT
+    pairs, which the asset metadata already carries. Applying a $10 floor to
+    one of those would refuse orders the broker would have taken, so the
+    notional rule is conditioned on the quote currency.
+    """
+    assert is_usd_quoted("BTC/USD")
+    assert is_usd_quoted("eth/usd")
+    assert not is_usd_quoted("BTC/USDT")
+    assert not is_usd_quoted("ETH/BTC")
+    assert not is_usd_quoted("BTCUSD"), "a pair with no quote currency is not USD-quoted"
+
+    non_usd = CryptoAssetSpec(
+        symbol="ETH/BTC",
+        asset_class="crypto",
+        status="active",
+        tradable=True,
+        fractionable=True,
+        min_order_size=Decimal("0.000000002"),
+        min_trade_increment=Decimal("0.000000001"),
+    )
+    # Only the asset's own floor applies; the $10 rule is not generalized.
+    assert effective_minimum_quantity(non_usd, reference_price=0.05) == non_usd.min_order_size
+
+
+@pytest.mark.parametrize(
+    "price",
+    [
+        pytest.param(0.0, id="zero"),
+        pytest.param(-1.0, id="negative"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinite"),
+    ],
+)
+def test_the_minimum_cannot_be_computed_from_an_unusable_price(price: float) -> None:
+    """No trustworthy price means no threshold, which means no submission.
+
+    A NaN in particular would compare False against every check and read as a
+    passing one, so it is rejected explicitly rather than allowed to reach a
+    comparison.
+    """
+    with pytest.raises(ReferencePriceUnavailableError):
+        minimum_quantity_from_notional(defect_asset_spec(), reference_price=price)
+
+
+def test_the_dollar_minimum_lives_in_exactly_one_place() -> None:
+    """The $10 floor is a broker contract, so it is written down once.
+
+    Freezing it in a single named constant is what makes it correctable when
+    Alpaca changes it: there is one line to edit, and nothing downstream has
+    its own copy of the number.
+    """
+    assert Decimal("10") == USD_MINIMUM_ORDER_NOTIONAL
+
+    package_root = Path(paper.__file__).resolve().parents[1]
+    literals = []
+    for path in sorted(package_root.rglob("*.py")):
+        code = code_without_prose(path.read_text())
+        for node in ast.walk(ast.parse(code)):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "Decimal":
+                argument = node.args[0] if node.args else None
+                if isinstance(argument, ast.Constant) and str(argument.value) == "10":
+                    literals.append(str(path))
+    assert literals == [str(Path(paper.__file__).resolve())], (
+        f'Decimal("10") should appear only where USD_MINIMUM_ORDER_NOTIONAL is '
+        f"defined, found: {literals}"
+    )
+
+
 # ==========================================================================
 # PAPER ONLY
 # ==========================================================================
@@ -968,7 +1307,9 @@ def test_normalization_always_rounds_down(quantity: str, increment: str, expecte
         min_order_size=Decimal("0.00000001"),
         min_trade_increment=Decimal(increment),
     )
-    normalized = normalize_broker_quantity(Decimal(quantity), spec)
+    # A deliberately huge price, so every quantity here clears the broker's $10
+    # minimum and this test stays about rounding direction and nothing else.
+    normalized = normalize_broker_quantity(Decimal(quantity), spec, reference_price=1_000_000.0)
 
     assert normalized == Decimal(expected)
     assert normalized <= Decimal(quantity), "normalization must never increase a quantity"

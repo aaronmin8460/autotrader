@@ -248,6 +248,15 @@ constant would produce orders the broker silently refuses - or worse, accepts
 at the wrong size. Normalization to a broker increment rounds **down**, never
 up: rounding up would exceed what risk approved.
 
+Asset metadata is necessary and **not sufficient**. Alpaca additionally enforces
+a minimum cost basis of **$10** on a USD-quoted crypto order, and does not
+report it: `min_order_size` still carries an older ~$1-notional-equivalent floor
+(0.000012417 BTC, about $1 at an $78,000 BTC). An order can therefore clear every
+published constraint and still be refused with *"cost basis must be >= minimal
+amount of order 10. No order was created."* That floor is written down once, as
+`USD_MINIMUM_ORDER_NOTIONAL`, and enforced locally before any broker request
+exists. See section 8, "C7".
+
 ---
 
 ## 8. Explicit exclusions
@@ -906,6 +915,7 @@ paper account + positions + asset metadata + current crypto reference price
         -> evaluate_risk
         -> RiskDecision              persisted to risk_events
         -> normalize DOWN to the broker's trade increment
+        -> refuse below the broker's effective minimum quantity
         -> OrderIntent               persisted AND COMMITTED
         -> broker duplicate preflight
         -> Alpaca PAPER MARKET order, GTC
@@ -923,6 +933,41 @@ rounding up to clear the minimum would put sizing outside the risk engine's
 control. The SDK's request field is typed as a float, so the exact `Decimal`
 becomes one at the last step and only after checking that the value the broker
 will actually receive is not larger than the approved quantity.
+
+**The USD minimum order notional is enforced locally** (section 7I). For a
+USD-quoted pair the effective minimum quantity is
+
+```
+effective_min_qty = max(
+    asset.min_order_size,                                  # live broker metadata
+    ceil_to_increment(USD_MINIMUM_ORDER_NOTIONAL / price)  # the $10 cost basis
+)
+```
+
+computed entirely in `Decimal`; a binary float would make a threshold that
+decides whether a real order is sent depend on a rounding artefact. The
+*threshold* rounds **up** to the next whole `min_trade_increment` - rounding it
+down would produce a floor itself worth less than $10 - while the *submitted*
+quantity still rounds **down** and may never exceed `RiskDecision.approved_quantity`.
+Threshold arithmetic and submission normalization are different operations on
+different values.
+
+An order below the effective minimum is a **definite local refusal**
+(`MinimumNotionalError`, a `QuantityBelowMinimumError`): `submit_order` is
+called zero times, no intent is persisted, and the outcome is known rather than
+`UNKNOWN`. The quantity is **never** raised to clear the floor; the caller must
+request more. Without a trustworthy price no threshold can be computed and
+nothing is submitted.
+
+The floor applies to **both sides**. Alpaca states the USD-pair minimum without
+a side distinction and describes the cost-basis check as covering buy and sell
+orders alike, so a SELL below $10 is refused by the endpoint exactly as a BUY
+is. Enforcing it locally on both sides sends no request rather than making one
+that cannot succeed. The consequence is Alpaca's rather than this system's: a
+position worth less than $10 cannot be closed until it recovers, which is why an
+opening order is sized with room above the floor rather than at it. The rule is
+scoped to USD-quoted pairs; Alpaca documents a separate `0.000000002` floor for
+its BTC, ETH, and USDT pairs, which the asset metadata already carries.
 
 **Risk context mapping.** Built from current paper broker state:
 

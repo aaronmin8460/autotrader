@@ -388,6 +388,18 @@ def _echo_paper_preview(result: PaperExecutionResult, *, dry_run: bool) -> None:
     if result.asset is not None:
         typer.echo(_field("Asset Min Order", format_quantity(result.asset.min_order_size)))
         typer.echo(_field("Asset Increment", format_quantity(result.asset.min_trade_increment)))
+    if result.effective_minimum_quantity is not None:
+        # The broker's $10 USD minimum is not in the asset metadata above, so
+        # the threshold an order is actually measured against is printed
+        # explicitly - it is the number an operator needs to size the request.
+        typer.echo(
+            _field(
+                "Broker Min Qty",
+                f"{format_quantity(result.effective_minimum_quantity)} "
+                f"(>= ${format_quantity(paper_execution.USD_MINIMUM_ORDER_NOTIONAL)})",
+            )
+        )
+    if result.asset is not None:
         typer.echo("")
     typer.echo(_field("Risk Decision", "APPROVED" if decision.approved else "REJECTED"))
     typer.echo(_field("Risk Reason", decision.reason_code))

@@ -38,6 +38,18 @@ risk-approved quantity normalized to the asset's *current*
 lands below `min_order_size`. No BTC or ETH increment is hardcoded anywhere:
 provider rules change, so the broker's live asset metadata is the authority.
 
+**Asset metadata is necessary and not sufficient.** Alpaca enforces a **$10
+minimum cost basis** on a USD-quoted crypto order that its asset metadata does
+not report - `min_order_size` still carries an older ~$1-notional floor - so an
+order can clear every published constraint and still be refused with "cost
+basis must be >= minimal amount of order 10. No order was created." That floor
+is written down once, as `USD_MINIMUM_ORDER_NOTIONAL`, and combined with the
+metadata in `effective_minimum_quantity`. An order below it is refused **here**,
+before any broker request exists, so the outcome is a definite local rejection
+rather than a round trip that ends in one. The quantity is never raised to
+clear the floor: that would send more than risk approved, so the caller is told
+to ask for more instead.
+
 **There is no market clock here.** Crypto trades continuously, so there is no
 session to open or close and nothing to gate a submission on. `get_clock()` is
 an equity-market concept and is not called.
@@ -86,7 +98,7 @@ import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import ROUND_FLOOR, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation, localcontext
 from enum import Enum
 
 from alpaca.common.enums import BaseURL
@@ -176,6 +188,35 @@ EVENT_DUPLICATE = "PAPER_ORDER_DUPLICATE"
 
 _ZERO = Decimal(0)
 
+#: The quote currency whose minimum-notional rule this module encodes.
+USD_QUOTE_CURRENCY = "USD"
+
+#: Alpaca's **current** minimum cost basis for a USD-quoted crypto order, in
+#: USD. Their crypto documentation states the rule as a quantity formula -
+#: "For ``USD`` pairs, the minimum order size calculation is: 10/USD asset
+#: price" - and the trading endpoint enforces the same floor as a cost basis,
+#: refusing anything smaller with "cost basis must be >= minimal amount of
+#: order 10. No order was created."
+#:
+#: It is written down here, as one number in one place, because the broker does
+#: **not** report it in asset metadata. `Asset.min_order_size` still carries the
+#: older $1-notional-equivalent floor - 0.000012417 BTC, about $1 at an $78,000
+#: BTC - so an order sized only against that metadata clears the asset minimum
+#: and is still rejected by the endpoint. Reading the metadata is necessary and
+#: not sufficient; this constant closes the gap.
+#:
+#: Scoped deliberately to Alpaca USD crypto pairs. It is not a generic broker
+#: minimum, it is not applied to non-USD pairs (Alpaca documents a separate
+#: `0.000000002` floor for BTC, ETH, and USDT pairs, which the asset metadata
+#: already carries), and it is not applied to equities - this system has none.
+USD_MINIMUM_ORDER_NOTIONAL = Decimal("10")
+
+#: Working precision for the threshold arithmetic below. The default context's
+#: 28 significant digits are ample for a $10 floor at any real price; this is
+#: set higher anyway so the ceiling is computed from a division that has not
+#: itself been rounded, and the exact check that follows it never has to work.
+_THRESHOLD_PRECISION = 60
+
 
 class PaperTradingDisabledError(ExecutionError):
     """The environment gate is closed, so nothing may be submitted."""
@@ -226,6 +267,26 @@ class QuantityBelowMinimumError(ExecutionError):
     Not an error to work around by rounding up: the broker's minimum is a
     floor, and exceeding a risk-approved quantity to clear it would put sizing
     outside the risk engine's control.
+    """
+
+
+class MinimumNotionalError(QuantityBelowMinimumError):
+    """The order's estimated cost basis is below the broker's USD minimum.
+
+    A **definitive local refusal**, raised before any broker request exists, so
+    an undersized order is never sent and never has an ambiguous outcome. It is
+    not a broker failure and not an `UNKNOWN`: nothing was submitted, and the
+    caller knows that with certainty.
+
+    A subclass of `QuantityBelowMinimumError` because it is the same kind of
+    answer - "this quantity is too small to be an order" - reached through a
+    different floor, and because every existing caller that already handles a
+    too-small quantity should handle this one identically.
+
+    The fix is never to round the quantity up. Exceeding the risk-approved
+    quantity to satisfy a broker minimum would put sizing outside the risk
+    engine's control, which is the one thing this boundary may not do. The
+    caller must request more.
     """
 
 
@@ -734,13 +795,155 @@ def fetch_crypto_asset(client: TradingClient, symbol: str) -> CryptoAssetSpec:
     )
 
 
-def normalize_broker_quantity(quantity: Decimal, asset: CryptoAssetSpec) -> Decimal:
-    """Round `quantity` **down** to the asset's trade increment.
+# --------------------------------------------------------------------------
+# The broker's order minimums
+#
+# Two floors apply, and an order has to clear both:
+#
+#   1. `Asset.min_order_size`, read live from the broker on every attempt; and
+#   2. Alpaca's USD minimum cost basis, `USD_MINIMUM_ORDER_NOTIONAL`, which the
+#      broker enforces but does not report.
+#
+# `effective_minimum_quantity` is the one place the two are combined, and the
+# only expression of the rule anywhere in this repository.
+#
+# Every number here is a `Decimal`. A binary float would make a threshold that
+# decides whether a real order is sent depend on a rounding artefact.
+# --------------------------------------------------------------------------
+
+
+def is_usd_quoted(symbol: str) -> bool:
+    """Whether `symbol` is a USD-quoted pair, so the USD notional rule applies.
+
+    The quote currency, not the base: ``BTC/USD`` is USD-quoted, ``BTC/USDT``
+    is not. Alpaca states a different minimum for its BTC, ETH, and USDT pairs,
+    and applying a $10 floor to one of those would refuse orders the broker
+    would have taken.
+    """
+    _, separator, quote = str(symbol).strip().upper().partition("/")
+    return bool(separator) and quote == USD_QUOTE_CURRENCY
+
+
+def reference_price_decimal(reference_price: float) -> Decimal:
+    """The reference price as an exact `Decimal`, or raise.
+
+    Validated here rather than trusted, because this value divides into a
+    threshold that decides whether an order is sent: a zero, a negative, a NaN,
+    or an infinity would each produce a confidently wrong floor - and a NaN in
+    particular would compare False against every check and read as a pass.
+
+    Converted through the float's shortest round-tripping decimal form, so
+    ``77722.3`` is 77722.3 rather than the binary value a hair away from it.
+    """
+    try:
+        price = require_reference_price(reference_price, "reference_price")
+    except ExecutionInputError as error:
+        raise ReferencePriceUnavailableError(
+            f"Cannot check the broker's minimum order value without a usable current "
+            f"price ({error}). Nothing was submitted."
+        ) from None
+    return Decimal(str(price))
+
+
+def minimum_quantity_from_notional(
+    asset: CryptoAssetSpec,
+    *,
+    reference_price: float,
+    notional: Decimal = USD_MINIMUM_ORDER_NOTIONAL,
+) -> Decimal:
+    """The smallest quantity of `asset` worth at least `notional` USD.
+
+    ``notional / reference_price``, rounded **UP** to the next whole trade
+    increment. Up, because this is a *threshold*: rounding it down would
+    produce a floor that itself buys less than $10, which is the bug this
+    function exists to prevent.
+
+    Rounding a threshold up and rounding a submitted quantity down are
+    different operations on different values, and this module does both. This
+    one computes a number an order is *compared against*; it never becomes an
+    order quantity, so nothing here can enlarge what risk approved.
+    """
+    price = reference_price_decimal(reference_price)
+    increment = _require_positive_decimal(asset.min_trade_increment, "min_trade_increment")
+    with localcontext() as context:
+        context.prec = _THRESHOLD_PRECISION
+        steps = (notional / (price * increment)).to_integral_value(rounding=ROUND_CEILING)
+        minimum = steps * increment
+        # The ceiling above is exact at this precision. The check is kept
+        # anyway, because "the threshold is at least the floor it was derived
+        # from" is the property that matters, and asserting it costs nothing.
+        while minimum * price < notional:  # pragma: no cover - exact at _THRESHOLD_PRECISION
+            steps += 1
+            minimum = steps * increment
+    return +minimum
+
+
+def effective_minimum_quantity(asset: CryptoAssetSpec, *, reference_price: float) -> Decimal:
+    """The smallest quantity of `asset` the broker will actually accept.
+
+    The **larger** of the two floors - the asset's own `min_order_size` and the
+    quantity worth `USD_MINIMUM_ORDER_NOTIONAL` - because an order has to clear
+    both and clearing only one is what produced the defect this encodes.
+
+    For a pair that is not USD-quoted the notional rule does not apply and the
+    asset's metadata stands alone; see `is_usd_quoted`.
+    """
+    floor = _require_positive_decimal(asset.min_order_size, "min_order_size")
+    if not is_usd_quoted(asset.symbol):
+        return floor
+    return max(floor, minimum_quantity_from_notional(asset, reference_price=reference_price))
+
+
+def require_minimum_notional(
+    quantity: Decimal, asset: CryptoAssetSpec, *, reference_price: float
+) -> Decimal:
+    """Raise unless `quantity` is worth at least the broker's USD minimum.
+
+    Returns the effective minimum when the quantity clears it, so a caller that
+    wants to report the threshold does not recompute it.
+
+    This applies to **both sides**. Alpaca documents the USD minimum without a
+    side distinction, and their staff describe the cost-basis check as covering
+    buy orders, sell orders, and limit orders alike, so a SELL below $10 is
+    refused by the endpoint exactly as a BUY is. Enforcing it locally on both
+    sides does not strand anything the broker would have accepted - it turns a
+    broker rejection into a local one, with zero broker calls and a message
+    that says what to do. It does mean a position whose value falls below $10
+    cannot be closed until it recovers or is topped up, which is Alpaca's
+    constraint rather than this system's, and is why an opening order should be
+    sized with room above the floor rather than at it.
+    """
+    minimum = effective_minimum_quantity(asset, reference_price=reference_price)
+    if quantity >= minimum:
+        return minimum
+    price = reference_price_decimal(reference_price)
+    raise MinimumNotionalError(
+        f"{format_quantity(quantity)} {asset.symbol} is worth about "
+        f"${format_quantity((quantity * price).quantize(Decimal('0.01'), rounding=ROUND_FLOOR))} "
+        f"at {price}, below the broker's minimum order value of "
+        f"${format_quantity(USD_MINIMUM_ORDER_NOTIONAL)}. The smallest quantity it "
+        f"would accept right now is {format_quantity(minimum)} {asset.symbol}. No "
+        "order was submitted and no broker request was made: the quantity is not "
+        "raised to clear the minimum, because that would send more than risk "
+        "approved. Request a larger quantity."
+    )
+
+
+def normalize_broker_quantity(
+    quantity: Decimal, asset: CryptoAssetSpec, *, reference_price: float
+) -> Decimal:
+    """Round `quantity` **down** to the asset's trade increment, or refuse it.
 
     Down, always. Rounding up would send more than the risk engine approved,
     which is the one direction this boundary may never move in. If the result
-    lands below the broker's minimum order size there is no valid order to
+    lands below either floor the broker enforces - its `min_order_size`, or the
+    quantity worth `USD_MINIMUM_ORDER_NOTIONAL` - there is no valid order to
     place, and that is reported rather than papered over by rounding back up.
+
+    `reference_price` is required rather than optional so that the value that
+    goes to the broker cannot be produced without the price its minimum is
+    measured in. There is no way to normalize a quantity here and skip the
+    check.
     """
     amount = require_quantity(quantity, "quantity")
     steps = (amount / asset.min_trade_increment).to_integral_value(rounding=ROUND_FLOOR)
@@ -759,6 +962,7 @@ def normalize_broker_quantity(quantity: Decimal, asset: CryptoAssetSpec) -> Deci
             f"order size of {format_quantity(asset.min_order_size)}. No order was "
             "submitted: rounding up would exceed what risk approved."
         )
+    require_minimum_notional(normalized, asset, reference_price=reference_price)
     return normalized
 
 
@@ -1096,6 +1300,7 @@ class PaperExecutionResult:
     daily_baseline_equity: Decimal
     message: str
     asset: CryptoAssetSpec | None = None
+    effective_minimum_quantity: Decimal | None = None
     intent: OrderIntent | None = None
     order_intent_id: int | None = None
     broker_order: BrokerOrderSnapshot | None = None
@@ -1403,6 +1608,12 @@ def execute_paper_order(
         "account": account,
         "daily_baseline_equity": baseline_equity,
         "asset": asset,
+        # Reported on every outcome, including a risk rejection: an operator
+        # sizing the next attempt needs the threshold whether or not this
+        # attempt got as far as being measured against it.
+        "effective_minimum_quantity": effective_minimum_quantity(
+            asset, reference_price=reference_price
+        ),
     }
 
     if not decision.approved:
@@ -1412,7 +1623,9 @@ def execute_paper_order(
             **common,
         )
 
-    broker_quantity = normalize_broker_quantity(decision.approved_quantity, asset)
+    broker_quantity = normalize_broker_quantity(
+        decision.approved_quantity, asset, reference_price=reference_price
+    )
 
     intent = OrderIntent(
         symbol=ticker,
@@ -1483,6 +1696,8 @@ __all__ = [
     "PAPER_TRADING_ENABLED_ENV",
     "PAPER_TRADING_ENABLED_VALUE",
     "REFERENCE_PRICE_FEED",
+    "USD_MINIMUM_ORDER_NOTIONAL",
+    "USD_QUOTE_CURRENCY",
     "TRADABLE_ACCOUNT_STATUSES",
     "AccountNotTradableError",
     "AmbiguousSubmissionError",
@@ -1493,6 +1708,7 @@ __all__ = [
     "CryptoAssetSpec",
     "DuplicatePreflightUnavailableError",
     "ExecutionOutcome",
+    "MinimumNotionalError",
     "MissingCredentialsError",
     "NotPaperEnvironmentError",
     "PaperAccountState",
@@ -1509,15 +1725,20 @@ __all__ = [
     "create_market_data_client",
     "create_paper_trading_client",
     "credentials_configured",
+    "effective_minimum_quantity",
     "execute_paper_order",
     "fetch_crypto_asset",
     "fetch_paper_account_state",
     "fetch_paper_positions",
     "fetch_reference_price",
     "find_broker_order_by_client_id",
+    "is_usd_quoted",
+    "minimum_quantity_from_notional",
     "normalize_broker_quantity",
     "paper_trading_enabled",
+    "reference_price_decimal",
     "require_confirmation",
+    "require_minimum_notional",
     "require_paper_trading_enabled",
     "require_tradable_account",
     "resolve_daily_baseline_equity",
