@@ -1,4 +1,4 @@
-"""The local SQLite operational-state store (schema v3).
+"""The local SQLite operational-state store (schema v4).
 
 This module is **persistence infrastructure and nothing else**. It opens a
 local SQLite database, creates a small fixed schema, and stores a handful of
@@ -26,12 +26,21 @@ a fractional USD mark, and moving them to text would silently discard the
 `CHECK (... > 0)` constraints that make an impossible price unstorable even by
 a writer that bypassed this module. A price here is a mark, never a quantity.
 
-**What is still deliberately absent.** There is no `fills`, `executions`,
-`broker_accounts`, or `reconciliation_runs` table. Phase 8 owns those, and the
-same reasoning applies: better added later, correctly, than guessed at now.
-`risk_events` remains deliberately generic - the risk engine owns the meaning
-of a risk decision, and this module stores opaque text rather than importing or
-mirroring its model.
+**What v4 changed, and why.** Phase 8 reconciles local state against broker
+truth, and two facts had nowhere to live. First, an intent whose absence at the
+broker has been *confirmed* is neither `CREATED` nor `REJECTED`: it is a stale
+decision that will never be sent, so `CONFIRMED_NOT_SUBMITTED` was added to the
+intent vocabulary - which is a CHECK constraint, hence a table rebuild. Second,
+a reconciliation run has to leave evidence, so `reconciliation_runs` and
+`reconciliation_events` record when a run happened, what it concluded, whether
+trading was allowed afterwards, and which order or position it touched.
+
+**What is still deliberately absent.** There is no `fills`, `executions`, or
+`broker_accounts` table. Order-level `filled_quantity` carries everything
+reconciliation actually needs, and a fill-level history would be a table this
+system has not yet earned. `risk_events` remains deliberately generic - the
+risk engine owns the meaning of a risk decision, and this module stores opaque
+text rather than importing or mirroring its model.
 
 **Transactions.** Connections run with `isolation_level=None`, so nothing is
 implicitly in a transaction and nothing implicitly commits. Every write goes
@@ -63,10 +72,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 #: The schema this module understands. There is no migration *framework*, but
-#: there is an explicit ordered upgrade path - v1 -> v2 -> v3 - applied in a
-#: single transaction by `initialize_database`. A database written by a
+#: there is an explicit ordered upgrade path - v1 -> v2 -> v3 -> v4 - applied in
+#: a single transaction by `initialize_database`. A database written by a
 #: **newer** version is refused, never downgraded.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: The oldest on-disk version this module can still open. Anything below it
 #: predates the migration path and is refused rather than guessed at.
@@ -94,6 +103,8 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "order_intents",
     "broker_orders",
     "daily_risk_baselines",
+    "reconciliation_runs",
+    "reconciliation_events",
 )
 
 #: The tables v2 added on top of v1. Kept separate so the v1 -> v2 migration
@@ -102,6 +113,9 @@ V2_TABLES: tuple[str, ...] = ("order_intents", "broker_orders")
 
 #: The table v3 adds on top of v2.
 V3_TABLES: tuple[str, ...] = ("daily_risk_baselines",)
+
+#: The tables v4 adds on top of v3, both of them Phase 8 reconciliation audit.
+V4_TABLES: tuple[str, ...] = ("reconciliation_runs", "reconciliation_events")
 
 #: Transient names the v2 -> v3 rebuild parks the old tables under. They exist
 #: only inside the migration transaction and are dropped before it commits, so
@@ -112,6 +126,9 @@ _PRE_V3_TABLES: tuple[str, ...] = (
     "order_intents__pre_v3",
     "broker_orders__pre_v3",
 )
+
+#: The same, for the v3 -> v4 rebuild of `order_intents`.
+_PRE_V4_TABLES: tuple[str, ...] = ("order_intents__pre_v4",)
 
 #: How a run was executed. Plain text, not a SQL enum. `PAPER` is a label a
 #: future phase may write; this module implements no paper behaviour whatsoever.
@@ -133,21 +150,31 @@ SIGNAL_TYPES: tuple[str, ...] = ("BUY", "EXIT")
 #: store, so a short cannot be recorded even by a caller that bypassed Python.
 ORDER_SIDES: tuple[str, ...] = ("BUY", "SELL")
 
-#: An intent's lifecycle, deliberately small (docs/SPEC.md section 8, C7).
+#: An intent's lifecycle, deliberately small (docs/SPEC.md sections 8 C7 and
+#: 8 C8).
 #:
 #: `CREATED`    persisted locally; the broker has not been called for it.
 #: `SUBMITTING` a submission is in flight; a row left here means the process
 #:              died mid-call and the broker's view is unknown.
-#: `SUBMITTED`  the broker returned an order for it.
+#: `SUBMITTED`  the broker returned an order for it. What became of that order
+#:              afterwards - filled, partially filled, canceled, rejected - is
+#:              the *broker's* status, kept in `broker_orders`, not here.
 #: `UNKNOWN`    the submission outcome is genuinely unknown - a timeout or
 #:              another ambiguous transport failure. It is **never** retried
-#:              automatically; Phase 8 resolves it by `client_order_id`.
+#:              automatically; reconciliation resolves it by `client_order_id`.
 #: `REJECTED`   the broker refused it outright, so no order exists.
+#: `CONFIRMED_NOT_SUBMITTED`
+#:              reconciliation asked the broker about this exact
+#:              `client_order_id`, more than once, and the broker definitively
+#:              answered that no such order exists (schema v4). Terminal: the
+#:              decision was never sent and will never be sent, because
+#:              executing a stale signal after a restart is not recovery.
 INTENT_STATUS_CREATED = "CREATED"
 INTENT_STATUS_SUBMITTING = "SUBMITTING"
 INTENT_STATUS_SUBMITTED = "SUBMITTED"
 INTENT_STATUS_UNKNOWN = "UNKNOWN"
 INTENT_STATUS_REJECTED = "REJECTED"
+INTENT_STATUS_CONFIRMED_NOT_SUBMITTED = "CONFIRMED_NOT_SUBMITTED"
 
 ORDER_INTENT_STATUSES: tuple[str, ...] = (
     INTENT_STATUS_CREATED,
@@ -155,6 +182,46 @@ ORDER_INTENT_STATUSES: tuple[str, ...] = (
     INTENT_STATUS_SUBMITTED,
     INTENT_STATUS_UNKNOWN,
     INTENT_STATUS_REJECTED,
+    INTENT_STATUS_CONFIRMED_NOT_SUBMITTED,
+)
+
+#: An intent in one of these states is finished: nothing a broker could say
+#: would move it again, so reconciliation does not query it.
+TERMINAL_INTENT_STATUSES: tuple[str, ...] = (
+    INTENT_STATUS_REJECTED,
+    INTENT_STATUS_CONFIRMED_NOT_SUBMITTED,
+)
+
+#: What one reconciliation run concluded (schema v4).
+#:
+#: `CLEAN`      local state already agreed with the broker.
+#: `REPAIRED`   differences were resolved from verified broker truth.
+#: `UNRESOLVED` at least one item stayed ambiguous.
+#: `FAILED`     the run could not complete.
+RECONCILIATION_STATUS_CLEAN = "CLEAN"
+RECONCILIATION_STATUS_REPAIRED = "REPAIRED"
+RECONCILIATION_STATUS_UNRESOLVED = "UNRESOLVED"
+RECONCILIATION_STATUS_FAILED = "FAILED"
+
+RECONCILIATION_STATUSES: tuple[str, ...] = (
+    RECONCILIATION_STATUS_CLEAN,
+    RECONCILIATION_STATUS_REPAIRED,
+    RECONCILIATION_STATUS_UNRESOLVED,
+    RECONCILIATION_STATUS_FAILED,
+)
+
+#: What one reconciliation *event* is about. `RUN` is the run-level summary.
+RECONCILIATION_CATEGORIES: tuple[str, ...] = ("ORDER", "POSITION", "RUN")
+
+#: What happened to one reconciled item. `OBSERVED` is evidence that changed
+#: nothing locally - something worth recording but not a repair and not a
+#: reason to block trading.
+RECONCILIATION_OUTCOMES: tuple[str, ...] = (
+    RECONCILIATION_STATUS_CLEAN,
+    RECONCILIATION_STATUS_REPAIRED,
+    RECONCILIATION_STATUS_UNRESOLVED,
+    RECONCILIATION_STATUS_FAILED,
+    "OBSERVED",
 )
 
 #: The one persisted timestamp form. Fixed width, so text ordering is also
@@ -208,6 +275,10 @@ class DuplicateOrderIntentError(StateError):
 
 class UnknownOrderIntentError(StateError):
     """The referenced `order_intents.id` does not exist."""
+
+
+class UnknownReconciliationRunError(StateError):
+    """The referenced `reconciliation_runs.id` does not exist."""
 
 
 class DuplicateBrokerOrderError(StateError):
@@ -584,6 +655,53 @@ class Position:
 
 
 @dataclass(frozen=True)
+class ReconciliationRun:
+    """One completed reconciliation pass against the broker (schema v4).
+
+    The durable answer to "when did reconciliation last run, what did it
+    conclude, and was trading allowed afterwards?". `safe_to_trade` is stored
+    rather than re-derived, so the record still says what the runtime was
+    actually told even if the rule that produced it is later changed.
+
+    A row appears only once a pass has finished. A process that died mid-pass
+    leaves no run row, which is the honest reading: repairs it had already
+    committed are durable, but nothing concluded.
+    """
+
+    id: int
+    started_at: datetime
+    completed_at: datetime
+    status: str
+    safe_to_trade: bool
+    orders_checked: int
+    positions_checked: int
+    issues_count: int
+    unresolved_count: int
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class ReconciliationEvent:
+    """One thing a reconciliation run observed, repaired, or could not resolve.
+
+    Deliberately narrow: an evidence line, not an event-sourcing record. It
+    answers which order or position was touched and why, and nothing here can
+    be replayed to reconstruct state - `order_intents`, `broker_orders`, and
+    `positions` hold that.
+    """
+
+    id: int
+    reconciliation_run_id: int
+    event_timestamp: datetime
+    category: str
+    outcome: str
+    symbol: str | None
+    client_order_id: str | None
+    detail: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
 class DailyRiskBaseline:
     """The account equity a UTC risk day is measured against.
 
@@ -753,7 +871,7 @@ _CREATE_POSITIONS = """
         updated_at    TEXT NOT NULL
     )
     """
-_CREATE_ORDER_INTENTS = """
+_CREATE_ORDER_INTENTS_V3 = """
     CREATE TABLE order_intents (
         id                 INTEGER PRIMARY KEY,
         client_order_id    TEXT NOT NULL UNIQUE CHECK (client_order_id <> ''),
@@ -808,6 +926,78 @@ _CREATE_DAILY_RISK_BASELINES = """
     )
     """
 
+# --------------------------------------------------------------------------
+# Current shapes (v4)
+#
+# `order_intents` gains one status. `reconciliation_runs` and
+# `reconciliation_events` are the audit trail of Phase 8 reconciliation:
+# `safe_to_trade` is stored as 0/1 with a CHECK, so an unreadable third value
+# cannot appear in the one field a runtime consults before trading.
+# --------------------------------------------------------------------------
+
+_CREATE_ORDER_INTENTS = """
+    CREATE TABLE order_intents (
+        id                 INTEGER PRIMARY KEY,
+        client_order_id    TEXT NOT NULL UNIQUE CHECK (client_order_id <> ''),
+        strategy_run_id    INTEGER REFERENCES strategy_runs (id),
+        created_at         TEXT NOT NULL,
+        symbol             TEXT NOT NULL CHECK (symbol <> ''),
+        side               TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+        requested_quantity TEXT NOT NULL CHECK (
+            requested_quantity <> '' AND CAST(requested_quantity AS REAL) > 0
+        ),
+        approved_quantity  TEXT NOT NULL CHECK (
+            approved_quantity <> '' AND CAST(approved_quantity AS REAL) > 0
+        ),
+        reference_price    REAL NOT NULL CHECK (reference_price > 0),
+        risk_reason_code   TEXT NOT NULL CHECK (risk_reason_code <> ''),
+        status             TEXT NOT NULL CHECK (
+            status IN (
+                'CREATED', 'SUBMITTING', 'SUBMITTED', 'UNKNOWN', 'REJECTED',
+                'CONFIRMED_NOT_SUBMITTED'
+            )
+        ),
+        updated_at         TEXT NOT NULL,
+        CHECK (CAST(approved_quantity AS REAL) <= CAST(requested_quantity AS REAL))
+    )
+    """
+_CREATE_RECONCILIATION_RUNS = """
+    CREATE TABLE reconciliation_runs (
+        id                INTEGER PRIMARY KEY,
+        started_at        TEXT NOT NULL,
+        completed_at      TEXT NOT NULL,
+        status            TEXT NOT NULL CHECK (
+            status IN ('CLEAN', 'REPAIRED', 'UNRESOLVED', 'FAILED')
+        ),
+        safe_to_trade     INTEGER NOT NULL CHECK (safe_to_trade IN (0, 1)),
+        orders_checked    INTEGER NOT NULL CHECK (orders_checked >= 0),
+        positions_checked INTEGER NOT NULL CHECK (positions_checked >= 0),
+        issues_count      INTEGER NOT NULL CHECK (issues_count >= 0),
+        unresolved_count  INTEGER NOT NULL CHECK (unresolved_count >= 0),
+        created_at        TEXT NOT NULL
+    )
+    """
+_CREATE_RECONCILIATION_EVENTS = """
+    CREATE TABLE reconciliation_events (
+        id                    INTEGER PRIMARY KEY,
+        reconciliation_run_id INTEGER NOT NULL REFERENCES reconciliation_runs (id),
+        event_timestamp       TEXT NOT NULL,
+        category              TEXT NOT NULL CHECK (
+            category IN ('ORDER', 'POSITION', 'RUN')
+        ),
+        outcome               TEXT NOT NULL CHECK (
+            outcome IN ('CLEAN', 'REPAIRED', 'UNRESOLVED', 'FAILED', 'OBSERVED')
+        ),
+        symbol                TEXT,
+        client_order_id       TEXT,
+        detail                TEXT NOT NULL CHECK (detail <> ''),
+        created_at            TEXT NOT NULL
+    )
+    """
+_CREATE_INDEX_RECONCILIATION_EVENTS = (
+    "CREATE INDEX idx_reconciliation_events_run ON reconciliation_events (reconciliation_run_id)"
+)
+
 #: A fresh database is built directly from these, at `SCHEMA_VERSION`. It is
 #: never created at v1 and then migrated forward.
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
@@ -820,9 +1010,12 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     _CREATE_ORDER_INTENTS,
     _CREATE_BROKER_ORDERS,
     _CREATE_DAILY_RISK_BASELINES,
+    _CREATE_RECONCILIATION_RUNS,
+    _CREATE_RECONCILIATION_EVENTS,
     _CREATE_INDEX_SIGNALS,
     _CREATE_INDEX_RISK_EVENTS,
     _CREATE_INDEX_ORDER_INTENTS_STATUS,
+    _CREATE_INDEX_RECONCILIATION_EVENTS,
 )
 
 # --------------------------------------------------------------------------
@@ -877,6 +1070,24 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 _DROP_PRE_V3_POSITIONS = "DROP TABLE positions__pre_v3"
 _DROP_PRE_V3_ORDER_INTENTS = "DROP TABLE order_intents__pre_v3"
 _DROP_PRE_V3_BROKER_ORDERS = "DROP TABLE broker_orders__pre_v3"
+
+# --------------------------------------------------------------------------
+# v3 -> v4 rebuild statements
+#
+# Only `order_intents` is rebuilt, and only because widening a CHECK constraint
+# is not something SQLite can do in place. Nothing about the data changes: every
+# column is copied across verbatim, and no existing row can hold the status the
+# rebuild makes storable, so no row's meaning moves.
+# --------------------------------------------------------------------------
+
+_RENAME_ORDER_INTENTS_PRE_V4 = "ALTER TABLE order_intents RENAME TO order_intents__pre_v4"
+_SELECT_PRE_V4_ORDER_INTENTS = """
+SELECT id, client_order_id, strategy_run_id, created_at, symbol, side, requested_quantity,
+       approved_quantity, reference_price, risk_reason_code, status, updated_at
+FROM order_intents__pre_v4
+ORDER BY id
+"""
+_DROP_PRE_V4_ORDER_INTENTS = "DROP TABLE order_intents__pre_v4"
 
 _PRAGMA_FOREIGN_KEYS = "PRAGMA foreign_keys = ON"
 _PRAGMA_FOREIGN_KEYS_OFF = "PRAGMA foreign_keys = OFF"
@@ -1066,7 +1277,7 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     connection.execute(_RENAME_BROKER_ORDERS_PRE_V3)
 
     connection.execute(_CREATE_POSITIONS)
-    connection.execute(_CREATE_ORDER_INTENTS)
+    connection.execute(_CREATE_ORDER_INTENTS_V3)
     connection.execute(_CREATE_BROKER_ORDERS)
     connection.execute(_CREATE_DAILY_RISK_BASELINES)
 
@@ -1131,13 +1342,75 @@ def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
     connection.execute(_CREATE_INDEX_ORDER_INTENTS_STATUS)
 
 
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """Widen the intent status vocabulary and add the reconciliation audit tables.
+
+    Reconciliation needs to record that the broker *definitively* has no order
+    under an intent's `client_order_id`. That is neither `CREATED` nor
+    `REJECTED`, so `CONFIRMED_NOT_SUBMITTED` joins the vocabulary - and because
+    the vocabulary is a CHECK constraint, SQLite requires a table rebuild to
+    change it. `order_intents` is renamed aside, recreated from the same
+    literal a fresh database uses, copied across column by column with ids and
+    `client_order_id` values preserved exactly, and the old copy dropped.
+
+    **No row changes meaning.** The rebuild only makes one more status
+    *storable*; it writes no row into it. A v3 database migrated here and then
+    reconciled is in the same state as one that was always v4.
+
+    `reconciliation_runs` and `reconciliation_events` are new and empty: there
+    is no history to backfill, and inventing one would be a fabricated audit
+    trail.
+
+    Runs inside the caller's transaction, with foreign-key enforcement and
+    modern rename semantics suspended; the caller re-checks referential
+    integrity before committing.
+    """
+    existing = _existing_table_names(connection)
+    conflicting = sorted(table for table in (*V4_TABLES, *_PRE_V4_TABLES) if table in existing)
+    if conflicting:
+        raise DatabaseStateError(
+            f"Cannot upgrade this database to schema version {SCHEMA_VERSION}: it "
+            f"already contains table(s) {', '.join(conflicting)}. Refusing to "
+            "migrate over an inconsistent database."
+        )
+
+    connection.execute(_RENAME_ORDER_INTENTS_PRE_V4)
+    connection.execute(_CREATE_ORDER_INTENTS)
+
+    for row in connection.execute(_SELECT_PRE_V4_ORDER_INTENTS).fetchall():
+        connection.execute(
+            _INSERT_MIGRATED_ORDER_INTENT,
+            (
+                row["id"],
+                row["client_order_id"],
+                row["strategy_run_id"],
+                row["created_at"],
+                row["symbol"],
+                row["side"],
+                row["requested_quantity"],
+                row["approved_quantity"],
+                row["reference_price"],
+                row["risk_reason_code"],
+                row["status"],
+                row["updated_at"],
+            ),
+        )
+
+    connection.execute(_DROP_PRE_V4_ORDER_INTENTS)
+    connection.execute(_CREATE_INDEX_ORDER_INTENTS_STATUS)
+    connection.execute(_CREATE_RECONCILIATION_RUNS)
+    connection.execute(_CREATE_RECONCILIATION_EVENTS)
+    connection.execute(_CREATE_INDEX_RECONCILIATION_EVENTS)
+
+
 #: Each supported upgrade, in order: the version it produces and how to get
 #: there. `initialize_database` runs every step above the database's current
-#: version, in one transaction, so v1 -> v3 is v1 -> v2 -> v3 and never a
-#: separate third path that could drift from either.
+#: version, in one transaction, so v1 -> v4 is v1 -> v2 -> v3 -> v4 and never a
+#: separate shortcut path that could drift from any of them.
 _MIGRATIONS = (
     (2, _migrate_v1_to_v2),
     (3, _migrate_v2_to_v3),
+    (4, _migrate_v3_to_v4),
 )
 
 
@@ -1231,9 +1504,10 @@ def initialize_database(path: str | Path) -> Path:
     existing older database is upgraded through the explicit ordered migration
     path, in a single transaction, so a failed upgrade rolls back and leaves
     the database on its original version rather than half-migrated. Every row
-    survives an upgrade; v3 rebuilds three tables to widen their quantity
+    survives an upgrade: v3 rebuilds three tables to widen their quantity
     columns and copies every row across unchanged apart from that
-    representation.
+    representation, and v4 rebuilds `order_intents` to widen a CHECK constraint
+    and copies every row across entirely unchanged.
 
     Idempotent: once at the current version, repeated calls verify and change
     nothing. A database written by a **newer** schema version is refused and
@@ -2133,9 +2407,253 @@ def list_daily_risk_baselines(connection: sqlite3.Connection) -> list[DailyRiskB
     ]
 
 
+# --------------------------------------------------------------------------
+# Reconciliation audit (schema v4)
+#
+# The durable evidence one reconciliation pass leaves behind. This is
+# persistence only: nothing here contacts a broker, decides what "reconciled"
+# means, or computes `safe_to_trade` - `autotrader.reconciliation` owns all of
+# that and hands the conclusion here to be written down.
+#
+# A run row is written once, when a pass has finished, together with its
+# events in a single transaction. There is deliberately no in-progress row: a
+# half-written run that a crash left behind would be indistinguishable from a
+# genuine one, and "reconciliation ran" is precisely the claim a runtime is
+# about to trust.
+# --------------------------------------------------------------------------
+
+_INSERT_RECONCILIATION_RUN = """
+INSERT INTO reconciliation_runs
+    (started_at, completed_at, status, safe_to_trade, orders_checked, positions_checked,
+     issues_count, unresolved_count, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+_SELECT_RECONCILIATION_RUN = """
+SELECT id, started_at, completed_at, status, safe_to_trade, orders_checked,
+       positions_checked, issues_count, unresolved_count, created_at
+FROM reconciliation_runs
+WHERE id = ?
+"""
+_SELECT_RECONCILIATION_RUNS = """
+SELECT id, started_at, completed_at, status, safe_to_trade, orders_checked,
+       positions_checked, issues_count, unresolved_count, created_at
+FROM reconciliation_runs
+ORDER BY id
+"""
+_SELECT_LATEST_RECONCILIATION_RUN = """
+SELECT id, started_at, completed_at, status, safe_to_trade, orders_checked,
+       positions_checked, issues_count, unresolved_count, created_at
+FROM reconciliation_runs
+ORDER BY id DESC
+LIMIT 1
+"""
+_INSERT_RECONCILIATION_EVENT = """
+INSERT INTO reconciliation_events
+    (reconciliation_run_id, event_timestamp, category, outcome, symbol, client_order_id,
+     detail, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+"""
+_SELECT_RECONCILIATION_EVENTS = """
+SELECT id, reconciliation_run_id, event_timestamp, category, outcome, symbol,
+       client_order_id, detail, created_at
+FROM reconciliation_events
+ORDER BY id
+"""
+_SELECT_RECONCILIATION_EVENTS_FOR_RUN = """
+SELECT id, reconciliation_run_id, event_timestamp, category, outcome, symbol,
+       client_order_id, detail, created_at
+FROM reconciliation_events
+WHERE reconciliation_run_id = ?
+ORDER BY id
+"""
+
+
+def _require_count(value: int, field: str) -> int:
+    """A non-negative row count. `bool` is refused as a type confusion."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise StateInputError(f"{field} must be an integer, got {type(value).__name__}.")
+    if value < 0:
+        raise StateInputError(f"{field} must not be negative, got {value}.")
+    return value
+
+
+def _to_reconciliation_run(row: sqlite3.Row) -> ReconciliationRun:
+    return ReconciliationRun(
+        id=int(row["id"]),
+        started_at=from_utc_text(row["started_at"]),
+        completed_at=from_utc_text(row["completed_at"]),
+        status=str(row["status"]),
+        safe_to_trade=bool(row["safe_to_trade"]),
+        orders_checked=int(row["orders_checked"]),
+        positions_checked=int(row["positions_checked"]),
+        issues_count=int(row["issues_count"]),
+        unresolved_count=int(row["unresolved_count"]),
+        created_at=from_utc_text(row["created_at"]),
+    )
+
+
+def _to_reconciliation_event(row: sqlite3.Row) -> ReconciliationEvent:
+    symbol = row["symbol"]
+    client_order_id = row["client_order_id"]
+    return ReconciliationEvent(
+        id=int(row["id"]),
+        reconciliation_run_id=int(row["reconciliation_run_id"]),
+        event_timestamp=from_utc_text(row["event_timestamp"]),
+        category=str(row["category"]),
+        outcome=str(row["outcome"]),
+        symbol=None if symbol is None else str(symbol),
+        client_order_id=None if client_order_id is None else str(client_order_id),
+        detail=str(row["detail"]),
+        created_at=from_utc_text(row["created_at"]),
+    )
+
+
+def record_reconciliation_run(
+    connection: sqlite3.Connection,
+    *,
+    started_at: datetime,
+    completed_at: datetime,
+    status: str,
+    safe_to_trade: bool,
+    orders_checked: int,
+    positions_checked: int,
+    issues_count: int,
+    unresolved_count: int,
+) -> int:
+    """Store one finished reconciliation run and return its row id.
+
+    `safe_to_trade` is persisted as the caller computed it rather than derived
+    from `status` here. The two must agree - and a test asserts they do - but
+    an audit record that silently recomputed the answer would no longer be
+    evidence of what the runtime was actually told.
+
+    `completed_at` may not precede `started_at`: a run that finished before it
+    began is a corrupt record, not a fast one.
+    """
+    run_status = _require_choice(status, "status", RECONCILIATION_STATUSES)
+    if not isinstance(safe_to_trade, bool):
+        raise StateInputError(f"safe_to_trade must be a bool, got {type(safe_to_trade).__name__}.")
+    started_text = to_utc_text(started_at, "started_at")
+    completed_text = to_utc_text(completed_at, "completed_at")
+    if completed_text < started_text:
+        raise StateInputError(
+            f"completed_at must not precede started_at ({completed_text} is before {started_text})."
+        )
+    orders = _require_count(orders_checked, "orders_checked")
+    positions = _require_count(positions_checked, "positions_checked")
+    issues = _require_count(issues_count, "issues_count")
+    unresolved = _require_count(unresolved_count, "unresolved_count")
+    if unresolved > issues:
+        raise StateInputError(
+            f"unresolved_count ({unresolved}) cannot exceed issues_count ({issues}); "
+            "every unresolved item is an issue."
+        )
+
+    with transaction(connection):
+        cursor = connection.execute(
+            _INSERT_RECONCILIATION_RUN,
+            (
+                started_text,
+                completed_text,
+                run_status,
+                int(safe_to_trade),
+                orders,
+                positions,
+                issues,
+                unresolved,
+                _now_text(),
+            ),
+        )
+    return int(cursor.lastrowid)
+
+
+def record_reconciliation_event(
+    connection: sqlite3.Connection,
+    *,
+    reconciliation_run_id: int,
+    event_timestamp: datetime,
+    category: str,
+    outcome: str,
+    detail: str,
+    symbol: str | None = None,
+    client_order_id: str | None = None,
+) -> int:
+    """Store one piece of reconciliation evidence and return its row id.
+
+    `detail` is free text written by the reconciler and must not be empty: an
+    event that cannot say what it observed is not evidence. It must never
+    contain a credential - the reconciler composes it from symbols, quantities,
+    statuses, and `client_order_id` values only.
+    """
+    event_category = _require_choice(category, "category", RECONCILIATION_CATEGORIES)
+    event_outcome = _require_choice(outcome, "outcome", RECONCILIATION_OUTCOMES)
+    detail_text = _require_text(detail, "detail")
+    ticker = None if symbol is None else _require_symbol(symbol)
+    client_id = _optional_text(client_order_id, "client_order_id")
+    timestamp_text = to_utc_text(event_timestamp, "event_timestamp")
+
+    try:
+        with transaction(connection):
+            cursor = connection.execute(
+                _INSERT_RECONCILIATION_EVENT,
+                (
+                    reconciliation_run_id,
+                    timestamp_text,
+                    event_category,
+                    event_outcome,
+                    ticker,
+                    client_id,
+                    detail_text,
+                    _now_text(),
+                ),
+            )
+    except sqlite3.IntegrityError as error:
+        if error.sqlite_errorname == "SQLITE_CONSTRAINT_FOREIGNKEY":
+            raise UnknownReconciliationRunError(
+                f"No reconciliation run with id {reconciliation_run_id!r}."
+            ) from None
+        raise
+    return int(cursor.lastrowid)
+
+
+def get_reconciliation_run(
+    connection: sqlite3.Connection, reconciliation_run_id: int
+) -> ReconciliationRun | None:
+    """Return one reconciliation run by row id, or None."""
+    row = connection.execute(_SELECT_RECONCILIATION_RUN, (reconciliation_run_id,)).fetchone()
+    return None if row is None else _to_reconciliation_run(row)
+
+
+def latest_reconciliation_run(connection: sqlite3.Connection) -> ReconciliationRun | None:
+    """Return the most recent finished reconciliation run, or None.
+
+    The lookup a runtime makes on startup to ask what the last pass concluded.
+    None means no pass has ever finished, which is **not** permission to trade.
+    """
+    row = connection.execute(_SELECT_LATEST_RECONCILIATION_RUN).fetchone()
+    return None if row is None else _to_reconciliation_run(row)
+
+
+def list_reconciliation_runs(connection: sqlite3.Connection) -> list[ReconciliationRun]:
+    """Every stored reconciliation run, oldest first."""
+    return [_to_reconciliation_run(row) for row in connection.execute(_SELECT_RECONCILIATION_RUNS)]
+
+
+def list_reconciliation_events(
+    connection: sqlite3.Connection, reconciliation_run_id: int | None = None
+) -> list[ReconciliationEvent]:
+    """Reconciliation evidence, oldest first, optionally for one run only."""
+    if reconciliation_run_id is None:
+        rows = connection.execute(_SELECT_RECONCILIATION_EVENTS)
+    else:
+        rows = connection.execute(_SELECT_RECONCILIATION_EVENTS_FOR_RUN, (reconciliation_run_id,))
+    return [_to_reconciliation_event(row) for row in rows]
+
+
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "DEFAULT_DATABASE_PATH",
+    "INTENT_STATUS_CONFIRMED_NOT_SUBMITTED",
     "INTENT_STATUS_CREATED",
     "INTENT_STATUS_REJECTED",
     "INTENT_STATUS_SUBMITTED",
@@ -2144,6 +2662,13 @@ __all__ = [
     "MIN_MIGRATABLE_SCHEMA_VERSION",
     "ORDER_INTENT_STATUSES",
     "ORDER_SIDES",
+    "RECONCILIATION_CATEGORIES",
+    "RECONCILIATION_OUTCOMES",
+    "RECONCILIATION_STATUSES",
+    "RECONCILIATION_STATUS_CLEAN",
+    "RECONCILIATION_STATUS_FAILED",
+    "RECONCILIATION_STATUS_REPAIRED",
+    "RECONCILIATION_STATUS_UNRESOLVED",
     "REQUIRED_TABLES",
     "RUN_MODES",
     "RUN_STATUSES",
@@ -2152,16 +2677,20 @@ __all__ = [
     "RUN_STATUS_RUNNING",
     "SCHEMA_VERSION",
     "SIGNAL_TYPES",
+    "TERMINAL_INTENT_STATUSES",
     "TERMINAL_RUN_STATUSES",
     "TIMESTAMP_FORMAT",
     "V2_TABLES",
     "V3_TABLES",
+    "V4_TABLES",
     "DailyRiskBaseline",
     "DatabaseStateError",
     "DuplicateBrokerOrderError",
     "DuplicateOrderIntentError",
     "DuplicateSignalError",
     "Position",
+    "ReconciliationEvent",
+    "ReconciliationRun",
     "RiskEvent",
     "StateError",
     "StateInputError",
@@ -2171,32 +2700,39 @@ __all__ = [
     "StrategyRun",
     "SystemEvent",
     "UnknownOrderIntentError",
+    "UnknownReconciliationRunError",
     "UnknownStrategyRunError",
     "UnsupportedSchemaVersionError",
     "connect",
-    "finish_strategy_run",
     "ensure_daily_risk_baseline",
+    "finish_strategy_run",
     "from_decimal_text",
     "from_risk_date_text",
     "from_utc_text",
     "get_broker_order_by_client_id",
     "get_broker_order_by_intent",
-    "get_order_intent",
     "get_daily_risk_baseline",
+    "get_order_intent",
     "get_order_intent_by_client_id",
     "get_position",
+    "get_reconciliation_run",
     "get_schema_version",
     "get_strategy_run",
     "initialize_database",
+    "latest_reconciliation_run",
     "list_broker_orders",
     "list_daily_risk_baselines",
     "list_order_intents",
     "list_positions",
+    "list_reconciliation_events",
+    "list_reconciliation_runs",
     "list_risk_events",
     "list_signals",
     "list_strategy_runs",
     "list_system_events",
     "record_order_intent",
+    "record_reconciliation_event",
+    "record_reconciliation_run",
     "record_risk_event",
     "record_signal",
     "record_strategy_run",

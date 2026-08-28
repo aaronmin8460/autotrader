@@ -6,7 +6,7 @@ run as a local Python CLI process against an Alpaca **paper** account.
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Crypto Pivot V0.2 complete. Next: Phase 8 reconciliation / crash recovery and Phase 9 24/7 runtime, in parallel
+## Status: Crypto V0.2 with Phase 8 reconciliation complete. Next: Phase 9 24/7 runtime
 
 **Current active version: Crypto V0.2.** The system trades BTC/USD and ETH/USD
 only, on 15-minute bars, 24 hours a day and 7 days a week.
@@ -23,11 +23,11 @@ What exists today: downloading historical 15-minute crypto bars from Alpaca's
 US crypto feed as Parquet, validating a stored dataset, the EMA 20 / EMA 50
 signal generator, a deterministic backtester with fractional positions and a
 modelled taker fee, a deterministic risk engine, a local SQLite
-operational-state database at schema v3, and a single deliberately awkward
-paper-order command. Validation never downloads or repairs data; the strategy
-emits signals only; the backtester is local arithmetic; the risk engine is a
-pure calculator that persists nothing; and the database stores records without
-deciding anything.
+operational-state database at schema v4, a single deliberately awkward
+paper-order command, and a crash-recovery reconciliation command. Validation
+never downloads or repairs data; the strategy emits signals only; the
+backtester is local arithmetic; the risk engine is a pure calculator that
+persists nothing; and the database stores records without deciding anything.
 
 **Live trading is not implemented, not configurable, and not reachable.** The
 trading client is constructed with `paper=True` hardcoded; there is no
@@ -43,14 +43,20 @@ risk engine, then rounded **down** to the broker's own trade increment, so the
 quantity sent is never more than the risk-approved one. The order intent and
 its `client_order_id` are committed to SQLite *before* the broker is called.
 
-**Reconciliation is not implemented.** The system creates the durable anchors
-crash recovery will need but resolves nothing. An ambiguous submission outcome
-is recorded as `UNKNOWN` and left alone - never retried, never re-keyed. There
-is no fills, executions, or reconciliation table.
+**Reconciliation resolves state; it never invents a trade.** `autotrader
+reconcile` reads the paper broker and repairs local SQLite from it. An
+`UNKNOWN` submission outcome is settled by asking the broker about the *same*
+`client_order_id` - never by sending a second order. A stale intent the broker
+confirms it never received is closed off rather than executed after a restart.
+A position mismatch is corrected in the database, never by trading. The
+command reports one answer a runtime can act on, `safe_to_trade`, which is
+false for anything ambiguous.
 
-**There is no 24/7 runner yet either.** The contracts are 24/7-safe - UTC
-dates, a UTC risk day, no market-session logic anywhere - but nothing loops,
-schedules, or polls. Running the system is still a human typing a command.
+**There is no 24/7 runner yet.** The contracts are 24/7-safe - UTC dates, a UTC
+risk day, no market-session logic anywhere - and reconciliation now provides
+the startup gate such a runner will need, but nothing loops, schedules, or
+polls. Running the system is still a human typing a command. Phase 9 is not
+started.
 
 ## Scope summary
 
@@ -67,7 +73,7 @@ schedules, or polls. Running the system is still a human typing a command.
 | Leverage / shorting | None |
 | Research strategy | EMA 20 / EMA 50 crossover (engineering validation only) |
 | Historical storage | Parquet |
-| Operational state | SQLite, local file, schema v3 |
+| Operational state | SQLite, local file, schema v4 |
 | Quantities | Fractional, `decimal.Decimal` |
 | Interface | Python CLI, local process - no web frontend |
 
@@ -434,7 +440,7 @@ Writes are transactional: `transaction()` commits on success and rolls back on
 **any** exception. All timestamps are ISO-8601 UTC in one canonical form, and
 **naive datetimes are rejected**.
 
-Nine tables exist:
+Eleven tables exist:
 
 | Table | Holds |
 | --- | --- |
@@ -447,10 +453,25 @@ Nine tables exist:
 | `order_intents` | An order this system decided to place, written **before** the broker call |
 | `broker_orders` | The latest normalized snapshot of what the broker said |
 | `daily_risk_baselines` | The UTC-day equity baseline the loss halt measures against |
+| `reconciliation_runs` | What one finished reconciliation pass concluded (v4) |
+| `reconciliation_events` | Which order or position it repaired, observed, or could not settle (v4) |
 
-**There is still no fill or reconciliation persistence.** No `fills`,
-`executions`, `broker_accounts`, or `reconciliation_runs` table exists: those
-belong to Phase 8.
+**There is still no fill persistence.** No `fills`, `executions`, or
+`broker_accounts` table exists. Order-level `filled_quantity` is what
+reconciliation actually settles, so a fill-level history would be a shape
+guessed at rather than needed.
+
+### Schema v4: the reconciliation vocabulary
+
+v4 does two things. It adds the two audit tables above, and it widens the
+`order_intents` status CHECK by one value, `CONFIRMED_NOT_SUBMITTED` - the
+state of an intent whose absence at the broker has been *confirmed*, which is
+neither `CREATED` nor `REJECTED`. Widening a CHECK requires a table rebuild in
+SQLite, so `order_intents` is renamed aside, recreated from the same literal a
+fresh database uses, copied across column by column, and the old copy dropped.
+No row's meaning changes: the rebuild only makes one more status storable, and
+writes no row into it. The two new tables arrive empty, because backfilling an
+audit trail that never happened would be a fabrication.
 
 ### Exact decimal quantities (schema v3)
 
@@ -478,9 +499,9 @@ fractional USD mark, and moving prices to text would discard the
 `CHECK (... > 0)` constraints that make an impossible price unstorable even by
 a writer bypassing this module. A price here is a mark, never a quantity.
 
-### Schema migration (v1 -> v2 -> v3)
+### Schema migration (v1 -> v2 -> v3 -> v4)
 
-A new database is created directly at v3. An older one is upgraded through an
+A new database is created directly at v4. An older one is upgraded through an
 explicit ordered path, in a single transaction, so a failed upgrade rolls back
 and leaves the database on its original version rather than half-migrated.
 
@@ -496,6 +517,12 @@ Existing data survives. An integer `1` becomes the decimal `"1"` and `100`
 becomes `"100"` - the same number, written out, with no scale invented and no
 row dropped. Referential integrity is suspended for the rebuild and re-checked
 before the transaction commits; a violation rolls the whole upgrade back.
+
+v3 -> v4 uses the same rebuild machinery for a smaller reason: only
+`order_intents` is rebuilt, and only to widen a CHECK constraint. Every column
+is copied verbatim - no value is converted and no row changes meaning - and the
+two reconciliation tables are created empty alongside it. The byte-identity
+test covers this path too, from v1, v2, and v3 alike.
 
 A database written by a **newer** version is still refused and left untouched.
 
@@ -612,23 +639,172 @@ on completed 15-minute bars - is Phase 9's job.
 **An ambiguous outcome is never retried.** A timeout after `submit_order` could
 mean the broker accepted the order or never saw it. Re-sending it risks a
 duplicate position, so the intent is marked `UNKNOWN`, an audit event is
-written, and the attempt stops. The `client_order_id` is kept so Phase 8 can
-ask the broker about that exact key. The CLI exits `2` for this case
-specifically. The SDK's own internal retry of `429`/`504` responses is switched
-off on the trading client for the same reason.
+written, and the attempt stops. The `client_order_id` is kept so
+[reconciliation](#reconciliation-and-crash-recovery) can ask the broker about
+that exact key. The CLI exits `2` for this case specifically. The SDK's own
+internal retry of `429`/`504` responses is switched off on the trading client
+for the same reason.
 
 ### Accepted is not filled
 
 A stored broker snapshot proves the broker **accepted** an order. Nothing
 infers a position from that: the local `positions` table is only written from a
 position actually observed at the broker, and a successful submission never
-increments it.
+increments it. Reconciliation keeps the same rule.
 
 ### Not implemented
 
-No reconciliation, no crash recovery, no automatic `UNKNOWN` resolution, no
-fill history, no open-order synchronization, no position repair, no streaming
-or websockets, no scheduler or 24/7 loop, no monitoring, and no live trading.
+No fill history, no streaming or websockets, no order replacement or
+cancellation, no scheduler or 24/7 loop, no monitoring, and no live trading.
+
+## Reconciliation and crash recovery
+
+```bash
+python -m autotrader.cli reconcile
+```
+
+`autotrader.reconciliation` makes local SQLite state reflect **verified broker
+truth** after a crash, a restart, or a submission whose outcome was never
+knowable. It is the only part of the system that rewrites local rows from what
+a broker says, and it is read-only towards the broker.
+
+### The authority hierarchy
+
+| | |
+| --- | --- |
+| **Broker** | Truth for orders, fills, and positions |
+| **Local SQLite** | Durable intent, audit trail, last-known snapshot |
+
+Where they disagree, the snapshot is rewritten. Never the other way around.
+
+### Reconciliation never invents a trade
+
+This is the property the whole phase is built around. No `UNKNOWN` intent is
+resubmitted, no `client_order_id` is regenerated, no submission is retried, no
+replacement order is created, and no offsetting order is placed to correct a
+position mismatch. The package imports nothing that could place an order, and
+source-level tests assert each forbidden identifier is absent from its
+executable code. In the test suite the fake broker's submit call does not merely
+count invocations - it raises.
+
+### The startup question
+
+One result object, one question:
+
+```python
+result = reconcile_paper_state(connection)
+if result.safe_to_trade:
+    ...
+```
+
+| Status | Meaning | `safe_to_trade` | Exit code |
+| --- | --- | --- | --- |
+| `CLEAN` | Local state already agreed with the broker | true | 0 |
+| `REPAIRED` | Differences were resolved from verified broker truth | true | 0 |
+| `UNRESOLVED` | The pass ran; something stayed ambiguous | false | 2 |
+| `FAILED` | The pass could not complete | false | 1 |
+
+`safe_to_trade` is **derived** from the status rather than stored beside it, so
+a result that says `UNRESOLVED` and "safe" cannot be constructed. A pass that
+never finished returns nothing at all, which is not permission.
+
+### Resolving an UNKNOWN intent
+
+An `UNKNOWN` intent means a submission ended without a knowable outcome - the
+order may or may not exist. The recovery anchor is the `client_order_id`
+committed *before* the request went out and never regenerated:
+
+| The broker says | What happens |
+| --- | --- |
+| It has that order | Its snapshot is recorded as-is. **Nothing is submitted.** |
+| It definitively has no such order, on more than one read | The intent becomes `CONFIRMED_NOT_SUBMITTED` - terminal, never sent |
+| The lookup times out, 5xx's, or cannot be read | Nothing changes; the pass is `UNRESOLVED` and startup is blocked |
+
+**One not-found is never enough.** A single `404` could be a lookup that
+overtook a submission still in flight, so the read is repeated a small fixed
+number of times with a short pause between, and every read must agree. It is a
+bounded confirmation, not a poll: no growing backoff, and no loop that waits
+for the answer it wants.
+
+The same handling covers a `CREATED` intent (the process died before
+submitting) and a `SUBMITTING` one (it died mid-call). A stale decision from
+before a crash is closed off rather than executed on the next run.
+
+### Order snapshot repair
+
+For an intent the broker does have, the snapshot is copied across: broker order
+id, client order id, symbol, side, quantity, filled quantity, filled average
+price when given, status, submitted time, and filled time. Nothing is inferred.
+
+- A **partial fill stays partial** - 0.0004 filled of 0.001 ordered is stored
+  as exactly that, and a partially filled order is re-read on the next pass
+  because it can still fill.
+- A **missing fill price is not invented**; absent stays absent.
+- **Accepted is still not filled**, and a submitted order never conjures a
+  position.
+- An order returned under this key that names a *different* key, market, or
+  side is not evidence about this intent: it is reported and nothing is written.
+- A broker order this system already recorded, which the broker now denies,
+  leaves the stored snapshot untouched and blocks trading. Recorded evidence is
+  not deleted because a later read disagreed with it.
+
+The broker's own `updated_at` is carried into the audit detail rather than into
+`broker_orders.updated_at`, which already means "when this snapshot was
+refreshed". One column, one clock.
+
+### Positions come only from the broker
+
+BTC/USD and ETH/USD are reconciled independently. A position the broker holds
+and local state does not is written in; a local position the broker no longer
+holds goes to zero. Quantities are exact `Decimal` values throughout. Nothing
+is derived from `order_intents`, and no order is placed to make the two agree.
+A short position at the broker fails the whole pass - this system is long only
+and cannot reason about one - and the `positions` column itself refuses a
+negative quantity. A broker position outside the traded universe is recorded as
+an observation and left alone.
+
+### Failing closed
+
+| Situation | Result |
+| --- | --- |
+| The client cannot be **proven** to reach Alpaca paper | `FAILED`, before any local write |
+| Authentication failure, or an unreadable account | `FAILED` |
+| The position list cannot be read | `FAILED` |
+| A short position at the broker | `FAILED` |
+| An order lookup times out or cannot be read | That item `UNRESOLVED`; the pass continues |
+| A malformed broker order | That item `UNRESOLVED` |
+| The audit record cannot be written | `FAILED` |
+
+Proving paper is a precondition, not an afterthought: a process about to
+rewrite local state from what a broker says checks *which* broker first, and an
+environment that cannot be read is refused exactly like a live one.
+
+An unresolved item does not abort the pass. A runtime is better served by every
+problem than by the first one.
+
+### Audit, idempotency, and dry run
+
+Every finished pass writes one `reconciliation_runs` row - when it ran, what it
+concluded, whether trading was allowed afterwards, and how much it checked -
+plus a `reconciliation_events` row for each item it repaired, observed, or
+could not settle. Clean items write nothing: an audit table where most rows say
+"no change" stops being readable. A summary also lands in `system_events`.
+
+Repairs commit as they are made and the audit record commits at the end, so a
+crash mid-pass leaves durable repairs and no run row - work was done, nothing
+was concluded - and the next pass reconciles from broker truth again.
+Reconciliation is idempotent: a second run after a repair reports `CLEAN`.
+
+`--dry-run` reports exactly the same findings and reconciles **nothing** into
+the database - no repair, no run row, no event. Opening the database still
+applies any pending schema migration, as every command here does; that is a
+structural upgrade, not a reconciliation result.
+
+### Not implemented here
+
+No order replacement or cancellation, no fill history, no automatic retry, and
+no loop, scheduler, or heartbeat. Reconciliation runs once, when asked, and
+returns.
 
 ## Development
 
@@ -652,14 +828,17 @@ stripped, so prose describing a forbidden construct cannot mask its presence.
 src/autotrader/data/        Alpaca crypto bars -> canonical Parquet, and
                             stored-dataset validation
 src/autotrader/cli/         Typer CLI (version, download, validate, backtest,
-                            paper-submit)
+                            paper-submit, reconcile)
 src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals
 src/autotrader/backtest/    deterministic next-bar-open backtester, fractional
                             quantities, modelled taker fee
 src/autotrader/risk/        deterministic risk decisions and sizing
-src/autotrader/state/       local SQLite operational state, schema v3
+src/autotrader/state/       local SQLite operational state, schema v4
 src/autotrader/execution/   Alpaca PAPER crypto execution - the only place a
                             trading client exists or an order is sent
+src/autotrader/reconciliation/
+                            crash recovery: broker truth -> local state, and
+                            the safe_to_trade startup answer
 tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)
 data/processed/             validated market data (git-ignored)
@@ -669,7 +848,11 @@ docs/SPEC.md                authoritative scope specification
 
 ## What comes next
 
-**Phase 8 - Reconciliation / Crash Recovery** and **Phase 9 - 24/7 Runtime /
-Monitoring**, developed in parallel. Neither is started. The pivot's job was to
-make the existing stack crypto-compatible and 24/7-safe *in its contracts*, not
-to run it unattended.
+**Phase 9 - 24/7 Runtime / Monitoring.** It owns the continuous loop, wake-up
+scheduling on completed 15-minute bars, bar-freshness checks, heartbeat and
+alerting, and process supervision. It is **not started**, and nothing in this
+repository loops, schedules, or polls.
+
+The integration boundary between the two is deliberately one line: a runtime
+may begin trading only when `reconcile_paper_state(...).safe_to_trade` is
+true. Phase 8 built that answer and stopped there.

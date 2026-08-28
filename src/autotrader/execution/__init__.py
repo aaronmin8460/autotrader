@@ -30,10 +30,12 @@ confirmation, both of which default to closed.
 **No market clock.** Crypto trades continuously, so nothing here reads an
 equity session's open/closed state or gates on one.
 
-**No reconciliation.** C7 creates the durable anchors that crash recovery will
-need - the persisted intent, its `client_order_id`, and the broker snapshot -
-but resolves nothing. An `UNKNOWN` outcome is recorded and left alone, never
-retried. That is Phase 8 (docs/SPEC.md section 8).
+**No reconciliation here.** C7 creates the durable anchors crash recovery
+needs - the persisted intent, its `client_order_id`, and the broker snapshot -
+and resolves nothing. An `UNKNOWN` outcome is recorded and left alone, never
+retried. `autotrader.reconciliation` resolves it, reading the broker through
+this package's read-only helpers so the broker boundary stays one file
+(docs/SPEC.md section 8, C8).
 """
 
 from autotrader.execution.models import (
@@ -54,6 +56,7 @@ from autotrader.execution.models import (
 from autotrader.execution.paper import (
     CONFIRMATION_TOKEN,
     ORDER_TIME_IN_FORCE,
+    PAPER_TRADING_BASE_URL,
     PAPER_TRADING_ENABLED_ENV,
     PAPER_TRADING_ENABLED_VALUE,
     REFERENCE_PRICE_FEED,
@@ -67,6 +70,7 @@ from autotrader.execution.paper import (
     DuplicatePreflightUnavailableError,
     ExecutionOutcome,
     MissingCredentialsError,
+    NotPaperEnvironmentError,
     PaperAccountState,
     PaperExecutionResult,
     PaperPosition,
@@ -94,6 +98,7 @@ from autotrader.execution.paper import (
     resolve_daily_baseline_equity,
     submit_order_intent,
     to_wire_quantity,
+    verify_paper_environment,
 )
 
 __all__ = [
@@ -101,6 +106,7 @@ __all__ = [
     "CONFIRMATION_TOKEN",
     "MAX_CLIENT_ORDER_ID_LENGTH",
     "ORDER_TIME_IN_FORCE",
+    "PAPER_TRADING_BASE_URL",
     "PAPER_TRADING_ENABLED_ENV",
     "PAPER_TRADING_ENABLED_VALUE",
     "REFERENCE_PRICE_FEED",
@@ -117,6 +123,7 @@ __all__ = [
     "ExecutionInputError",
     "ExecutionOutcome",
     "MissingCredentialsError",
+    "NotPaperEnvironmentError",
     "OrderIntent",
     "OrderSide",
     "PaperAccountState",
@@ -152,4 +159,5 @@ __all__ = [
     "resolve_daily_baseline_equity",
     "submit_order_intent",
     "to_wire_quantity",
+    "verify_paper_environment",
 ]

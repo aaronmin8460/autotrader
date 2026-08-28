@@ -1,9 +1,10 @@
 # autotrader - Project Specification (v0.2)
 
-**Status:** Crypto Pivot V0.2 complete. The active system is crypto spot -
-BTC/USD and ETH/USD, 15-minute bars, 24/7 - and it can place an order only into
-Alpaca's paper environment. Next: Phase 8 reconciliation / crash recovery and
-Phase 9 24/7 runtime / monitoring, planned to be developed in parallel.
+**Status:** Crypto V0.2 through Phase 8 complete. The active system is crypto
+spot - BTC/USD and ETH/USD, 15-minute bars, 24/7 - it can place an order only
+into Alpaca's paper environment, and it can reconcile local state against that
+account after a crash. Next: Phase 9 24/7 runtime / monitoring, which is **not
+started** and is being developed independently.
 **Archived milestone:** Equity V0.1 is preserved at the Git tag
 `equity-v0.1-phase7`.
 **Last updated:** 2026-08-27
@@ -134,11 +135,11 @@ Phase 2  Data Validation                   <- done, migrated to crypto (C2)
 Phase 3  Strategy                          <- done, unchanged by the pivot (C3)
 Phase 4  Backtesting                       <- done, migrated to crypto (C4)
 Phase 5  Risk Engine                       <- done, migrated to crypto (C5)
-Phase 6  SQLite Operational State          <- done, schema v3 (C6)
+Phase 6  SQLite Operational State          <- done, schema v4 (C6 + C8)
 Phase 7  Alpaca Paper Trading              <- done, migrated to crypto (C7)
 --- Crypto Pivot V0.2 complete ---
-Phase 8  Reconciliation / Crash Recovery   <- next, in parallel with Phase 9
-Phase 9  24/7 Runtime / Monitoring         <- next, in parallel with Phase 8
+Phase 8  Reconciliation / Crash Recovery   <- done (C8)
+Phase 9  24/7 Runtime / Monitoring         <- next, not started
 Phase 10 Deployment
 ```
 
@@ -154,11 +155,12 @@ Phase 10 Deployment
     to a later phase.
   - Market data is **never committed**. The directories are tracked via
     `.gitkeep`; their contents are ignored.
-- **Operational trading state:** a local SQLite database at schema **v3**. It
+- **Operational trading state:** a local SQLite database at schema **v4**. It
   stores strategy runs, signals, risk events, system events, local position
-  snapshots, order intents, broker-order snapshots, and UTC-day risk baselines.
-  Fills, executions, and reconciliation records are **not** stored yet - they
-  belong to Phase 8. Database files are ignored by git.
+  snapshots, order intents, broker-order snapshots, UTC-day risk baselines, and
+  reconciliation runs and events. Fills and executions are **not** stored:
+  order-level `filled_quantity` is what reconciliation settles, and a
+  fill-level history has not been earned. Database files are ignored by git.
 - **Secrets:** environment variables loaded from a local `.env`, which is
   ignored by git. `.env.example` documents the variable names only and
   contains no values.
@@ -205,6 +207,12 @@ sent to the broker, and what the broker reported back.
 Every order needs a stable client-side idempotency key. On startup and after
 any crash, local state must be reconciled against the broker's authoritative
 state before new orders are placed.
+
+Reconciliation **observes and repairs; it never creates an order**. Resolving
+an ambiguous submission by sending a second one, or correcting a position
+difference by trading, is prohibited: recovery that places a trade is not
+recovery. The recovery anchor is always the existing `client_order_id`, and it
+is never regenerated.
 
 ### F. Backtesting must not use future information
 
@@ -683,7 +691,7 @@ trading client, persistence of any kind, changes to C4 accounting, stop losses,
 take profits, trailing stops, volatility or drawdown sizing, correlation
 limits, intraday rate limiting, reconciliation, monitoring, and deployment.
 
-### C6 - SQLite operational state, schema v3 (complete)
+### C6 - SQLite operational state, schema v4 (complete)
 
 The local operational-state store, `autotrader.state.sqlite`. It is
 **persistence infrastructure and nothing else**: it opens a database, creates a
@@ -712,7 +720,7 @@ are rejected**.
 parameter. No SQL is ever built by string interpolation, and a test asserts
 that at the source level.
 
-**Tables.** Exactly nine.
+**Tables.** Exactly eleven.
 
 | Table | Purpose | Invariants |
 | --- | --- | --- |
@@ -725,6 +733,8 @@ that at the source level.
 | `order_intents` | An order this system decided to place, written **before** the broker call | `client_order_id` UNIQUE; `requested_quantity > 0`; `0 < approved_quantity <= requested_quantity`; `reference_price > 0` |
 | `broker_orders` | Latest normalized broker snapshot | one per intent; `quantity > 0`; `filled_quantity >= 0`; `status` opaque text |
 | `daily_risk_baselines` | The UTC-day equity baseline | `risk_date_utc` PRIMARY KEY; `baseline_equity > 0`; `captured_at` |
+| `reconciliation_runs` | What one finished reconciliation pass concluded (v4) | `status` in `CLEAN`/`REPAIRED`/`UNRESOLVED`/`FAILED`; `safe_to_trade` in `(0, 1)`; counts `>= 0`; `completed_at >= started_at` |
+| `reconciliation_events` | Which order or position a pass repaired, observed, or could not settle (v4) | one run reference; `category` in `ORDER`/`POSITION`/`RUN`; `outcome` in the four statuses plus `OBSERVED`; `detail` non-empty |
 
 **Exact decimal quantities.** Every broker-critical quantity column -
 `positions.quantity`, `order_intents.requested_quantity`,
@@ -763,8 +773,8 @@ continuously, so a day whose first observation is at 14:00 UTC is measured from
 This is a **persistence primitive only**. Nothing here schedules anything,
 watches a clock, or decides when an observation should happen.
 
-**Schema migration (v1 -> v2 -> v3).** A new database is created directly at
-v3. An older one is upgraded through an explicit ordered path, in a single
+**Schema migration (v1 -> v2 -> v3 -> v4).** A new database is created directly
+at v4. An older one is upgraded through an explicit ordered path, in a single
 transaction; SQLite's DDL is transactional, so a failure anywhere rolls back to
 the original version rather than leaving a half-applied state.
 
@@ -787,15 +797,26 @@ unchanged. A stored quantity that is not an exact integer means the column
 holds something this module never wrote, and the migration fails closed rather
 than guessing.
 
+**v3 -> v4 uses the same rebuild machinery for a smaller reason.** Only
+`order_intents` is rebuilt, and only because SQLite cannot widen a CHECK
+constraint in place: the intent vocabulary gains `CONFIRMED_NOT_SUBMITTED`
+(section 9, C8). Every column is copied verbatim - nothing is converted, and no
+existing row can hold the new status, so no row changes meaning. The two
+reconciliation tables are created empty; backfilling an audit trail of passes
+that never ran would be a fabrication. The byte-identity assertion covers this
+path too, from v1, v2, and v3 alike.
+
 A database written by a **newer** version is refused and left untouched; one
 older than v1 has no path and is refused too.
 
 **No CLI.** There is no `db-init`, `db-shell`, or migration command.
 
-**Explicitly out of scope for C6:** fills, executions, broker accounts,
-reconciliation, crash recovery, trading loops or schedulers, a migration
-framework, connection pooling, an ORM, a database CLI, backup and restore
-tooling, and database repair.
+**Explicitly out of scope for C6:** fills, executions, broker accounts, trading
+loops or schedulers, a migration framework, connection pooling, an ORM, a
+database CLI, backup and restore tooling, and database repair. Reconciliation
+*records* live here as of v4, but nothing in this module performs one: it
+stores the conclusion `autotrader.reconciliation` reached and interprets none
+of it.
 
 ### C7 - Alpaca paper crypto execution (complete)
 
@@ -953,26 +974,175 @@ against real response shapes, no real credential is read, and sockets are
 asserted shut. Source-level tests scan *executable* code with docstrings and
 comments stripped.
 
-**Explicitly out of scope for C7:** live trading in any form; startup or
-crash-recovery reconciliation; open-order synchronization; fill-history
-reconciliation; position repair; automatic `UNKNOWN` resolution; retry or
-backoff on submission; streaming or websockets; order replacement or
-cancellation as part of the execution path; multi-broker abstraction; notional,
-limit, stop, bracket, or OCO orders; a scheduler or 24/7 loop; a monitoring
-surface; a frontend; and deployment.
+**Explicitly out of scope for C7:** live trading in any form; reconciliation
+and crash recovery, which are C8's; retry or backoff on submission; streaming
+or websockets; order replacement or cancellation as part of the execution path;
+multi-broker abstraction; notional, limit, stop, bracket, or OCO orders; a
+scheduler or 24/7 loop; a monitoring surface; a frontend; and deployment.
+
+### C8 - Reconciliation and crash recovery (complete)
+
+`autotrader.reconciliation` makes local SQLite state reflect **verified broker
+truth** after a process crash, a restart, a submission whose outcome was never
+knowable, a lost broker response, a stale local snapshot, a fill that landed
+after the local process died, or a cancellation that arrived after the snapshot
+was written.
+
+**Authority hierarchy.** The broker is truth for orders, fills, and positions.
+Local SQLite is durable intent, an audit trail, and a last-known snapshot.
+Where they disagree, the snapshot is rewritten from the broker - never the
+reverse.
+
+**Reconciliation never creates an order.** It may read broker state, look up
+orders that already exist, update local snapshots, repair local status, update
+observed positions, and classify what it cannot settle. It may **not**
+automatically resubmit an `UNKNOWN` intent, mint a new `client_order_id` for an
+existing intent, retry a submission, create a replacement order, or trade to
+correct a mismatch. The package imports nothing that could place an order, and
+source-level tests assert each forbidden identifier is absent from its
+executable code with docstrings and comments stripped.
+
+**Public API.** One function and one result:
+
+```python
+result = reconcile_paper_state(connection, dry_run=False)
+result.safe_to_trade
+```
+
+`ReconciliationResult` carries `status`, `safe_to_trade`, `issues`,
+`orders_checked`, `positions_checked`, `unresolved_count`, `repaired_count`,
+`started_at`, `completed_at`, and the `reconciliation_run_id` it recorded.
+There is no multi-broker framework: there is one broker, Alpaca paper.
+
+**Status vocabulary and the startup contract.**
+
+| Status | Meaning | `safe_to_trade` |
+| --- | --- | --- |
+| `CLEAN` | Local and broker state already agreed | true |
+| `REPAIRED` | Differences were resolved from verified broker truth | true |
+| `UNRESOLVED` | The pass ran; ambiguity remains | false |
+| `FAILED` | The pass could not complete | false |
+
+`safe_to_trade` is **derived** from `status`, not stored alongside it, so a
+result claiming `UNRESOLVED` and "safe" cannot be constructed. A pass that
+never finished returns no result at all, which is not permission.
+
+**Paper environment verification, first.** Before any local write, the trading
+client must be *provably* pointed at Alpaca paper: its base URL must be the
+paper host and the SDK's sandbox flag must be set. An attribute that is
+missing, of an unexpected type, or pointing elsewhere **fails closed**. There
+is no benefit of the doubt, and no live path.
+
+**`UNKNOWN` recovery.** The anchor is the persisted `client_order_id`,
+generated once and never regenerated.
+
+| The broker's answer | Outcome |
+| --- | --- |
+| It has that order | The snapshot is normalized and persisted; the intent becomes `SUBMITTED`. **Nothing is submitted.** |
+| It definitively has no such order | A **bounded** confirmation follows: the read is repeated a small fixed number of times with a short pause, and every read must agree. If they do, the intent becomes `CONFIRMED_NOT_SUBMITTED` - terminal. |
+| Ambiguous, timed out, 5xx, or unreadable | The intent is left exactly as it was; the pass is `UNRESOLVED`. |
+
+A single not-found is never sufficient: a lookup that overtook a submission
+still in flight would answer "no" about an order that exists. The confirmation
+is bounded - a fixed count, a fixed pause, no growing backoff and no loop that
+waits for the answer it wants.
+
+`CONFIRMED_NOT_SUBMITTED` means the stale historical intent will not be
+submitted later. The strategy and a future runtime react to new bars normally;
+the pre-crash signal is not re-sent.
+
+**`CREATED` and `SUBMITTING` crash residue.** A `CREATED` intent with no broker
+evidence is **never** automatically submitted. Reconciliation establishes
+whether broker evidence exists and, if the broker definitively has none, marks
+it `CONFIRMED_NOT_SUBMITTED`. A `SUBMITTING` intent - a process that died
+mid-call - is treated as ambiguous and handled identically to `UNKNOWN`.
+
+**Order snapshot repair.** For an intent whose local state says `SUBMITTED`,
+`accepted`, `new`, `pending`, or `partially_filled`, current broker truth is
+read and the local snapshot updated: `accepted` -> `filled`, `accepted` ->
+`canceled`, `accepted` -> `rejected`, and so on. Only observed broker truth is
+persisted; no transition is fabricated. The reconciled fields are the broker
+order id, client order id, symbol, side, quantity, filled quantity, filled
+average price when known, status, submitted time, and filled time. The broker's
+own `updated_at` is carried into the audit detail rather than into
+`broker_orders.updated_at`, which already means "when this snapshot was
+refreshed" - one column, one clock.
+
+An order returned under this key that names a different `client_order_id`,
+market, or side is not evidence about this intent: it is reported and nothing
+is written. A broker order already recorded locally which the broker now denies
+leaves the stored snapshot untouched and blocks trading; recorded evidence is
+not deleted because a later read disagreed with it.
+
+**Partial fills stay partial.** 0.0004 filled of 0.001 ordered is stored as
+exactly that and never becomes a full fill. A `partially_filled` order is
+re-read on the next pass, because it can still fill. The remainder is never
+automatically canceled or replaced. A missing fill price is not invented, and
+no fill is derived from a submitted quantity.
+
+**Positions come only from the broker.** BTC/USD and ETH/USD are reconciled
+independently. A broker position that local state lacks is written in; a local
+position the broker no longer holds goes to zero. Quantities are exact
+`Decimal` values, normalized from the broker's strings and stored through the
+existing decimal serialization - no float ever holds an authoritative position
+quantity. A current position is **never** derived from `order_intents`,
+`SUBMITTED` is never read as "a position exists", and no short local position
+can be written. A broker position outside the traded universe is recorded as an
+observation, not reconciled, and never traded out of. Mismatches produce audit
+evidence; no offsetting order is placed.
+
+**Broker read failure fails closed.** A client that cannot be proven to be
+paper, an authentication failure, an unreadable account, a position-list
+failure, a short position at the broker, or an inability to write the audit
+record each make the whole pass `FAILED`. An order lookup that times out or a
+malformed broker order makes that item `UNRESOLVED` while the rest of the pass
+completes - a runtime is better served by every problem than by the first one.
+No pass reports green on truth it could not read.
+
+**Audit.** Every finished pass writes one `reconciliation_runs` row and a
+`reconciliation_events` row per repaired, observed, or unresolved item, in a
+single transaction, plus a summary in `system_events`. Clean items write no
+event: an audit table where most rows say "no change" stops being readable.
+Repairs commit as they are made and the audit record commits at the end, so a
+crash mid-pass leaves durable repairs and no run row - work was done, nothing
+was concluded - and the next pass reconciles again. No secret is ever written.
+
+**Idempotency.** Running reconciliation twice costs a second look and changes
+nothing; a second pass after a repair reports `CLEAN`. An intent in a terminal
+state, and a broker order in a terminal broker status, are not re-queried.
+
+**Precondition.** This is a startup and after-the-fact operation. It must not
+run while a submission is in flight in another process, which nothing in this
+repository does.
+
+**CLI.** `autotrader reconcile`, with `--db` and `--dry-run`. It may modify
+local SQLite; it can never submit an order, which is why it needs neither the
+environment gate nor a confirmation token. `--dry-run` reports identical
+findings and reconciles nothing into the database; opening the database still
+applies any pending schema migration, as every command does, which is a
+structural upgrade rather than a reconciliation result. Exit codes: `0` for
+`CLEAN` or `REPAIRED`, `1` for `FAILED`, `2` for `UNRESOLVED`. Operational
+failures print a message, never a traceback.
+
+**Explicitly out of scope for C8:** order replacement or cancellation, fill- or
+execution-level history, automatic retry or resubmission of anything, a
+multi-broker abstraction, live trading, and every part of Phase 9 - the
+continuous loop, the scheduler, completed-bar polling, heartbeats, monitoring,
+and deployment.
 
 ### Later phases
-
-**Phase 8 - Reconciliation / Crash Recovery.** It owns: resolving `UNKNOWN`
-intents against the broker by `client_order_id`, startup broker-vs-local
-reconciliation, open-order synchronization, fill history, position repair, and
-the local order state machine. C7 deliberately built only the durable anchors
-it will need.
 
 **Phase 9 - 24/7 Runtime / Monitoring.** It owns: the continuous loop, wake-up
 scheduling on completed 15-minute bars, bar-freshness checks, heartbeat and
 alerting, and the process supervision that makes the first equity observation
-of a UTC day land near the boundary. The pivot made every contract 24/7-*safe*;
-nothing in the current system loops, schedules, or polls.
+of a UTC day land near the boundary. The pivot made every contract 24/7-*safe*
+and C8 supplies the startup gate; nothing in the current system loops,
+schedules, or polls.
 
-These two are planned to be developed in parallel. Neither has started.
+**Phase 9 has not started, and nothing here implements any part of it.** The
+integration boundary between C8 and Phase 9 is deliberately one sentence:
+
+> A runtime may begin trading only when a reconciliation result reports
+> `safe_to_trade` true.
+
+Phase 9 is being developed independently and is **not** complete.

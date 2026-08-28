@@ -1012,20 +1012,30 @@ def test_backtest_imports_no_broker_client() -> None:
 
 
 def test_the_order_api_exists_only_inside_the_paper_execution_boundary() -> None:
-    """The broker vocabulary is pinned to the one place it may live.
+    """The broker vocabulary is pinned to the places it may live.
 
     If it ever leaks into a strategy, the backtester, the risk engine, or the
     state layer, that is a violation of docs/SPEC.md section 6A and this fails.
+
+    Reconciliation is the one qualified exception, and only halfway: it is
+    *handed* a trading client and only reads through it, so it may name that
+    type, and a companion test pins client construction to `execution/paper.py`
+    regardless. It may never name anything that submits - the tokens below stay
+    forbidden there, which is what makes "crash recovery cannot place an order"
+    checkable rather than merely asserted.
     """
-    forbidden = ("TradingClient", "submit_order", "OrderRequest", "MarketOrderRequest")
+    submitting = ("submit_order", "OrderRequest", "MarketOrderRequest")
+    forbidden = ("TradingClient", *submitting)
     source_root = Path(engine.__file__).resolve().parents[1]
     allowed = {source_root / "execution", source_root / "cli"}
+    reads_only = {source_root / "reconciliation"}
 
     for path in sorted(source_root.rglob("*.py")):
         if any(parent in allowed for parent in path.parents):
             continue
+        tokens = submitting if any(parent in reads_only for parent in path.parents) else forbidden
         text = path.read_text()
-        for token in forbidden:
+        for token in tokens:
             assert token not in text, f"{token} found outside the execution boundary: {path}"
 
 

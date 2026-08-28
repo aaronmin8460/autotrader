@@ -1,16 +1,18 @@
-"""C6 schema tests: the v1 -> v2 -> v3 migration path and the order tables.
+"""C6/C8 schema tests: the v1 -> v2 -> v3 -> v4 migration path and the order tables.
 
 Every test is offline and writes only into pytest's temporary directory. No
 credential is read and no socket is opened - this is the persistence layer,
 which has never talked to a broker and still does not.
 
-The migration is the risky part of the pivot: it runs against a database that
-may already hold real operational history, and unlike the earlier additive step
-v3 has to *rebuild* three tables to widen their quantity columns from whole
-integers to exact decimal text. These tests exist to prove that rebuild is
+The migration is the risky part of any schema change: it runs against a
+database that may already hold real operational history. v3 had to *rebuild*
+three tables to widen their quantity columns from whole integers to exact
+decimal text; v4 rebuilds `order_intents` again, this time only to widen a
+CHECK constraint so reconciliation can record that the broker definitively
+never received an order. These tests exist to prove each rebuild is
 transactional, idempotent, schema-identical to a fresh database, and that it
 carries every existing row across unchanged - an integer `100` becoming the
-decimal `"100"`, and nothing else moving.
+decimal `"100"` in v3, and nothing at all moving in v4.
 """
 
 from __future__ import annotations
@@ -24,11 +26,13 @@ import pytest
 
 from autotrader.state import sqlite as state
 from autotrader.state.sqlite import (
+    INTENT_STATUS_CONFIRMED_NOT_SUBMITTED,
     MIN_MIGRATABLE_SCHEMA_VERSION,
     REQUIRED_TABLES,
     SCHEMA_VERSION,
     V2_TABLES,
     V3_TABLES,
+    V4_TABLES,
     DatabaseStateError,
     DuplicateBrokerOrderError,
     DuplicateOrderIntentError,
@@ -50,10 +54,14 @@ from autotrader.state.sqlite import (
     list_broker_orders,
     list_daily_risk_baselines,
     list_order_intents,
+    list_reconciliation_events,
+    list_reconciliation_runs,
     list_risk_events,
     list_signals,
     list_strategy_runs,
     record_order_intent,
+    record_reconciliation_event,
+    record_reconciliation_run,
     record_risk_event,
     record_signal,
     record_strategy_run,
@@ -191,9 +199,41 @@ def v1_database(tmp_path: Path) -> Path:
     return build_v1_database(tmp_path / "v1.db")
 
 
+def build_v3_database(path: Path) -> Path:
+    """Create a database exactly as the v3 (crypto pivot) release would have left it.
+
+    Built from the module's own retained v3 `order_intents` literal, so this is
+    the real historical shape - narrower status vocabulary included - rather
+    than a hand-copied approximation of it.
+    """
+    with connect(path) as connection, transaction(connection):
+        for statement in (
+            state._CREATE_SCHEMA_METADATA,
+            state._CREATE_STRATEGY_RUNS,
+            state._CREATE_SIGNALS,
+            state._CREATE_RISK_EVENTS,
+            state._CREATE_SYSTEM_EVENTS,
+            state._CREATE_POSITIONS,
+            state._CREATE_ORDER_INTENTS_V3,
+            state._CREATE_BROKER_ORDERS,
+            state._CREATE_DAILY_RISK_BASELINES,
+            state._CREATE_INDEX_SIGNALS,
+            state._CREATE_INDEX_RISK_EVENTS,
+            state._CREATE_INDEX_ORDER_INTENTS_STATUS,
+        ):
+            connection.execute(statement)
+        connection.execute(state._INSERT_SCHEMA_VERSION, (3, "2025-01-02T00:00:00.000000+00:00"))
+    return path
+
+
 @pytest.fixture
 def v2_database(tmp_path: Path) -> Path:
     return build_v2_database(tmp_path / "v2.db")
+
+
+@pytest.fixture
+def v3_database(tmp_path: Path) -> Path:
+    return build_v3_database(tmp_path / "v3.db")
 
 
 @pytest.fixture
@@ -241,12 +281,13 @@ def schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]]
 # --------------------------------------------------------------------------
 
 
-def test_a_new_database_initializes_directly_at_version_three(database_path: Path) -> None:
+def test_a_new_database_initializes_directly_at_the_current_version(database_path: Path) -> None:
     """A fresh database is never created at an older version and then upgraded."""
     with connect(database_path) as connection:
-        assert get_schema_version(connection) == SCHEMA_VERSION == 3
+        assert get_schema_version(connection) == SCHEMA_VERSION == 4
         assert set(REQUIRED_TABLES) <= table_names(connection)
         assert set(V3_TABLES) <= table_names(connection)
+        assert set(V4_TABLES) <= table_names(connection)
 
 
 def test_a_version_one_database_migrates_all_the_way_to_three(v1_database: Path) -> None:
@@ -274,7 +315,7 @@ def test_a_version_two_database_migrates_to_three(v2_database: Path) -> None:
         assert set(V3_TABLES) <= table_names(connection)
 
 
-@pytest.mark.parametrize("builder", [build_v1_database, build_v2_database])
+@pytest.mark.parametrize("builder", [build_v1_database, build_v2_database, build_v3_database])
 def test_a_migrated_schema_is_identical_to_a_freshly_created_one(tmp_path: Path, builder) -> None:
     """ "Migrated to v3" and "created as v3" must be the same database.
 
@@ -444,7 +485,7 @@ def test_the_daily_risk_baseline_table_arrives_with_v3(v2_database: Path) -> Non
         assert stored is not None and stored.baseline_equity == Decimal("100000")
 
 
-@pytest.mark.parametrize("builder", [build_v1_database, build_v2_database])
+@pytest.mark.parametrize("builder", [build_v1_database, build_v2_database, build_v3_database])
 def test_migration_is_idempotent(tmp_path: Path, builder) -> None:
     legacy = builder(tmp_path / "legacy.db")
     populate_v1_data(legacy)
@@ -643,14 +684,447 @@ def test_the_migration_rebuilds_only_the_tables_that_hold_quantities(
 
 
 # --------------------------------------------------------------------------
+# v3 -> v4: the reconciliation schema
+# --------------------------------------------------------------------------
+
+
+def test_a_version_three_database_migrates_to_four(v3_database: Path) -> None:
+    with connect(v3_database) as connection:
+        assert get_schema_version(connection) == 3
+        assert not set(V4_TABLES) & table_names(connection)
+
+    initialize_database(v3_database)
+
+    with connect(v3_database) as connection:
+        assert get_schema_version(connection) == SCHEMA_VERSION == 4
+        assert set(V4_TABLES) <= table_names(connection)
+
+
+def test_the_v4_migration_carries_every_intent_across_unchanged(v3_database: Path) -> None:
+    """Nothing in an intent changes. Only one more status becomes storable."""
+    with connect(v3_database) as connection:
+        record_order_intent(
+            connection,
+            client_order_id="autotrader-v3-1",
+            created_at=T0,
+            symbol="ETH/USD",
+            side="BUY",
+            requested_quantity=Decimal("0.50000"),
+            approved_quantity=Decimal("0.25"),
+            reference_price=3_000.0,
+            risk_reason_code="POSITION_LIMIT",
+            status="UNKNOWN",
+        )
+        before = list_order_intents(connection)
+
+    initialize_database(v3_database)
+
+    with connect(v3_database) as connection:
+        assert list_order_intents(connection) == before
+
+
+def test_a_v3_intent_status_that_v4_adds_was_previously_unstorable(
+    v3_database: Path,
+) -> None:
+    """The rebuild is not cosmetic: the old CHECK constraint really did refuse it."""
+    with (
+        connect(v3_database) as connection,
+        pytest.raises(sqlite3.IntegrityError),
+        transaction(connection),
+    ):
+        connection.execute(
+            "INSERT INTO order_intents (client_order_id, created_at, symbol, side, "
+            "requested_quantity, approved_quantity, reference_price, risk_reason_code, "
+            "status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "autotrader-v3-blocked",
+                state.to_utc_text(T0),
+                "BTC/USD",
+                "BUY",
+                "0.001",
+                "0.001",
+                100_000.0,
+                "APPROVED",
+                INTENT_STATUS_CONFIRMED_NOT_SUBMITTED,
+                state.to_utc_text(T0),
+            ),
+        )
+
+
+def test_the_new_intent_status_is_storable_after_the_migration(v3_database: Path) -> None:
+    initialize_database(v3_database)
+
+    with connect(v3_database) as connection:
+        intent = record_order_intent(
+            connection,
+            client_order_id="autotrader-v4-1",
+            created_at=T0,
+            symbol="BTC/USD",
+            side="BUY",
+            requested_quantity=Decimal("0.001"),
+            approved_quantity=Decimal("0.001"),
+            reference_price=100_000.0,
+            risk_reason_code="APPROVED",
+            status=INTENT_STATUS_CONFIRMED_NOT_SUBMITTED,
+        )
+        stored = get_order_intent(connection, intent)
+
+    assert stored is not None
+    assert stored.status == INTENT_STATUS_CONFIRMED_NOT_SUBMITTED
+
+
+def test_the_v4_migration_leaves_a_decimal_quantity_exact(v3_database: Path) -> None:
+    with connect(v3_database) as connection:
+        upsert_position(
+            connection, symbol="BTC/USD", quantity=Decimal("0.000123456789"), updated_at=T0
+        )
+
+    initialize_database(v3_database)
+
+    with connect(v3_database) as connection:
+        position = get_position(connection, "BTC/USD")
+    assert position is not None
+    assert position.quantity == Decimal("0.000123456789")
+    assert str(position.quantity) == "0.000123456789"
+
+
+def test_the_v4_migration_rebuilds_only_order_intents(v3_database: Path) -> None:
+    """A rebuild is a real cost, spent only where widening a CHECK requires it."""
+    with connect(v3_database) as connection:
+        before = {name: sql for _type, name, sql in schema_objects(connection)}
+
+    initialize_database(v3_database)
+
+    with connect(v3_database) as connection:
+        after = {name: sql for _type, name, sql in schema_objects(connection)}
+
+    untouched = {name: sql for name, sql in before.items() if name != "order_intents"}
+    assert untouched.items() <= after.items()
+    assert after["order_intents"] != before["order_intents"]
+    assert INTENT_STATUS_CONFIRMED_NOT_SUBMITTED in after["order_intents"]
+    assert set(V4_TABLES) <= set(after)
+
+
+def test_a_failed_v3_to_v4_migration_rolls_back_completely(v3_database: Path) -> None:
+    """A half-upgraded database is worse than an un-upgraded one."""
+    with connect(v3_database) as connection, transaction(connection):
+        connection.execute("CREATE TABLE reconciliation_runs (id INTEGER PRIMARY KEY)")
+
+    with pytest.raises(DatabaseStateError):
+        initialize_database(v3_database)
+
+    with connect(v3_database) as connection:
+        assert get_schema_version(connection) == 3
+        assert not set(state._PRE_V4_TABLES) & table_names(connection)
+        assert "order_intents" in table_names(connection)
+        assert "reconciliation_events" not in table_names(connection)
+
+
+def test_foreign_keys_and_wal_survive_the_v4_migration(v3_database: Path) -> None:
+    initialize_database(v3_database)
+
+    with connect(v3_database) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_a_broker_order_still_references_its_intent_after_the_v4_rebuild(
+    v3_database: Path,
+) -> None:
+    """`order_intents` is renamed aside and recreated; the reference must follow."""
+    with connect(v3_database) as connection:
+        intent = record_order_intent(
+            connection,
+            client_order_id="autotrader-v3-fk",
+            created_at=T0,
+            symbol="BTC/USD",
+            side="BUY",
+            requested_quantity=Decimal("0.001"),
+            approved_quantity=Decimal("0.001"),
+            reference_price=100_000.0,
+            risk_reason_code="APPROVED",
+            status="SUBMITTED",
+        )
+        upsert_broker_order(
+            connection,
+            order_intent_id=intent,
+            broker_order_id="broker-v3-fk",
+            client_order_id="autotrader-v3-fk",
+            symbol="BTC/USD",
+            side="BUY",
+            quantity=Decimal("0.001"),
+            status="accepted",
+            updated_at=T0,
+        )
+
+    initialize_database(v3_database)
+
+    with connect(v3_database) as connection:
+        stored = get_broker_order_by_intent(connection, intent)
+        assert stored is not None and stored.broker_order_id == "broker-v3-fk"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        with pytest.raises(sqlite3.IntegrityError), transaction(connection):
+            connection.execute(
+                "INSERT INTO broker_orders (order_intent_id, broker_order_id, "
+                "client_order_id, symbol, side, quantity, filled_quantity, status, "
+                "updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    9_999,
+                    "broker-orphan",
+                    "autotrader-orphan",
+                    "BTC/USD",
+                    "BUY",
+                    "0.001",
+                    "0",
+                    "accepted",
+                    state.to_utc_text(T0),
+                    state.to_utc_text(T0),
+                ),
+            )
+
+
+def test_the_migration_backfills_no_reconciliation_history(v3_database: Path) -> None:
+    """An invented audit trail would be worse than an empty one."""
+    initialize_database(v3_database)
+
+    with connect(v3_database) as connection:
+        assert list_reconciliation_runs(connection) == []
+        assert list_reconciliation_events(connection) == []
+
+
+# --------------------------------------------------------------------------
+# reconciliation_runs and reconciliation_events
+# --------------------------------------------------------------------------
+
+
+def record_clean_run(connection: sqlite3.Connection, **overrides: object) -> int:
+    fields: dict[str, object] = {
+        "started_at": T0,
+        "completed_at": T0 + timedelta(seconds=2),
+        "status": "CLEAN",
+        "safe_to_trade": True,
+        "orders_checked": 1,
+        "positions_checked": 2,
+        "issues_count": 0,
+        "unresolved_count": 0,
+    }
+    fields.update(overrides)
+    return record_reconciliation_run(connection, **fields)  # type: ignore[arg-type]
+
+
+def test_a_reconciliation_run_round_trips(connection: sqlite3.Connection) -> None:
+    run_id = record_clean_run(connection, status="REPAIRED", issues_count=3)
+
+    stored = list_reconciliation_runs(connection)
+    assert len(stored) == 1
+    assert stored[0].id == run_id
+    assert stored[0].status == "REPAIRED"
+    assert stored[0].safe_to_trade is True
+    assert stored[0].orders_checked == 1
+    assert stored[0].positions_checked == 2
+    assert stored[0].issues_count == 3
+    assert stored[0].started_at == T0
+    assert stored[0].completed_at == T0 + timedelta(seconds=2)
+
+
+def test_the_latest_run_is_the_most_recent_one(connection: sqlite3.Connection) -> None:
+    record_clean_run(connection)
+    second = record_clean_run(connection, status="REPAIRED")
+
+    latest = state.latest_reconciliation_run(connection)
+    assert latest is not None and latest.id == second
+
+
+def test_no_run_at_all_is_not_permission_to_trade(connection: sqlite3.Connection) -> None:
+    assert state.latest_reconciliation_run(connection) is None
+
+
+@pytest.mark.parametrize("status", ["CLEAN", "REPAIRED", "UNRESOLVED", "FAILED"])
+def test_every_reconciliation_status_is_storable(
+    connection: sqlite3.Connection, status: str
+) -> None:
+    assert record_clean_run(
+        connection, status=status, safe_to_trade=status in {"CLEAN", "REPAIRED"}
+    )
+
+
+def test_an_unknown_reconciliation_status_is_rejected(connection: sqlite3.Connection) -> None:
+    with pytest.raises(StateInputError):
+        record_clean_run(connection, status="PROBABLY_FINE")
+
+
+def test_the_database_itself_rejects_an_unknown_status(connection: sqlite3.Connection) -> None:
+    """The CHECK constraint holds even for a writer that bypassed this module."""
+    with pytest.raises(sqlite3.IntegrityError), transaction(connection):
+        connection.execute(
+            "INSERT INTO reconciliation_runs (started_at, completed_at, status, "
+            "safe_to_trade, orders_checked, positions_checked, issues_count, "
+            "unresolved_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                state.to_utc_text(T0),
+                state.to_utc_text(T0),
+                "PROBABLY_FINE",
+                1,
+                0,
+                0,
+                0,
+                0,
+                state.to_utc_text(T0),
+            ),
+        )
+
+
+def test_safe_to_trade_can_only_be_zero_or_one(connection: sqlite3.Connection) -> None:
+    """The one field a runtime consults cannot hold an unreadable third value."""
+    with pytest.raises(sqlite3.IntegrityError), transaction(connection):
+        connection.execute(
+            "INSERT INTO reconciliation_runs (started_at, completed_at, status, "
+            "safe_to_trade, orders_checked, positions_checked, issues_count, "
+            "unresolved_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                state.to_utc_text(T0),
+                state.to_utc_text(T0),
+                "CLEAN",
+                2,
+                0,
+                0,
+                0,
+                0,
+                state.to_utc_text(T0),
+            ),
+        )
+
+
+def test_a_run_that_finished_before_it_began_is_refused(
+    connection: sqlite3.Connection,
+) -> None:
+    with pytest.raises(StateInputError):
+        record_clean_run(connection, completed_at=T0 - timedelta(seconds=1))
+
+
+def test_more_unresolved_items_than_issues_is_refused(connection: sqlite3.Connection) -> None:
+    """Every unresolved item is an issue, so it can never be the larger number."""
+    with pytest.raises(StateInputError):
+        record_clean_run(connection, issues_count=1, unresolved_count=2)
+
+
+def test_a_negative_count_is_refused(connection: sqlite3.Connection) -> None:
+    with pytest.raises(StateInputError):
+        record_clean_run(connection, orders_checked=-1)
+
+
+def test_a_non_boolean_safe_to_trade_is_refused(connection: sqlite3.Connection) -> None:
+    with pytest.raises(StateInputError):
+        record_clean_run(connection, safe_to_trade=1)
+
+
+def test_a_reconciliation_event_round_trips(connection: sqlite3.Connection) -> None:
+    run_id = record_clean_run(connection, status="REPAIRED", issues_count=1)
+
+    record_reconciliation_event(
+        connection,
+        reconciliation_run_id=run_id,
+        event_timestamp=T0,
+        category="ORDER",
+        outcome="REPAIRED",
+        symbol="BTC/USD",
+        client_order_id="autotrader-1",
+        detail="repaired from broker truth",
+    )
+
+    events = list_reconciliation_events(connection, run_id)
+    assert len(events) == 1
+    assert events[0].category == "ORDER"
+    assert events[0].outcome == "REPAIRED"
+    assert events[0].symbol == "BTC/USD"
+    assert events[0].client_order_id == "autotrader-1"
+    assert events[0].detail == "repaired from broker truth"
+
+
+def test_an_event_needs_a_real_run(connection: sqlite3.Connection) -> None:
+    with pytest.raises(state.UnknownReconciliationRunError):
+        record_reconciliation_event(
+            connection,
+            reconciliation_run_id=9_999,
+            event_timestamp=T0,
+            category="RUN",
+            outcome="FAILED",
+            detail="orphan",
+        )
+
+
+def test_an_event_that_says_nothing_is_refused(connection: sqlite3.Connection) -> None:
+    run_id = record_clean_run(connection)
+
+    with pytest.raises(StateInputError):
+        record_reconciliation_event(
+            connection,
+            reconciliation_run_id=run_id,
+            event_timestamp=T0,
+            category="RUN",
+            outcome="CLEAN",
+            detail="   ",
+        )
+
+
+@pytest.mark.parametrize("category", ["ORDER", "POSITION", "RUN"])
+def test_every_event_category_is_storable(connection: sqlite3.Connection, category: str) -> None:
+    run_id = record_clean_run(connection)
+
+    assert record_reconciliation_event(
+        connection,
+        reconciliation_run_id=run_id,
+        event_timestamp=T0,
+        category=category,
+        outcome="OBSERVED",
+        detail="something happened",
+    )
+
+
+def test_an_unknown_event_category_is_rejected(connection: sqlite3.Connection) -> None:
+    run_id = record_clean_run(connection)
+
+    with pytest.raises(StateInputError):
+        record_reconciliation_event(
+            connection,
+            reconciliation_run_id=run_id,
+            event_timestamp=T0,
+            category="VIBES",
+            outcome="OBSERVED",
+            detail="something happened",
+        )
+
+
+def test_events_can_be_listed_for_one_run_only(connection: sqlite3.Connection) -> None:
+    first = record_clean_run(connection, status="REPAIRED", issues_count=1)
+    second = record_clean_run(connection, status="REPAIRED", issues_count=1)
+    for run_id, detail in ((first, "first"), (second, "second")):
+        record_reconciliation_event(
+            connection,
+            reconciliation_run_id=run_id,
+            event_timestamp=T0,
+            category="RUN",
+            outcome="OBSERVED",
+            detail=detail,
+        )
+
+    assert [event.detail for event in list_reconciliation_events(connection, second)] == ["second"]
+    assert len(list_reconciliation_events(connection)) == 2
+
+
+# --------------------------------------------------------------------------
 # Tables Phase 8 owns must still not exist
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "forbidden", ["fills", "executions", "broker_accounts", "reconciliation_runs"]
-)
-def test_no_reconciliation_table_exists(connection: sqlite3.Connection, forbidden: str) -> None:
+@pytest.mark.parametrize("forbidden", ["fills", "executions", "broker_accounts"])
+def test_no_unearned_broker_table_exists(connection: sqlite3.Connection, forbidden: str) -> None:
+    """Reconciliation arrived in v4; a fill-level history still has not.
+
+    Order-level `filled_quantity` is what reconciliation actually settles, so
+    these shapes would be guessed at rather than needed.
+    """
     assert forbidden not in table_names(connection)
 
 

@@ -2,18 +2,23 @@
 
 The commands are application metadata, a historical crypto market-data
 download, read-only validation of an already-downloaded dataset, a local
-backtest of the EMA crossover strategy over a stored dataset, and a single,
-deliberately awkward **paper** order submission.
+backtest of the EMA crossover strategy over a stored dataset, a single,
+deliberately awkward **paper** order submission, and a crash-recovery
+reconciliation of local state against the paper broker.
 
 Everything here is crypto spot: BTC/USD and ETH/USD, 15-minute bars, UTC
 dates, 24/7. There is no asset-class selector and no equity command; the
 completed equity milestone is archived at the Git tag `equity-v0.1-phase7`.
 
-`paper-submit` is the only command that can reach a broker, and it can only
-ever reach Alpaca **paper**. It requires an environment gate and an explicit
+`paper-submit` is the only command that can **submit** an order, and it can
+only ever reach Alpaca paper. It requires an environment gate and an explicit
 confirmation token, both closed by default, and there is no `--live` option,
 no `--paper` option, and no way to ask for anything but paper (docs/SPEC.md
 section 8, C7).
+
+`reconcile` also reaches the broker, but only to read it. It may rewrite local
+SQLite state from what the broker reports; it can never place an order, and it
+needs neither gate for that reason (docs/SPEC.md section 8, C8).
 """
 
 from datetime import UTC, datetime
@@ -51,6 +56,13 @@ from autotrader.execution.paper import (
     ExecutionOutcome,
     PaperExecutionResult,
 )
+from autotrader.reconciliation import (
+    ItemOutcome,
+    ReconciliationError,
+    ReconciliationResult,
+    ReconciliationStatus,
+    reconcile_paper_state,
+)
 from autotrader.state.sqlite import DEFAULT_DATABASE_PATH, StateError, connect, initialize_database
 
 DEFAULT_OUTPUT_DIR = Path("data/raw")
@@ -76,6 +88,18 @@ BACKTEST_INPUT_EXIT_CODE = 1
 PAPER_SUBMIT_REFUSED_EXIT_CODE = 1
 PAPER_SUBMIT_UNKNOWN_EXIT_CODE = 2
 
+#: `reconcile` exit codes, deliberately mirroring `paper-submit`.
+#:
+#: 0  CLEAN or REPAIRED - local state matches verified broker truth, and a
+#:    runtime may start trading.
+#: 1  FAILED - the pass could not complete, so nothing is known. An operational
+#:    failure, reported as a message rather than a traceback.
+#: 2  UNRESOLVED - the pass completed and something remains ambiguous, which is
+#:    the same situation `paper-submit` reports with 2: an order may exist at
+#:    the broker. Its own code so a script can never read it as a clean run.
+RECONCILE_FAILED_EXIT_CODE = 1
+RECONCILE_UNRESOLVED_EXIT_CODE = 2
+
 #: Width of the label column in the backtest report.
 _LABEL_WIDTH = 23
 
@@ -91,13 +115,15 @@ def cli() -> None:
     """Personal automated 24/7 crypto trading system.
 
     Historical crypto market data, dataset validation, EMA crossover signals,
-    local backtesting, a deterministic risk engine, local SQLite state, and
-    Alpaca **paper** order submission. Crypto spot only: BTC/USD and ETH/USD.
+    local backtesting, a deterministic risk engine, local SQLite state, Alpaca
+    **paper** order submission, and crash-recovery reconciliation. Crypto spot
+    only: BTC/USD and ETH/USD.
 
     There is no live trading. `paper-submit` talks to Alpaca's paper
     environment only, behind an environment gate and an explicit confirmation
     token; no command, flag, or environment variable can direct an order at a
-    real-money account.
+    real-money account. `reconcile` reads that same paper account and repairs
+    local state from it, and can never place an order.
     """
 
 
@@ -465,6 +491,128 @@ def paper_submit(
     typer.echo("")
     typer.echo("Accepted is not filled. Local positions are not updated from an")
     typer.echo("accepted order; reconciliation against the broker is a later phase.")
+
+
+_RECONCILE_EXIT_CODES = {
+    ReconciliationStatus.CLEAN: 0,
+    ReconciliationStatus.REPAIRED: 0,
+    ReconciliationStatus.UNRESOLVED: RECONCILE_UNRESOLVED_EXIT_CODE,
+    ReconciliationStatus.FAILED: RECONCILE_FAILED_EXIT_CODE,
+}
+
+_RECONCILE_STATUS_COLOURS = {
+    ReconciliationStatus.CLEAN: typer.colors.GREEN,
+    ReconciliationStatus.REPAIRED: typer.colors.GREEN,
+    ReconciliationStatus.UNRESOLVED: typer.colors.YELLOW,
+    ReconciliationStatus.FAILED: typer.colors.RED,
+}
+
+
+def _echo_reconcile_report(result: ReconciliationResult, *, dry_run: bool) -> None:
+    """Print what the pass found, grouped so the blocking items are last.
+
+    Contains no credential and no account number: every line is built from
+    symbols, quantities, statuses, and `client_order_id` values.
+    """
+    typer.echo("AUTO TRADER - PAPER RECONCILIATION")
+    typer.echo("")
+    typer.echo(_field("Environment", "PAPER ONLY"))
+    typer.echo(_field("Mode", "DRY RUN (read-only)" if dry_run else "REPAIR"))
+    typer.secho(
+        _field("Status", result.status.value),
+        fg=_RECONCILE_STATUS_COLOURS[result.status],
+    )
+    typer.secho(
+        _field("Safe To Trade", "YES" if result.safe_to_trade else "NO"),
+        fg=typer.colors.GREEN if result.safe_to_trade else typer.colors.RED,
+    )
+    typer.echo("")
+    typer.echo(_field("Orders Checked", str(result.orders_checked)))
+    typer.echo(_field("Positions Checked", str(result.positions_checked)))
+    typer.echo(_field("Repaired", str(result.repaired_count)))
+    typer.echo(_field("Unresolved", str(result.unresolved_count)))
+    if result.reconciliation_run_id is not None:
+        typer.echo(_field("Run ID", str(result.reconciliation_run_id)))
+
+    for heading, outcome in (
+        ("Repaired:", ItemOutcome.REPAIRED),
+        ("Observed:", ItemOutcome.OBSERVED),
+        ("Unresolved:", ItemOutcome.UNRESOLVED),
+        ("Failed:", ItemOutcome.FAILED),
+    ):
+        matching = [issue for issue in result.issues if issue.outcome is outcome]
+        if not matching:
+            continue
+        typer.echo("")
+        typer.echo(heading)
+        for issue in matching:
+            target = issue.symbol or issue.client_order_id or issue.category
+            typer.echo(f"- {target}: {issue.detail}")
+
+    typer.echo("")
+    if dry_run:
+        typer.echo("DRY RUN - nothing was written to the database.")
+    typer.echo("No order was submitted. Reconciliation never places a trade.")
+
+
+@app.command()
+def reconcile(
+    database: Annotated[
+        Path,
+        typer.Option("--db", help="Local operational-state database."),
+    ] = DEFAULT_DATABASE_PATH,
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report what would be repaired without writing anything.",
+    ),
+) -> None:
+    """Reconcile local state against the Alpaca **PAPER** broker after a crash.
+
+    The broker is the truth about orders, fills, and positions; the local
+    database is durable intent, an audit trail, and a last-known snapshot.
+    This command reads the broker and rewrites local rows to match it.
+
+    **It can never submit an order.** An `UNKNOWN` intent is resolved by asking
+    the broker about its existing `client_order_id`, never by sending a second
+    order; a stale intent the broker confirms it never received is closed off
+    rather than executed; and a position mismatch is corrected in the database,
+    never by trading. That is why this command needs neither the environment
+    gate nor a confirmation token: there is nothing here to confirm.
+
+    `--dry-run` reports exactly the same findings and reconciles nothing into
+    the database - no repair, no audit row. Run it first to see what a real
+    pass would change. It does still *open* the database, which applies any
+    pending schema migration, exactly as every other command here does; that is
+    a structural upgrade, not a reconciliation result.
+
+    Exits 0 when the result is CLEAN or REPAIRED, which is the answer a 24/7
+    runtime needs before it may start trading; 1 when the pass FAILED and
+    nothing is known; and 2 when it completed but something is UNRESOLVED -
+    meaning an order may exist at the broker and must be settled by hand.
+    """
+    try:
+        initialize_database(database)
+    except StateError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=RECONCILE_FAILED_EXIT_CODE) from None
+
+    with connect(database) as connection:
+        try:
+            result = reconcile_paper_state(
+                connection,
+                dry_run=dry_run,
+                now=None,
+            )
+        except (ReconciliationError, ExecutionError, StateError) as error:
+            typer.secho(str(error), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=RECONCILE_FAILED_EXIT_CODE) from None
+
+    _echo_reconcile_report(result, dry_run=dry_run)
+
+    exit_code = _RECONCILE_EXIT_CODES[result.status]
+    if exit_code != 0:
+        raise typer.Exit(code=exit_code)
 
 
 def main() -> None:
