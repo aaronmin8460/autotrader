@@ -360,12 +360,14 @@ fi
 
 note "starting caddy"
 run systemctl enable caddy.service
-if [ "${DRY_RUN}" -eq 0 ] && systemctl is-active --quiet caddy.service; then
-  step "reloading the running service"
-  systemctl reload caddy.service || systemctl restart caddy.service
-else
-  run systemctl restart caddy.service
-fi
+# Restart, never reload. `EnvironmentFile` is read when the process starts, so
+# a reload of an instance that came up before the drop-in existed - which is
+# exactly what `apt install caddy` leaves behind on a first publish - would
+# adapt this configuration against three empty variables. A restart is
+# sub-second, the certificates are on disk, and the only thing dropped is an
+# in-flight request to a read-only page.
+step "restarting so the publish variables are read from ${WEB_ENV_FILE}"
+run systemctl restart caddy.service
 
 if [ "${DRY_RUN}" -eq 1 ]; then
   note "dry run complete - nothing was changed"
