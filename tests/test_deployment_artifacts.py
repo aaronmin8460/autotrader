@@ -835,3 +835,29 @@ def test_the_deploy_script_warns_when_an_admin_unit_shadows_a_deployed_one() -> 
     text = script_code("autotrader-deploy")
     assert "ADMIN_SYSTEMD_DIR" in text
     assert "shadows" in text
+
+
+def test_the_dashboard_api_reads_the_host_submission_gate() -> None:
+    """It reports whether this host is armed, so it has to read what arms it.
+
+    The panel's `paper_execution_enabled` is computed from the API process's
+    own environment. An API that never loads the activation file reports the
+    safe default forever and prints "No order can be submitted" beside a
+    running, armed runtime.
+    """
+    unit = parse_unit(SYSTEMD_ROOT / "autotrader-dashboard-api.service")
+    files = directive(unit, "Service", "EnvironmentFile")
+    activation = [value for value in files if value.lstrip("-").endswith(ACTIVATION_BASENAME)]
+    assert activation, files
+    assert activation[0].startswith("-"), "an unactivated host must still start the API"
+    assert files[-1] == activation[0], "the activation file must be loaded last"
+
+
+def test_reading_the_gate_does_not_give_the_dashboard_a_way_to_trade() -> None:
+    """Loading the activation file must not be mistaken for granting authority."""
+    unit = parse_unit(SYSTEMD_ROOT / "autotrader-dashboard-api.service")
+    for value in directive(unit, "Service", "Environment"):
+        assert not value.startswith("AUTOTRADER_PAPER_TRADING_ENABLED")
+    exec_start = one(unit, "Service", "ExecStart") or ""
+    assert "--confirm-paper" not in exec_start
+    assert "crypto-run" not in exec_start and "equity-run" not in exec_start

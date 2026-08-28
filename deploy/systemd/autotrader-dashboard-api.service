@@ -34,6 +34,17 @@ WorkingDirectory=/opt/autotrader/app
 # should not be carrying the variable that authorizes one.
 EnvironmentFile=/etc/autotrader/autotrader.env
 EnvironmentFile=-/etc/autotrader/autotrader.secrets.env
+# Read-only, and read for one reason: the runtime panels report whether this
+# HOST's paper submission gate is open, and the API computes that from its own
+# environment. Without this line it always reported the safe default from
+# autotrader.env and printed "No order can be submitted" on a panel next to a
+# runtime that was armed and running - the most misleading sentence this screen
+# could carry. Optional (`-`), so an unactivated host still starts.
+#
+# This grants the API nothing: every route is a GET, there is no submission
+# path in the process, and the file holds no credential. The frontend is a
+# different matter and deliberately does not load it.
+EnvironmentFile=-/etc/autotrader/autotrader.trading.env
 
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
