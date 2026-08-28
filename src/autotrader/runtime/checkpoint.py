@@ -41,6 +41,17 @@ from autotrader.runtime.schedule import require_utc
 from autotrader.state import sqlite as state
 
 
+class CheckpointNotDurableError(Exception):
+    """A bar claim could not be made durable, so the bar must not be acted on.
+
+    Raised rather than returned, and deliberately not an `ExecutionError`: the
+    runtime classifies an unrecognised failure as fatal, which is the right
+    answer here. A claim that is not on disk cannot stop a restarted process
+    re-deciding the same bar, and acting on a bar whose claim might still be
+    rolled back is the duplicate-trade direction.
+    """
+
+
 class ProcessedBarCheckpoint(Protocol):
     """What the runtime needs to know about bars it has already acted on."""
 
@@ -81,10 +92,15 @@ class InMemoryCheckpoint:
 class SqliteCheckpoint:
     """The production checkpoint: one committed row per symbol, in schema v5.
 
-    `mark_processed` returns only once the claim is committed. A second
-    connection - another process, or a test holding one open - can read it
-    immediately, which is exactly the property that makes a restart safe and
-    exactly what a test can assert without trusting this docstring.
+    `mark_processed` returns only once the claim is committed, and it now
+    checks that rather than assuming it: `upsert_runtime_checkpoint` joins an
+    enclosing transaction rather than committing inside one, so a caller that
+    wrapped this call would get a claim that no other connection can see and
+    that a crash would roll back. That is refused. A second connection -
+    another process, or a test holding one open - can read every claim this
+    method accepts the instant it returns, which is exactly the property that
+    makes a restart safe and exactly what a test can assert without trusting
+    this docstring.
 
     Reads are not cached. The database is the claim; a cache in front of it
     would be a second answer that could disagree with the one that matters, and
@@ -104,6 +120,14 @@ class SqliteCheckpoint:
 
     def mark_processed(self, symbol: str, bar_timestamp: datetime) -> None:
         moment = require_utc(bar_timestamp, "bar_timestamp")
+        if self._connection.in_transaction:
+            raise CheckpointNotDurableError(
+                f"The {symbol} claim for {moment.isoformat()} cannot be made durable: "
+                "this connection is inside an open transaction, so the claim would be "
+                "invisible to any other process and would be rolled back by a crash. "
+                "Refusing to claim a bar that a restarted process could then process "
+                "again. Nothing was claimed and nothing was decided."
+            )
         state.upsert_runtime_checkpoint(
             self._connection,
             symbol=symbol,
@@ -119,4 +143,9 @@ class SqliteCheckpoint:
         }
 
 
-__all__ = ["InMemoryCheckpoint", "ProcessedBarCheckpoint", "SqliteCheckpoint"]
+__all__ = [
+    "CheckpointNotDurableError",
+    "InMemoryCheckpoint",
+    "ProcessedBarCheckpoint",
+    "SqliteCheckpoint",
+]

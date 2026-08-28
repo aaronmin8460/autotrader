@@ -76,6 +76,7 @@ from autotrader.execution.paper import (
     AmbiguousSubmissionError,
     ExecutionOutcome,
     MissingCredentialsError,
+    NonDurableIntentError,
     PaperExecutionResult,
     paper_trading_enabled,
 )
@@ -197,16 +198,26 @@ def classify(error: BaseException) -> CycleSeverity:
     `AmbiguousSubmissionError` pauses trading. An order may exist at the
     broker; continuing to submit would be building on an unknown position.
 
-    A rejected credential, an account the broker will not let trade, and a
-    broken local database are fatal. None of them improves by being retried
-    every fifteen minutes, and a daemon that loops forever on one is worse than
-    a process that stops and says so.
+    A rejected credential, an account the broker will not let trade, a broken
+    local database, and an intent that could not be made durable are fatal.
+    None of them improves by being retried every fifteen minutes, and a daemon
+    that loops forever on one is worse than a process that stops and says so.
+
+    `NonDurableIntentError` is listed before the general `ExecutionError` case
+    on purpose. It is an `ExecutionError` by type, but it is a caller defect
+    rather than a broker condition: it will fail identically on every boundary
+    forever, and the thing it is protecting - a recovery anchor reaching disk
+    before an order reaches the broker - is not something to keep re-attempting
+    in the hope that it starts working.
     """
     if isinstance(error, AmbiguousSubmissionError):
         return CycleSeverity.TRADING_PAUSED
     if isinstance(
         error,
-        BrokerAuthenticationError | MissingCredentialsError | AccountNotTradableError,
+        BrokerAuthenticationError
+        | MissingCredentialsError
+        | AccountNotTradableError
+        | NonDurableIntentError,
     ):
         return CycleSeverity.FATAL
     if isinstance(error, state.StateError):

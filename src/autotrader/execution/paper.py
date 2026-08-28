@@ -314,6 +314,22 @@ class AmbiguousSubmissionError(ExecutionError):
     """
 
 
+class NonDurableIntentError(ExecutionError):
+    """The order intent is not committed to disk, so nothing may be submitted.
+
+    The one invariant the whole recovery design rests on is that a
+    `client_order_id` reaches durable storage *before* it reaches the broker.
+    An intent that exists only inside an open transaction is invisible to every
+    other connection and disappears entirely if the process dies - so an order
+    placed against one would sit at the broker under a key no restart could
+    ever find, and therefore under a key nothing could stop this system from
+    duplicating.
+
+    This is a caller error, not a broker or network condition. It cannot be
+    retried into working and it is fatal to the runtime.
+    """
+
+
 class ExecutionOutcome(Enum):
     """How one execution attempt ended."""
 
@@ -1360,9 +1376,13 @@ def submit_order_intent(
 ) -> SubmissionResult:
     """Submit one already-persisted intent, exactly once.
 
-    The intent **must** already be committed: this function is the point of no
-    return, and the caller's durable `client_order_id` is what makes the
-    outcome recoverable.
+    The intent **must** already be committed, and that is now checked rather
+    than assumed: this function is the point of no return, and the caller's
+    durable `client_order_id` is the only thing that makes the outcome
+    recoverable. An open transaction on `connection` means the intent has not
+    been committed - `record_order_intent` joins an enclosing transaction
+    instead of committing inside it - so the attempt is refused before the
+    broker is touched at all.
 
     A duplicate preflight runs first. If the broker already has an order under
     this key, that order is recorded and returned and **nothing is submitted**.
@@ -1370,15 +1390,32 @@ def submit_order_intent(
     `submit_order` is called at most once. There is no retry, no backoff, and
     no second attempt under any circumstances:
 
-    - a returned order marks the intent `SUBMITTED`;
+    - a returned order that can be read and stored marks the intent
+      `SUBMITTED`;
     - a definite broker rejection marks it `REJECTED` and raises
       `BrokerRejectedOrderError`;
     - anything ambiguous marks it `UNKNOWN`, writes an audit event, and raises
       `AmbiguousSubmissionError`.
 
-    The `client_order_id` is never regenerated, so the ambiguous case stays
+    "Anything ambiguous" includes both halves of the response, not just the
+    call: once `submit_order` has been entered a request has gone out, so a
+    reply that cannot be parsed and a reply that cannot be written to disk are
+    both states in which an order may exist and this process does not know what
+    it is. Reporting either as an ordinary failure would let the caller carry
+    on trading over an order it never recorded.
+
+    The `client_order_id` is never regenerated, so every ambiguous case stays
     resolvable by asking the broker about that exact key.
     """
+    if connection.in_transaction:
+        raise NonDurableIntentError(
+            f"The order intent for client_order_id {intent.client_order_id} is not "
+            "committed: this connection is inside an open transaction, so the intent "
+            "is invisible to any other process and would be rolled back by a crash. "
+            "Refusing to submit an order whose recovery anchor is not durable. "
+            "Nothing was submitted."
+        )
+
     existing = find_broker_order_by_client_id(client, intent.client_order_id)
     if existing is not None:
         _persist_broker_snapshot(
@@ -1435,14 +1472,42 @@ def submit_order_intent(
             connection, intent, order_intent_id, now, type(error).__name__
         ) from None
 
-    snapshot = _to_snapshot(order)
-    _persist_broker_snapshot(
-        connection,
-        order_intent_id=order_intent_id,
-        snapshot=snapshot,
-        status=state.INTENT_STATUS_SUBMITTED,
-        now=now,
-    )
+    # Past this line a request has definitely reached the broker. Every failure
+    # from here on is therefore ambiguous rather than merely unfortunate: the
+    # order may exist, and the honest record of "it may exist and I could not
+    # find out what it is" is UNKNOWN under the same client_order_id.
+    try:
+        snapshot = _to_snapshot(order)
+    except Exception as error:  # noqa: BLE001 - an unreadable reply is not a refusal
+        raise _mark_unknown(
+            connection,
+            intent,
+            order_intent_id,
+            now,
+            f"the broker's reply could not be read ({type(error).__name__}: {error})",
+        ) from None
+
+    try:
+        _persist_broker_snapshot(
+            connection,
+            order_intent_id=order_intent_id,
+            snapshot=snapshot,
+            status=state.INTENT_STATUS_SUBMITTED,
+            now=now,
+        )
+    except Exception as error:  # noqa: BLE001 - an unstorable reply is not a refusal
+        # `_mark_unknown` writes too, so a database that is broken rather than
+        # briefly busy will raise from in there instead. That is the correct
+        # outcome as well: it is fatal, and a runtime that cannot record what it
+        # did must stop rather than continue.
+        raise _mark_unknown(
+            connection,
+            intent,
+            order_intent_id,
+            now,
+            f"the broker's reply could not be stored ({type(error).__name__}: {error})",
+        ) from None
+
     state.record_system_event(
         connection,
         event_timestamp=now,
@@ -1710,6 +1775,7 @@ __all__ = [
     "ExecutionOutcome",
     "MinimumNotionalError",
     "MissingCredentialsError",
+    "NonDurableIntentError",
     "NotPaperEnvironmentError",
     "PaperAccountState",
     "PaperExecutionResult",
