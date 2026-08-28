@@ -1,0 +1,146 @@
+@import "tailwindcss";
+
+/* --------------------------------------------------------------------------
+   Design tokens.
+
+   Dark is the designed mode: the values below are the dark palette, and the
+   light overrides sit in one media query. Every component uses semantic token
+   utilities (`bg-surface`, `text-ink-2`, `border-line`) and never a raw colour,
+   so light mode is not a second design to maintain - it is the same design
+   with one block of variables swapped.
+
+   Greens and reds are reserved for financial and safety semantics. Nothing
+   here is decorative colour.
+   -------------------------------------------------------------------------- */
+
+@theme {
+  --font-sans:
+    ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --color-canvas: var(--app-canvas);
+  --color-surface: var(--app-surface);
+  --color-sunken: var(--app-sunken);
+  --color-line: var(--app-line);
+  --color-line-strong: var(--app-line-strong);
+  --color-ink: var(--app-ink);
+  --color-ink-2: var(--app-ink-2);
+  --color-ink-3: var(--app-ink-3);
+  --color-pos: var(--app-pos);
+  --color-neg: var(--app-neg);
+  --color-warn: var(--app-warn);
+  --color-accent: var(--app-accent);
+
+  --radius-card: 8px;
+}
+
+:root {
+  color-scheme: dark;
+
+  --app-canvas: #0a0c0d;
+  --app-surface: #101315;
+  --app-sunken: #0d1011;
+  --app-line: #1e2427;
+  --app-line-strong: #2b3236;
+  --app-ink: #e7eaeb;
+  --app-ink-2: #98a1a6;
+  --app-ink-3: #6a7378;
+  --app-pos: #46b26a;
+  --app-neg: #e0574f;
+  --app-warn: #cf9a3a;
+  --app-accent: #6ea8d8;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    --app-canvas: #f4f5f6;
+    --app-surface: #ffffff;
+    --app-sunken: #fafbfb;
+    --app-line: #e2e5e7;
+    --app-line-strong: #cfd4d7;
+    --app-ink: #14181a;
+    --app-ink-2: #5d666b;
+    --app-ink-3: #8b9498;
+    --app-pos: #1a7f42;
+    --app-neg: #c23934;
+    --app-warn: #8a6212;
+    --app-accent: #2f6f9f;
+  }
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Every figure on this page is meant to be compared down a column. */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* A label small enough to disappear until it is looked for. */
+.eyebrow {
+  font-size: 10px;
+  line-height: 1.2;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+/* Tables scroll inside their own card rather than moving the page. */
+.scroll-x {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.scroll-x::-webkit-scrollbar {
+  height: 8px;
+}
+
+.scroll-x::-webkit-scrollbar-thumb {
+  background-color: var(--color-line-strong);
+  border-radius: 4px;
+}
+
+.scroll-x::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Tints.
+
+   The only place a semantic colour is used as a background rather than as
+   text. Mixed against the surface so the card still reads as a card, not as a
+   coloured banner - reserved for the two states that mean something is wrong.
+   -------------------------------------------------------------------------- */
+
+.tint-neg {
+  background-color: color-mix(in srgb, var(--color-neg) 8%, var(--color-surface));
+}
+
+.tint-warn {
+  background-color: color-mix(in srgb, var(--color-warn) 8%, var(--color-surface));
+}

@@ -39,5 +39,12 @@ data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 
+# Dashboard frontend (C10)
+node_modules/
+.next/
+dashboard/frontend/out/
+dashboard/frontend/next-env.d.ts
+*.tsbuildinfo
+
 # macOS
 .DS_Store
