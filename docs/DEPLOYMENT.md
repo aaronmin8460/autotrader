@@ -420,6 +420,13 @@ than an argument so that it is never visible in `ps`. Lose it and
 `--rotate-credential` issues another; there is no recovery path and there is
 not meant to be one.
 
+The hash does not reach the journal either. Caddy's packaged unit starts the
+server with `--environ`, which prints the whole process environment at every
+start — and the drop-in has just put the hash in that environment. The drop-in
+therefore replaces the command with one that omits the flag. Without it,
+journald keeps a copy of the dashboard's only credential, readable by every
+member of `adm`, for as long as it keeps anything.
+
 ### The hostname has to resolve first
 
 Caddy proves control of the name to Let's Encrypt by answering a request

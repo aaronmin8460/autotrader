@@ -501,6 +501,29 @@ def test_the_caddy_dropin_feeds_caddy_the_publish_file_and_nothing_else() -> Non
     assert ACTIVATION_BASENAME not in joined
 
 
+def test_the_caddy_dropin_keeps_the_credential_out_of_the_journal() -> None:
+    """The packaged unit runs `caddy run --environ`, which prints the environment.
+
+    With the publish file loaded, that environment contains the bcrypt hash -
+    so every start would write the dashboard's only credential to journald,
+    readable by every member of `adm`. The drop-in clears the command list and
+    sets it again without the flag.
+    """
+    unit = parse_unit(SYSTEMD_ROOT / "caddy.service.d" / "10-autotrader-web.conf")
+    commands = directive(unit, "Service", "ExecStart")
+    assert commands and commands[0] == "", "the list must be cleared before it is set"
+    assert len(commands) == 2, commands
+    assert "--environ" not in commands[-1], commands[-1]
+    assert "--config /etc/caddy/Caddyfile" in commands[-1], commands[-1]
+
+
+def test_the_caddy_dropin_owns_the_log_directory() -> None:
+    """Otherwise the access log belongs to whoever created the file first."""
+    unit = parse_unit(SYSTEMD_ROOT / "caddy.service.d" / "10-autotrader-web.conf")
+    assert one(unit, "Service", "LogsDirectory") == "caddy"
+    assert one(unit, "Service", "LogsDirectoryMode") == "0750"
+
+
 def test_the_publish_template_ships_empty() -> None:
     """An empty hash matches no password, so an unconfigured host refuses everyone."""
     text = (ENV_ROOT / f"{WEB_ENV_BASENAME}.example").read_text()

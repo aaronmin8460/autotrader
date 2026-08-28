@@ -29,7 +29,6 @@
 # the hostname. There is no login page behind this proxy to fall back on. The
 # `basic_auth` block below is the entire authentication boundary, and removing
 # it publishes the account.
-
 {
 	# The admin API is a control endpoint: it can rewrite this configuration
 	# at runtime. Loopback is already its default; stating it makes that a

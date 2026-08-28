@@ -38,6 +38,8 @@ APP_DIR="${AUTOTRADER_APP_DIR:-/opt/autotrader/app}"
 WEB_ENV_FILE="${CONFIG_DIR}/autotrader.web.env"
 CADDY_CONFIG_DIR="${AUTOTRADER_CADDY_CONFIG_DIR:-/etc/caddy}"
 CADDY_CONFIG="${CADDY_CONFIG_DIR}/Caddyfile"
+CADDY_LOG_DIR="/var/log/caddy"
+CADDY_LOG_FILE="${CADDY_LOG_DIR}/autotrader-dashboard.log"
 DROPIN_DIR="${AUTOTRADER_CADDY_DROPIN_DIR:-/etc/systemd/system/caddy.service.d}"
 DROPIN="${DROPIN_DIR}/10-autotrader-web.conf"
 
@@ -361,6 +363,32 @@ else
   AUTOTRADER_DASHBOARD_PASSWORD_HASH="${HASH}" \
     caddy validate --config "${CADDY_CONFIG}" --adapter caddyfile >/dev/null
   step "the configuration parses"
+fi
+
+# ---------------------------------------------------------------------------
+# The access log
+#
+# `caddy validate` above did not merely parse the file: it provisioned the
+# logging module, and provisioning opens the writer. This script runs as root,
+# so the file it just created is owned by root, and the caddy user cannot open
+# it. The service then fails to start with a permission error against a
+# directory whose ownership looks entirely correct, which is a genuinely
+# difficult ten minutes.
+#
+# The drop-in's `LogsDirectory=` keeps the directory right on every boot. This
+# repairs the one file validation may have left behind on this run.
+# ---------------------------------------------------------------------------
+
+note "access log"
+if [ "${DRY_RUN}" -eq 1 ]; then
+  step "[dry-run] ensure ${CADDY_LOG_FILE} belongs to caddy"
+else
+  install -d -o caddy -g caddy -m 0750 "${CADDY_LOG_DIR}"
+  if [ -e "${CADDY_LOG_FILE}" ]; then
+    chown caddy:caddy "${CADDY_LOG_FILE}"
+    chmod 0640 "${CADDY_LOG_FILE}"
+  fi
+  step "${CADDY_LOG_DIR} belongs to caddy"
 fi
 
 # ---------------------------------------------------------------------------
