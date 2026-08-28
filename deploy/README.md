@@ -2,16 +2,16 @@
 
 Version-controlled deployment artifacts for running AutoTrader on a VPS.
 
-Nothing here has been run against a server, and nothing here installs itself.
-The operator runbook is [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md); this
-file is the index.
+Nothing here installs itself. The operator runbook is
+[`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md); this file is the index.
 
 ```
 deploy/
   systemd/    unit templates -> /usr/lib/systemd/system (masks live in /etc)
+              caddy.service.d/ -> /etc/systemd/system (a drop-in, not a unit)
   env/        environment file templates -> /etc/autotrader
   bin/        operational scripts
-  caddy/      optional reverse proxy, not installed by anything
+  caddy/      the public reverse proxy, installed by autotrader-publish-web
 ```
 
 ## The one thing to know
@@ -32,10 +32,16 @@ that reaches the second. See
 | `autotrader-rollback` | `/opt/autotrader`, a backup | never |
 | `autotrader-backup` | `backups/` only | never |
 | `autotrader-healthcheck` | **nothing** | never |
+| `autotrader-publish-web` | `/etc/caddy`, `autotrader.web.env`, firewall | never |
 
 Every script takes `--dry-run` except `autotrader-healthcheck`, which changes
 nothing by construction, and `autotrader-backup`, whose only effect is a new
 file.
+
+`autotrader-publish-web` is the fourth independent action, after deploy,
+activation and emergency stop. It changes **who can look at the dashboard** and
+touches no trading unit, no database and no credential belonging to the broker.
+See [Publishing the dashboard](../docs/DEPLOYMENT.md#publishing-the-dashboard).
 
 ## Units
 
@@ -46,6 +52,11 @@ file.
 | `autotrader-dashboard-api.service` | `always` | `127.0.0.1:8000`, read-only |
 | `autotrader-dashboard-web.service` | `always` | `127.0.0.1:3000` |
 | `autotrader-backup.timer` | — | daily |
+
+`caddy.service.d/10-autotrader-web.conf` is a drop-in for the Caddy package's
+own unit, not an `autotrader-*` unit. It adds one `EnvironmentFile` and is
+installed to `/etc/systemd/system` by `autotrader-publish-web`, so that
+`apt upgrade caddy` cannot take the hostname and the password hash with it.
 
 `RestartPreventExitStatus=2` on the two runtimes is the load-bearing line: exit
 2 means a submission outcome is `UNKNOWN` and an order may exist at the broker,

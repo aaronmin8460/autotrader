@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+#
+# Publish the read-only AutoTrader dashboard on a public HTTPS hostname.
+#
+#   autotrader-publish-web --domain dash.example.com
+#   autotrader-publish-web --rotate-credential
+#   autotrader-publish-web --unpublish
+#   autotrader-publish-web --dry-run --domain dash.example.com
+#
+# **This is a fourth action, and it is independent of the other three.**
+# `autotrader-deploy` ships code, `autotrader-enable-paper-trading` opens the
+# submission gate, `autotrader-emergency-stop` closes everything. This one
+# changes who can LOOK at the result, and it touches no trading unit, no
+# database, no credential belonging to the broker and no gate. Running it on a
+# host that has never been activated publishes a dashboard that reports a
+# system submitting nothing, which is exactly what it should do.
+#
+# What it changes, in order:
+#
+#   1. installs Caddy from the project's own apt repository
+#   2. installs /etc/caddy/Caddyfile verbatim from deploy/caddy/Caddyfile
+#   3. installs the systemd drop-in that feeds Caddy the publish variables
+#   4. writes /etc/autotrader/autotrader.web.env, 0640 root:caddy, generating
+#      a password on first run and printing it exactly once
+#   5. opens 80/tcp and 443/tcp in the firewall, and nothing else
+#   6. starts Caddy and waits for a real certificate to be issued
+#
+# The dashboard processes are not restarted, not reconfigured, and not even
+# read. They keep listening on loopback exactly as they did before; the only
+# difference is that something on the same machine now connects to 3000.
+#
+# Run as root.
+
+set -euo pipefail
+
+CONFIG_DIR="${AUTOTRADER_CONFIG_DIR:-/etc/autotrader}"
+APP_DIR="${AUTOTRADER_APP_DIR:-/opt/autotrader/app}"
+WEB_ENV_FILE="${CONFIG_DIR}/autotrader.web.env"
+CADDY_CONFIG_DIR="${AUTOTRADER_CADDY_CONFIG_DIR:-/etc/caddy}"
+CADDY_CONFIG="${CADDY_CONFIG_DIR}/Caddyfile"
+DROPIN_DIR="${AUTOTRADER_CADDY_DROPIN_DIR:-/etc/systemd/system/caddy.service.d}"
+DROPIN="${DROPIN_DIR}/10-autotrader-web.conf"
+
+#: The apt list and keyring the project publishes. Ubuntu 24.04 carries Caddy
+#: 2.6, which predates the `basic_auth` directive this configuration is built
+#: on; on 2.6 the config does not load and the site never comes up. That is a
+#: safe failure, but it is a confusing one, so the newer package is a
+#: requirement rather than a preference.
+CADDY_KEYRING="/usr/share/keyrings/caddy-stable-archive-keyring.gpg"
+CADDY_APT_LIST="/etc/apt/sources.list.d/caddy-stable.list"
+CADDY_GPG_URL="https://dl.cloudsmith.io/public/caddy/stable/gpg.key"
+CADDY_LIST_URL="https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt"
+CADDY_MINIMUM_MAJOR=2
+CADDY_MINIMUM_MINOR=8
+
+#: How long to wait for ACME. A first issuance is usually seconds; a rate
+#: limit or a DNS record that has not propagated is minutes, and waiting
+#: forever would turn a misconfiguration into a hung terminal.
+CERTIFICATE_TIMEOUT_SECONDS=180
+
+DOMAIN=""
+USERNAME="${AUTOTRADER_DASHBOARD_USER:-autotrader}"
+DRY_RUN=0
+ROTATE=0
+UNPUBLISH=0
+
+die() { printf 'publish-web: %s\n' "$*" >&2; exit 1; }
+note() { printf '\n== %s\n' "$*"; }
+step() { printf '  %s\n' "$*"; }
+run() {
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    printf '  [dry-run] %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: autotrader-publish-web [--domain HOST] [--user NAME] [--dry-run]
+       autotrader-publish-web --rotate-credential [--dry-run]
+       autotrader-publish-web --unpublish [--dry-run]
+
+  --domain HOST         Public hostname to publish on. Required the first
+                        time; afterwards the stored value is reused.
+  --user NAME           Login name (default: autotrader). Not a secret.
+  --rotate-credential   Issue a new password, print it once, reload Caddy.
+                        Changes nothing else.
+  --unpublish           Stop Caddy and close 80/443. Leaves the configuration
+                        on disk so that republishing is one command, and
+                        leaves the dashboard running on loopback.
+  --dry-run             Print what would happen. Changes nothing.
+
+The password is printed to this terminal and stored nowhere. Only its bcrypt
+hash is written to disk. If it is lost, --rotate-credential issues another.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --domain) [ $# -ge 2 ] || die "--domain needs a hostname"; DOMAIN="$2"; shift ;;
+    --user) [ $# -ge 2 ] || die "--user needs a name"; USERNAME="$2"; shift ;;
+    --rotate-credential) ROTATE=1 ;;
+    --unpublish) UNPUBLISH=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+  shift
+done
+
+[ "$(id -u)" -eq 0 ] || die "run as root."
+if [ "${ROTATE}" -eq 1 ] && [ "${UNPUBLISH}" -eq 1 ]; then
+  die "--rotate-credential and --unpublish are different operations."
+fi
+
+# ---------------------------------------------------------------------------
+# Reading the stored configuration
+#
+# Never with `source`. This file is systemd's format, not the shell's, and
+# sourcing it would execute whatever a future edit put in it.
+# ---------------------------------------------------------------------------
+
+stored_value() {
+  local key="$1"
+  [ -f "${WEB_ENV_FILE}" ] || return 0
+  sed -n "s/^${key}=//p" "${WEB_ENV_FILE}" | tail -n 1
+}
+
+# ---------------------------------------------------------------------------
+# --unpublish
+# ---------------------------------------------------------------------------
+
+if [ "${UNPUBLISH}" -eq 1 ]; then
+  note "unpublishing"
+  if command -v caddy >/dev/null 2>&1; then
+    step "stopping and disabling caddy"
+    run systemctl disable --now caddy.service
+  else
+    step "caddy is not installed - nothing to stop"
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    step "closing 80/tcp and 443/tcp"
+    run ufw --force delete allow 80/tcp || true
+    run ufw --force delete allow 443/tcp || true
+  fi
+  cat <<'DONE'
+
+  The dashboard is private again. Both processes are untouched and still
+  listening on loopback, so an SSH tunnel still reaches them:
+
+      ssh -N -L 3000:127.0.0.1:3000 you@your-vps
+
+  The configuration and the stored credential hash are left on disk.
+  `autotrader-publish-web` with no arguments republishes on the same hostname.
+DONE
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Preconditions
+# ---------------------------------------------------------------------------
+
+note "preconditions"
+
+if [ -z "${DOMAIN}" ]; then
+  DOMAIN="$(stored_value AUTOTRADER_DASHBOARD_DOMAIN)"
+  [ -n "${DOMAIN}" ] || die "no hostname. Pass --domain HOST the first time."
+  step "hostname ${DOMAIN} (from ${WEB_ENV_FILE})"
+else
+  step "hostname ${DOMAIN}"
+fi
+
+case "${DOMAIN}" in
+  *[!a-zA-Z0-9.-]*|-*|.*|"") die "'${DOMAIN}' is not a hostname." ;;
+esac
+
+STORED_USER="$(stored_value AUTOTRADER_DASHBOARD_USER)"
+if [ -n "${STORED_USER}" ] && [ "${USERNAME}" = "autotrader" ]; then
+  USERNAME="${STORED_USER}"
+fi
+step "login name ${USERNAME}"
+
+[ -f "${APP_DIR}/deploy/caddy/Caddyfile" ] || die "${APP_DIR}/deploy/caddy/Caddyfile is missing. Deploy a SHA that has it."
+
+# The dashboard must already be up. Publishing a hostname that proxies to a
+# closed port produces a 502 behind a valid certificate, which reads as "the
+# publish worked and the dashboard is broken" and sends the operator to the
+# wrong half of the system.
+for port in 3000 8000; do
+  if ss -tln 2>/dev/null | grep -qE "127\.0\.0\.1:${port}\b"; then
+    step "127.0.0.1:${port} is listening"
+  else
+    die "nothing is listening on 127.0.0.1:${port}. Start the dashboard units first."
+  fi
+done
+
+# ACME proves control of the name by answering a request addressed to it. If
+# the name does not point here that request never arrives, and Caddy retries
+# against Let's Encrypt until it is rate-limited.
+PUBLIC_ADDRESS="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)"
+RESOLVED="$(getent ahostsv4 "${DOMAIN}" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
+if [ -z "${RESOLVED}" ]; then
+  die "${DOMAIN} does not resolve. ACME cannot validate a name that has no A record."
+fi
+step "${DOMAIN} resolves to ${RESOLVED% }"
+if [ -n "${PUBLIC_ADDRESS}" ]; then
+  case " ${RESOLVED}" in
+    *" ${PUBLIC_ADDRESS} "*) step "which is this host (${PUBLIC_ADDRESS})" ;;
+    *) die "${DOMAIN} resolves to ${RESOLVED% } but this host is ${PUBLIC_ADDRESS}. ACME would fail." ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+# Caddy
+# ---------------------------------------------------------------------------
+
+caddy_is_new_enough() {
+  command -v caddy >/dev/null 2>&1 || return 1
+  local version major minor
+  version="$(caddy version 2>/dev/null | head -n 1 | sed -n 's/^v\{0,1\}\([0-9][0-9.]*\).*/\1/p')"
+  [ -n "${version}" ] || return 1
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  [ "${major}" -gt "${CADDY_MINIMUM_MAJOR}" ] && return 0
+  [ "${major}" -eq "${CADDY_MINIMUM_MAJOR}" ] && [ "${minor}" -ge "${CADDY_MINIMUM_MINOR}" ]
+}
+
+note "caddy"
+if caddy_is_new_enough; then
+  step "$(caddy version | head -n 1) is already installed"
+else
+  step "installing caddy from ${CADDY_LIST_URL}"
+  run apt-get install -y --no-install-recommends debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    printf '  [dry-run] fetch %s -> %s\n' "${CADDY_GPG_URL}" "${CADDY_KEYRING}"
+    printf '  [dry-run] fetch %s -> %s\n' "${CADDY_LIST_URL}" "${CADDY_APT_LIST}"
+  else
+    curl -1sSLf "${CADDY_GPG_URL}" | gpg --dearmor --yes -o "${CADDY_KEYRING}"
+    chmod 0644 "${CADDY_KEYRING}"
+    curl -1sSLf "${CADDY_LIST_URL}" > "${CADDY_APT_LIST}"
+    chmod 0644 "${CADDY_APT_LIST}"
+  fi
+  run apt-get update
+  run apt-get install -y caddy
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    caddy_is_new_enough || die "installed caddy is older than ${CADDY_MINIMUM_MAJOR}.${CADDY_MINIMUM_MINOR}; the configuration needs basic_auth."
+    step "installed $(caddy version | head -n 1)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+note "configuration"
+run install -d -o root -g root -m 0755 "${CADDY_CONFIG_DIR}"
+step "installing ${CADDY_CONFIG} from the repository, verbatim"
+run install -o root -g root -m 0644 "${APP_DIR}/deploy/caddy/Caddyfile" "${CADDY_CONFIG}"
+
+run install -d -o root -g root -m 0755 "${DROPIN_DIR}"
+step "installing ${DROPIN}"
+run install -o root -g root -m 0644 "${APP_DIR}/deploy/systemd/caddy.service.d/10-autotrader-web.conf" "${DROPIN}"
+run systemctl daemon-reload
+
+# ---------------------------------------------------------------------------
+# The credential
+# ---------------------------------------------------------------------------
+
+note "credential"
+
+STORED_HASH="$(stored_value AUTOTRADER_DASHBOARD_PASSWORD_HASH)"
+NEW_PASSWORD=""
+
+if [ "${ROTATE}" -eq 1 ] || [ -z "${STORED_HASH}" ]; then
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    step "[dry-run] would generate a password and store only its bcrypt hash"
+    HASH="DRY_RUN_PLACEHOLDER"
+  else
+    # 32 characters from a 62-symbol alphabet, out of 192 bits of kernel
+    # entropy. Long because nothing rate-limits a guess against basic auth,
+    # and random because this credential is typed into a browser once and
+    # then remembered by it.
+    NEW_PASSWORD="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9')"
+    [ "${#NEW_PASSWORD}" -ge 24 ] || die "could not generate a password of usable length."
+    # Through stdin, never argv: an argument is visible in `ps` to every
+    # local account for as long as the process lives.
+    HASH="$(printf '%s' "${NEW_PASSWORD}" | caddy hash-password)"
+    case "${HASH}" in
+      '$2a$'*|'$2b$'*|'$2y$'*) : ;;
+      *) die "caddy hash-password did not return a bcrypt hash." ;;
+    esac
+  fi
+  if [ "${ROTATE}" -eq 1 ]; then
+    step "issued a new password (the previous one stops working at reload)"
+  else
+    step "issued the first password for this host"
+  fi
+else
+  step "reusing the stored hash - pass --rotate-credential to issue a new password"
+  HASH="${STORED_HASH}"
+fi
+
+step "writing ${WEB_ENV_FILE} (0640 root:caddy)"
+if [ "${DRY_RUN}" -eq 1 ]; then
+  printf '  [dry-run] AUTOTRADER_DASHBOARD_DOMAIN=%s\n' "${DOMAIN}"
+  printf '  [dry-run] AUTOTRADER_DASHBOARD_USER=%s\n' "${USERNAME}"
+  printf '  [dry-run] AUTOTRADER_DASHBOARD_PASSWORD_HASH=<bcrypt>\n'
+else
+  install -d -o root -g root -m 0755 "${CONFIG_DIR}"
+  # Written at 0600 under the final name, then opened to the caddy group once
+  # the bytes are in place. The hash is never briefly world-readable.
+  install -o root -g root -m 0600 /dev/null "${WEB_ENV_FILE}"
+  {
+    printf '# Written by autotrader-publish-web. Not in version control.\n'
+    printf '# The plaintext password was printed once and stored nowhere.\n'
+    printf 'AUTOTRADER_DASHBOARD_DOMAIN=%s\n' "${DOMAIN}"
+    printf 'AUTOTRADER_DASHBOARD_USER=%s\n' "${USERNAME}"
+    printf 'AUTOTRADER_DASHBOARD_PASSWORD_HASH=%s\n' "${HASH}"
+  } > "${WEB_ENV_FILE}"
+  chown root:caddy "${WEB_ENV_FILE}"
+  chmod 0640 "${WEB_ENV_FILE}"
+fi
+
+# ---------------------------------------------------------------------------
+# Validate before anything is exposed
+# ---------------------------------------------------------------------------
+
+note "validating"
+if [ "${DRY_RUN}" -eq 1 ]; then
+  step "[dry-run] caddy validate --config ${CADDY_CONFIG}"
+else
+  # The adapter reads {$VAR} from the environment, so validation has to see
+  # the same values systemd will hand the service.
+  AUTOTRADER_DASHBOARD_DOMAIN="${DOMAIN}" \
+  AUTOTRADER_DASHBOARD_USER="${USERNAME}" \
+  AUTOTRADER_DASHBOARD_PASSWORD_HASH="${HASH}" \
+    caddy validate --config "${CADDY_CONFIG}" --adapter caddyfile >/dev/null
+  step "the configuration parses"
+fi
+
+# ---------------------------------------------------------------------------
+# Firewall
+# ---------------------------------------------------------------------------
+
+note "firewall"
+if command -v ufw >/dev/null 2>&1; then
+  step "allowing 80/tcp (ACME and the redirect) and 443/tcp"
+  run ufw allow 80/tcp
+  run ufw allow 443/tcp
+  step "nothing else is opened: 3000, 8000 and 2019 stay on loopback"
+else
+  step "ufw is not installed - open 80/tcp and 443/tcp in whatever guards this host"
+fi
+
+# ---------------------------------------------------------------------------
+# Start
+# ---------------------------------------------------------------------------
+
+note "starting caddy"
+run systemctl enable caddy.service
+if [ "${DRY_RUN}" -eq 0 ] && systemctl is-active --quiet caddy.service; then
+  step "reloading the running service"
+  systemctl reload caddy.service || systemctl restart caddy.service
+else
+  run systemctl restart caddy.service
+fi
+
+if [ "${DRY_RUN}" -eq 1 ]; then
+  note "dry run complete - nothing was changed"
+  exit 0
+fi
+
+note "waiting for a certificate"
+DEADLINE=$((SECONDS + CERTIFICATE_TIMEOUT_SECONDS))
+ISSUED=0
+while [ "${SECONDS}" -lt "${DEADLINE}" ]; do
+  # 401 is success here. It means TLS completed against a certificate this
+  # client trusts, the request reached the site, and authentication turned it
+  # away - which is the whole boundary working, observed from outside.
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "https://${DOMAIN}/" 2>/dev/null || true)"
+  if [ "${code}" = "401" ]; then
+    ISSUED=1
+    break
+  fi
+  sleep 5
+done
+
+if [ "${ISSUED}" -ne 1 ]; then
+  printf '\n'
+  die "no trusted certificate after ${CERTIFICATE_TIMEOUT_SECONDS}s. journalctl -u caddy -n 50"
+fi
+step "certificate issued and the site answers 401 without credentials"
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+printf '\n== published\n'
+printf '  https://%s/\n' "${DOMAIN}"
+printf '  user: %s\n' "${USERNAME}"
+if [ -n "${NEW_PASSWORD}" ]; then
+  printf '\n  password (shown once, stored nowhere, not recoverable):\n\n'
+  printf '      %s\n' "${NEW_PASSWORD}"
+  printf '\n  Put it in a password manager now. Only its bcrypt hash was\n'
+  printf '  written to disk; --rotate-credential issues another.\n'
+else
+  printf '  password: unchanged - --rotate-credential issues a new one\n'
+fi
+printf '\n  The dashboard is read-only. Nothing behind this hostname can place,\n'
+printf '  cancel or modify an order, and the trading runtimes were not touched.\n'

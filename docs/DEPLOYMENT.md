@@ -21,6 +21,7 @@ posture".
 - [Restart policy](#restart-policy)
 - [SQLite](#sqlite)
 - [Networking](#networking)
+- [Publishing the dashboard](#publishing-the-dashboard)
 - [Runbook](#runbook)
 - [What is still pinned to Combined Integration](#what-is-still-pinned-to-combined-integration)
 - [Crypto-only posture](#crypto-only-posture)
@@ -365,8 +366,9 @@ By default the dashboard is reachable over an SSH tunnel and from nowhere else:
 ssh -N -L 3000:127.0.0.1:3000 you@your-vps
 ```
 
-That is a legitimate end state. `deploy/caddy/Caddyfile.example` is for putting
-it on a hostname instead, and it carries the authentication warning in full.
+That is a legitimate end state, and it is the default. Putting the dashboard on
+a public hostname instead is one command and its own section: see
+[Publishing the dashboard](#publishing-the-dashboard).
 
 **`--hostname 127.0.0.1` on the frontend unit is load-bearing.** `next start`
 binds `0.0.0.0` by default, which on a VPS means the unauthenticated dashboard
@@ -379,6 +381,75 @@ can place an order, so the risk is disclosure rather than control — but what i
 discloses is account value, positions, orders and strategy behaviour in real
 time. There is no login page behind the proxy. `basic_auth` in the Caddyfile is
 the entire authentication boundary.
+
+The proxy adds one guarantee the application already makes, so that it stops
+depending on the application making it: `@write not method GET HEAD` returns
+405 at the edge. The dashboard is GET-only today, and a route that accidentally
+accepts a POST tomorrow is not reachable from the internet on the day it is
+written.
+
+---
+
+## Publishing the dashboard
+
+One command, and it is independent of the other three. `autotrader-deploy`
+ships code, `autotrader-enable-paper-trading` opens the submission gate,
+`autotrader-emergency-stop` closes everything. This one changes **who can look
+at the result** and touches no trading unit, no database, no broker credential
+and no gate.
+
+```bash
+/opt/autotrader/app/deploy/bin/autotrader-publish-web --domain dash.example.com
+```
+
+It installs Caddy, installs `deploy/caddy/Caddyfile` verbatim, writes
+`/etc/autotrader/autotrader.web.env`, opens 80 and 443, starts the service, and
+waits until the hostname answers `401` over a certificate a real client
+trusts — then prints a generated password **once**.
+
+`--dry-run` prints the whole plan and changes nothing. `--rotate-credential`
+issues a new password. `--unpublish` stops Caddy and closes both ports, leaving
+the dashboard running on loopback and the configuration on disk.
+
+### The password is printed once
+
+Only its bcrypt hash reaches disk, in a file that is `0640 root:caddy` rather
+than world-readable like `autotrader.env`. Nothing on the host can recover the
+plaintext, the script does not log it, and it is hashed through stdin rather
+than an argument so that it is never visible in `ps`. Lose it and
+`--rotate-credential` issues another; there is no recovery path and there is
+not meant to be one.
+
+### The hostname has to resolve first
+
+Caddy proves control of the name to Let's Encrypt by answering a request
+addressed to it. The script refuses to continue if the name does not resolve,
+or resolves somewhere other than this host, because the alternative is Caddy
+retrying against a rate-limited ACME endpoint while the operator reads a
+firewall rule looking for the mistake.
+
+A host with no domain of its own can use the wildcard DNS resolver
+`sslip.io`, which answers `<ip>.sslip.io` with `<ip>`. It is a real, publicly
+resolvable name that Let's Encrypt will issue for, it costs nothing, and it
+needs no registrar:
+
+```bash
+/opt/autotrader/app/deploy/bin/autotrader-publish-web --domain 203.0.113.10.sslip.io
+```
+
+The tradeoff is that the name is derived from the address, so it is guessable
+by anyone scanning the range. That is exactly why `basic_auth` is not optional:
+obscurity was never the boundary, and with an IP-derived hostname there is no
+obscurity left to lean on.
+
+### What stays private
+
+Publishing is additive. The dashboard processes are not restarted, not
+reconfigured, and not read — they keep listening on `127.0.0.1:3000` and
+`127.0.0.1:8000` exactly as before, and the only change is that something on
+the same machine now connects to 3000. The Caddy admin API, which can rewrite
+the running configuration, is pinned to `127.0.0.1:2019` in the Caddyfile
+rather than left at its default.
 
 ---
 
@@ -618,7 +689,27 @@ If the schema has moved past what the target commit understands, the rollback
 newer file rather than downgrade it and discard data. Choose a newer rollback
 target, restore a pre-migration backup deliberately, or fix forward.
 
-### 14. Emergency stop
+### 14. Publish the dashboard — optional, and separate again
+
+```bash
+/opt/autotrader/app/deploy/bin/autotrader-publish-web --dry-run --domain dash.example.com
+/opt/autotrader/app/deploy/bin/autotrader-publish-web --domain dash.example.com
+```
+
+Copy the printed password into a password manager before closing the terminal.
+Then check the boundary from somewhere that is not this host:
+
+```bash
+curl -sI  https://dash.example.com/                    # expect 401
+curl -sI -u user:pass https://dash.example.com/        # expect 200
+curl -sI -u user:pass -X POST https://dash.example.com/  # expect 405
+curl -sS  http://dash.example.com/ -o /dev/null -w '%{http_code} %{redirect_url}\n'  # expect 308
+```
+
+`autotrader-publish-web --unpublish` reverses it. See
+[Publishing the dashboard](#publishing-the-dashboard).
+
+### 15. Emergency stop
 
 ```bash
 /opt/autotrader/app/deploy/bin/autotrader-emergency-stop
@@ -655,7 +746,7 @@ source rather than against the plan.
 | `deploy/bin/autotrader-healthcheck` → `_check_account_safety` | replace the name probe with the real table | **adapted** — the table is `account_safety_state`, a single row pinned by `CHECK (id = 1)`, and the check now reports its `state`: `SAFE` is OK, `UNSAFE_UNKNOWN` and `UNSAFE_RECONCILIATION` are FAIL |
 | `deploy/bin/autotrader-rollback` → schema gate | that `SCHEMA_VERSION` and `MIN_MIGRATABLE_SCHEMA_VERSION` are still module-level assignments | **unchanged** — both are still plain assignments in `src/autotrader/state/sqlite.py`; the current schema is v6 |
 | lock scoping | that crypto and equity still take differently-scoped locks | **unchanged** — crypto takes the unscoped runtime lock, equity takes a scoped one, and the shared account execution lock is a third, separate file. The two services still run concurrently |
-| `deploy/caddy/Caddyfile.example` | the domain and the bcrypt hash | **still open** — no hostname has been chosen, and nothing published the dashboard. See "Networking" |
+| `deploy/caddy/Caddyfile` | the domain and the bcrypt hash | **closed** — both are now `{$VAR}` reads from `/etc/autotrader/autotrader.web.env`, so the file installs verbatim and neither value is in Git. `autotrader-publish-web` writes that file. See "Publishing the dashboard" |
 
 One further adaptation was made for the crypto-only posture described below:
 `autotrader-healthcheck` now reports a **masked** unit as OK rather than as a

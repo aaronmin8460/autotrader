@@ -56,7 +56,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 # There is no --host argument, and its absence is the point: the entry point
 # hardcodes 127.0.0.1 so that "listen on every interface" cannot become a
 # one-flag decision on an API that has no authentication. Reaching it from
-# anywhere else is Caddy's job (deploy/caddy/Caddyfile.example).
+# anywhere else is Caddy's job (deploy/caddy/Caddyfile).
 ExecStart=/opt/autotrader/venv/bin/python -m autotrader.dashboard --port ${AUTOTRADER_DASHBOARD_API_PORT}
 
 # `always`, unlike the trading units. The distinction is what the process can

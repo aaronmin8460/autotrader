@@ -45,7 +45,7 @@ Environment=DASHBOARD_API_ORIGIN=http://127.0.0.1:8000
 # binds 0.0.0.0 by default, which on a VPS means the unauthenticated dashboard
 # is on the public internet the moment the service comes up - no firewall
 # mistake required, just the default. Public exposure goes through Caddy, with
-# authentication in front (deploy/caddy/Caddyfile.example).
+# authentication in front (deploy/caddy/Caddyfile).
 ExecStart=/opt/autotrader/app/dashboard/frontend/node_modules/.bin/next start --hostname 127.0.0.1 --port ${AUTOTRADER_DASHBOARD_WEB_PORT}
 
 # Safe for the same reason the API's is: this process renders state it cannot

@@ -44,12 +44,20 @@ BASH_SCRIPTS = (
     "autotrader-rollback",
     "autotrader-enable-paper-trading",
     "autotrader-emergency-stop",
+    "autotrader-publish-web",
 )
 PYTHON_SCRIPTS = ("autotrader-backup", "autotrader-healthcheck")
 ALL_SCRIPTS = BASH_SCRIPTS + PYTHON_SCRIPTS
 
 #: The one file whose existence authorizes order submission.
 ACTIVATION_BASENAME = "autotrader.trading.env"
+
+#: The proxy configuration, installed verbatim - there is no `.example` step.
+CADDYFILE = "Caddyfile"
+
+#: Host-side publish configuration: hostname, login name, bcrypt hash. Written
+#: by `autotrader-publish-web`, never by a deploy, and never in Git.
+WEB_ENV_BASENAME = "autotrader.web.env"
 
 
 # ---------------------------------------------------------------------------
@@ -426,12 +434,119 @@ def test_the_dashboard_api_is_not_given_a_host_argument() -> None:
     assert "--host " not in exec_start, exec_start
 
 
-def test_the_proxy_template_keeps_an_authentication_boundary() -> None:
-    text = (DEPLOY_ROOT / "caddy" / "Caddyfile.example").read_text()
-    assert "basic_auth" in text
+def caddyfile_code() -> str:
+    """The Caddyfile with its comment lines removed.
+
+    Same reason `script_code` exists: the file explains at length what a second
+    upstream would do to the authentication boundary, and a raw-text count of
+    `reverse_proxy` reads that explanation as a violation.
+    """
+    lines = (DEPLOY_ROOT / "caddy" / CADDYFILE).read_text().splitlines()
+    return "\n".join(line for line in lines if not line.strip().startswith("#"))
+
+
+def test_the_proxy_keeps_an_authentication_boundary() -> None:
+    code = caddyfile_code()
+    assert "basic_auth" in code
     # One upstream. A second route straight to the API would bypass basic_auth.
-    assert text.count("reverse_proxy") == 1, "the API must not be proxied separately"
-    assert "127.0.0.1:3000" in text
+    assert code.count("reverse_proxy") == 1, "the API must not be proxied separately"
+    assert "reverse_proxy 127.0.0.1:3000" in code
+
+
+def test_the_proxy_never_reaches_the_api_directly() -> None:
+    """The API has no authentication of its own; only the frontend may be an upstream."""
+    assert "8000" not in caddyfile_code()
+
+
+def test_the_proxy_config_carries_no_credential_and_no_hostname() -> None:
+    """Every host-specific value is an environment read, so the file installs verbatim."""
+    code = caddyfile_code()
+    for variable in (
+        "{$AUTOTRADER_DASHBOARD_DOMAIN}",
+        "{$AUTOTRADER_DASHBOARD_USER}",
+        "{$AUTOTRADER_DASHBOARD_PASSWORD_HASH}",
+    ):
+        assert variable in code, variable
+    # A bcrypt hash begins with $2a$/$2b$/$2y$. One in this file is a
+    # credential in Git, and it is the only credential the dashboard has.
+    assert "$2a$" not in code and "$2b$" not in code and "$2y$" not in code
+
+
+def test_the_proxy_rejects_write_methods_at_the_edge() -> None:
+    """Defence in depth: the dashboard is GET-only, and so is the way in."""
+    code = caddyfile_code()
+    assert "not method GET HEAD" in code
+    assert "405" in code
+
+
+def test_the_proxy_admin_api_stays_on_loopback() -> None:
+    """It can rewrite the running configuration. It is a control plane."""
+    code = caddyfile_code()
+    assert "admin 127.0.0.1:2019" in code
+
+
+# ---------------------------------------------------------------------------
+# Publishing the dashboard
+# ---------------------------------------------------------------------------
+
+
+def test_the_caddy_dropin_feeds_caddy_the_publish_file_and_nothing_else() -> None:
+    unit = parse_unit(SYSTEMD_ROOT / "caddy.service.d" / "10-autotrader-web.conf")
+    files = directive(unit, "Service", "EnvironmentFile")
+    assert files == [f"/etc/autotrader/{WEB_ENV_BASENAME}"], files
+    # Not the broker credentials, and not the submission gate. Caddy proxies
+    # bytes; it has no use for either and no business holding them.
+    joined = " ".join(files)
+    assert "autotrader.secrets.env" not in joined
+    assert ACTIVATION_BASENAME not in joined
+
+
+def test_the_publish_template_ships_empty() -> None:
+    """An empty hash matches no password, so an unconfigured host refuses everyone."""
+    text = (ENV_ROOT / f"{WEB_ENV_BASENAME}.example").read_text()
+    assert "AUTOTRADER_DASHBOARD_DOMAIN=\n" in text
+    assert "AUTOTRADER_DASHBOARD_USER=\n" in text
+    assert "AUTOTRADER_DASHBOARD_PASSWORD_HASH=\n" in text
+
+
+def test_the_publish_script_never_writes_the_password_to_disk() -> None:
+    """Only the bcrypt hash is stored. The plaintext is printed once and dropped."""
+    code = script_code("autotrader-publish-web")
+    assert "AUTOTRADER_DASHBOARD_PASSWORD_HASH=%s\\n" in code
+    for number, line in enumerate(code.splitlines(), start=1):
+        if "NEW_PASSWORD" in line and ">" in line:
+            raise AssertionError(f"line {number} redirects the plaintext password: {line!r}")
+
+
+def test_the_publish_script_hashes_through_stdin_not_argv() -> None:
+    """An argument is visible in `ps` to every local account while it runs."""
+    code = script_code("autotrader-publish-web")
+    assert "caddy hash-password" in code
+    assert "--plaintext" not in code
+
+
+def test_the_publish_script_opens_only_the_two_web_ports() -> None:
+    code = script_code("autotrader-publish-web")
+    opened = set(re.findall(r"ufw\s+(?:--force\s+)?(?:delete\s+)?allow\s+(\S+)", code))
+    assert opened <= {"80/tcp", "443/tcp"}, opened
+    for port in ("3000", "8000", "2019", "5432"):
+        assert f"allow {port}" not in code, port
+
+
+def test_the_publish_script_cannot_touch_a_trading_runtime() -> None:
+    """Changing who can look at the dashboard must not change what trades."""
+    code = script_code("autotrader-publish-web")
+    for unit in TRADING_UNITS:
+        assert unit not in code, unit
+    assert ACTIVATION_BASENAME not in code
+    assert "autotrader.secrets.env" not in code
+
+
+def test_the_publish_script_does_not_restart_the_dashboard() -> None:
+    """Publishing is additive: something new connects to a port already open."""
+    code = script_code("autotrader-publish-web")
+    for unit in DASHBOARD_UNITS:
+        assert unit not in code, unit
 
 
 # ---------------------------------------------------------------------------
