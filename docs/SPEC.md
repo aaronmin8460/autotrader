@@ -1,11 +1,14 @@
 # autotrader - Project Specification (v0.2)
 
-**Status:** Crypto V0.2 through Phase 9 complete. Phase 8 and Phase 9 are
-merged onto one branch and are not yet wired together. The active system is
-crypto spot - BTC/USD and ETH/USD, 15-minute bars, 24/7 - it can place an order
-only into Alpaca's paper environment, it can reconcile local state against that
-account, and it can run unattended on completed 15-minute UTC bars without
-trading. Next: the Phase 8 / Phase 9 integration gate.
+**Status:** Crypto V0.2 through Phase 9 complete, and Phase 8 and Phase 9 are
+**integrated**. The active system is crypto spot - BTC/USD and ETH/USD,
+15-minute bars, 24/7 - it can place an order only into Alpaca's paper
+environment, it reconciles local state against that account at every process
+start, and it runs unattended on completed 15-minute UTC bars. Startup
+reconciliation is the trading authority: no green result, no new paper order.
+**No integrated paper BUY has been observed end to end yet.** Next: the
+integrated crypto paper smoke gate, then failure injection, then Phase 10
+deployment.
 **Archived milestone:** Equity V0.1 is preserved at the Git tag
 `equity-v0.1-phase7`.
 **Last updated:** 2026-08-28
@@ -136,12 +139,12 @@ Phase 2  Data Validation                   <- done, migrated to crypto (C2)
 Phase 3  Strategy                          <- done, unchanged by the pivot (C3)
 Phase 4  Backtesting                       <- done, migrated to crypto (C4)
 Phase 5  Risk Engine                       <- done, migrated to crypto (C5)
-Phase 6  SQLite Operational State          <- done, schema v4 (C6 + C8)
+Phase 6  SQLite Operational State          <- done, schema v5 (C6 + C8 + C9)
 Phase 7  Alpaca Paper Trading              <- done, migrated to crypto (C7)
 --- Crypto Pivot V0.2 complete ---
 Phase 8  Reconciliation / Crash Recovery   <- done (C8)
 Phase 9  24/7 Runtime / Monitoring         <- done (C9)
---- Phase 8 + Phase 9 merged, integration gate open ---
+--- Phase 8 + Phase 9 integrated (schema v5) ---
 Phase 10 Deployment                        <- after the integrated paper smoke
 ```
 
@@ -157,10 +160,11 @@ Phase 10 Deployment                        <- after the integrated paper smoke
     to a later phase.
   - Market data is **never committed**. The directories are tracked via
     `.gitkeep`; their contents are ignored.
-- **Operational trading state:** a local SQLite database at schema **v4**. It
+- **Operational trading state:** a local SQLite database at schema **v5**. It
   stores strategy runs, signals, risk events, system events, local position
-  snapshots, order intents, broker-order snapshots, UTC-day risk baselines, and
-  reconciliation runs and events. Fills and executions are **not** stored:
+  snapshots, order intents, broker-order snapshots, UTC-day risk baselines,
+  reconciliation runs and events, and per-symbol completed-bar checkpoints.
+  Fills and executions are **not** stored:
   order-level `filled_quantity` is what reconciliation settles, and a
   fill-level history has not been earned. Database files are ignored by git.
 - **Secrets:** environment variables loaded from a local `.env`, which is
@@ -700,7 +704,7 @@ trading client, persistence of any kind, changes to C4 accounting, stop losses,
 take profits, trailing stops, volatility or drawdown sizing, correlation
 limits, intraday rate limiting, reconciliation, monitoring, and deployment.
 
-### C6 - SQLite operational state, schema v4 (complete)
+### C6 - SQLite operational state, schema v5 (complete)
 
 The local operational-state store, `autotrader.state.sqlite`. It is
 **persistence infrastructure and nothing else**: it opens a database, creates a
@@ -729,7 +733,7 @@ are rejected**.
 parameter. No SQL is ever built by string interpolation, and a test asserts
 that at the source level.
 
-**Tables.** Exactly eleven.
+**Tables.** Exactly twelve.
 
 | Table | Purpose | Invariants |
 | --- | --- | --- |
@@ -744,6 +748,7 @@ that at the source level.
 | `daily_risk_baselines` | The UTC-day equity baseline | `risk_date_utc` PRIMARY KEY; `baseline_equity > 0`; `captured_at` |
 | `reconciliation_runs` | What one finished reconciliation pass concluded (v4) | `status` in `CLEAN`/`REPAIRED`/`UNRESOLVED`/`FAILED`; `safe_to_trade` in `(0, 1)`; counts `>= 0`; `completed_at >= started_at` |
 | `reconciliation_events` | Which order or position a pass repaired, observed, or could not settle (v4) | one run reference; `category` in `ORDER`/`POSITION`/`RUN`; `outcome` in the four statuses plus `OBSERVED`; `detail` non-empty |
+| `runtime_checkpoints` | The newest completed bar a runtime durably claimed, per symbol (v5) | `symbol` PRIMARY KEY; `last_processed_bar_timestamp` non-empty; monotonic - an older claim updates nothing |
 
 **Exact decimal quantities.** Every broker-critical quantity column -
 `positions.quantity`, `order_intents.requested_quantity`,
@@ -776,14 +781,14 @@ enforced by the primary key as well as in Python.
 **Honest limitation:** this records the first equity the system *observed* on
 that date, not the equity at exactly 00:00 UTC. Nothing in this milestone runs
 continuously, so a day whose first observation is at 14:00 UTC is measured from
-14:00 UTC. The stored `captured_at` records how close it was. A 24/7 runner
-(Phase 9) will make the first observation land near the boundary.
+14:00 UTC. The stored `captured_at` records how close it was. The C9 runner,
+running continuously, makes the first observation land near the boundary.
 
 This is a **persistence primitive only**. Nothing here schedules anything,
 watches a clock, or decides when an observation should happen.
 
-**Schema migration (v1 -> v2 -> v3 -> v4).** A new database is created directly
-at v4. An older one is upgraded through an explicit ordered path, in a single
+**Schema migration (v1 -> v2 -> v3 -> v4 -> v5).** A new database is created
+directly at v5. An older one is upgraded through an explicit ordered path, in a single
 transaction; SQLite's DDL is transactional, so a failure anywhere rolls back to
 the original version rather than leaving a half-applied state.
 
@@ -815,6 +820,16 @@ reconciliation tables are created empty; backfilling an audit trail of passes
 that never ran would be a fabrication. The byte-identity assertion covers this
 path too, from v1, v2, and v3 alike.
 
+**v4 -> v5 is purely additive.** One new table, `runtime_checkpoints`, and
+nothing else: no existing table is rebuilt, renamed, retyped, or reindexed, and
+a test asserts every pre-existing schema object comes through byte-identical.
+Phase 8's `reconciliation_runs` and `reconciliation_events` rows, every order
+intent, every fractional quantity, and every daily risk baseline survive
+because nothing in the step reads or writes them. The table starts **empty**,
+which is the correct starting state rather than an omission: a checkpoint
+claims that some process already acted on a bar, and backfilling one from
+`signals` would invent a claim this schema never recorded as claimed.
+
 A database written by a **newer** version is refused and left untouched; one
 older than v1 has no path and is refused too.
 
@@ -823,9 +838,10 @@ older than v1 has no path and is refused too.
 **Explicitly out of scope for C6:** fills, executions, broker accounts, trading
 loops or schedulers, a migration framework, connection pooling, an ORM, a
 database CLI, backup and restore tooling, and database repair. Reconciliation
-*records* live here as of v4, but nothing in this module performs one: it
-stores the conclusion `autotrader.reconciliation` reached and interprets none
-of it.
+*records* live here as of v4 and runtime bar *claims* as of v5, but nothing in
+this module performs a reconciliation or decides that a bar may be acted on: it
+stores the conclusions `autotrader.reconciliation` and `autotrader.runtime`
+reached and interprets none of them.
 
 ### C7 - Alpaca paper crypto execution (complete)
 
@@ -1133,11 +1149,16 @@ structural upgrade rather than a reconciliation result. Exit codes: `0` for
 `CLEAN` or `REPAIRED`, `1` for `FAILED`, `2` for `UNRESOLVED`. Operational
 failures print a message, never a traceback.
 
+**CLI, and the runtime.** `autotrader reconcile` remains available for
+diagnostics and manual repair. It is **not** a prerequisite an operator has to
+remember before every daemon start: `crypto-run` invokes this same pass itself
+at startup (C9, below). The two callers share one implementation; there is no
+second copy of reconciliation anywhere.
+
 **Explicitly out of scope for C8:** order replacement or cancellation, fill- or
 execution-level history, automatic retry or resubmission of anything, a
-multi-broker abstraction, live trading, and every part of Phase 9 - the
-continuous loop, the scheduler, completed-bar polling, heartbeats, monitoring,
-and deployment.
+multi-broker abstraction, live trading, the continuous loop, the scheduler,
+completed-bar polling, heartbeats, monitoring, and deployment.
 
 ### C9 - 24/7 crypto runtime and monitoring (complete)
 
@@ -1194,22 +1215,21 @@ recursive EMA its state. Historical signals inside the window are **not**
 replayed: every crossover older than the newest bar has already happened, and
 re-emitting them would turn a restart into a burst of stale orders.
 
-**In-process duplicate protection.** A per-symbol `last_processed_bar_timestamp`
+**Durable duplicate protection.** A per-symbol `last_processed_bar_timestamp`
 checkpoint is claimed **before** the strategy runs, so one completed bar is one
-decision per symbol per process even when the provider repeats the newest bar
-or a cycle overruns its boundary. The checkpoint is an interface with an
-in-memory implementation, and **no SQLite schema change was made in this
-phase**. Cross-restart exactly-once recovery is Phase 8's and is deliberately
-not invented here.
+decision per symbol even when the provider repeats the newest bar, a cycle
+overruns its boundary, or the process is restarted. The production
+implementation is `SqliteCheckpoint` on `runtime_checkpoints` (schema v5) and
+is the constructor default; `InMemoryCheckpoint` remains for tests. See
+**C8+C9 integration**, below, for the safety model this encodes.
 
-**Startup fail-closed.** Broker submission is off until an external
-startup-safety check reports `SAFE`. The shipped production default is
-`unresolved_startup_safety()`, which reports `UNRESOLVED` - nobody has checked -
-and keeps submission off. This is the narrow seam Phase 8's reconciliation
-result will be connected to: one zero-argument callable returning a
-`StartupSafetyResult`. There is no plugin framework, no registry, and no
-discovery. While unresolved the runtime still fetches, validates, evaluates,
-records signals, and logs; it simply does not trade.
+**Startup fail-closed.** Broker submission is off until the startup-safety
+check reports `SAFE`, and in production that check is Phase 8's reconciliation
+pass. A runtime constructed without one keeps `unresolved_startup_safety()`,
+which reports `UNRESOLVED` and also keeps submission off. The seam is one
+zero-argument callable returning a `StartupSafetyResult`: no plugin framework,
+no registry, no discovery. While unsafe the runtime still fetches, validates,
+evaluates, records signals, and logs; it simply does not trade.
 
 **Unattended paper execution needs three things, all closed by default:**
 
@@ -1218,7 +1238,7 @@ records signals, and logs; it simply does not trade.
 2. `--confirm-paper-runtime PAPER`, authorizing **this process** for its
    lifetime. A daemon cannot have a token typed every fifteen minutes, so the
    confirmation moved to process start rather than being removed or weakened;
-3. a startup-safety check reporting that trading is safe.
+3. a startup reconciliation reporting `safe_to_trade`.
 
 `--observe-only` goes further than refusing: it constructs no execution path at
 all, so submission is unexpressible rather than merely disabled. There is no
@@ -1238,8 +1258,10 @@ Invalid bars fail that cycle closed: nothing is sorted, repaired, or traded.
 **`UNKNOWN` pauses trading for the life of the process.** The order may or may
 not exist at the broker, so no later signal is submitted on top of a position
 nobody can describe. Observation continues, `run_forever` stops scheduling, and
-the CLI exits `2`. Nothing here resolves, retries, or reasons about the
-ambiguity - that is Phase 8.
+the CLI exits `2`. Nothing resolves, retries, or reasons about the ambiguity
+*inside that cycle*: recovery is a **new process**, which runs startup
+reconciliation before it may trade again. Startup and mid-run are two distinct
+reconciliation moments, and only the first one is allowed to open the gate.
 
 **Heartbeat.** A structured status object exposing runtime start, last cycle
 start, last successful cycle, last processed bar per symbol, whether paper
@@ -1272,8 +1294,8 @@ released.
 at startup in mode `PAPER` and closed at shutdown - `COMPLETED` on a clean
 stop, `FAILED` when the runtime ended paused or fatal. The newest completed
 bar's signal is recorded through C6's existing `record_signal`; a repeat raises
-`DuplicateSignalError`, which is respected rather than worked around. No schema
-was redesigned and no table was added.
+`DuplicateSignalError`, which is respected rather than worked around. No table
+was redesigned; the integration adds one (`runtime_checkpoints`, v5).
 
 **Sizing stays C5's.** The runtime holds no sizing policy. A signal requests a
 quantity larger than any position this account can hold or any ceiling this
@@ -1292,25 +1314,125 @@ critical regressions are pinned: an in-progress bar is never processed, the
 same completed bar is never processed twice in one process, an `UNKNOWN`
 outcome pauses future trading, and a second runner instance is refused.
 
-**Explicitly out of scope for C8:** everything Phase 8 owns - `UNKNOWN`
-resolution, broker-vs-local reconciliation, open-order synchronization, fill
-history, position repair, `reconciliation_runs`, and startup broker truth
-synchronization; cross-restart exactly-once recovery; any SQLite schema change;
-live trading in any form; `asyncio`; alerting and monitoring integrations
-(Telegram, Slack, Discord, email, SMS); a distributed rate limiter; and every
-deployment artefact - systemd units, Docker, cloud scripts, and VPS
-provisioning, which are Phase 10.
+**Explicitly out of scope for C9:** `UNKNOWN` *resolution* and every other part
+of reconciliation, which C8 owns and this package calls rather than
+re-implements; live trading in any form; `asyncio`; alerting and monitoring
+integrations (Telegram, Slack, Discord, email, SMS); a distributed rate
+limiter; and every deployment artefact - systemd units, Docker, cloud scripts,
+and VPS provisioning, which are Phase 10.
 
-### Later phases
+### C8 + C9 integration - reconciliation as the startup authority (complete)
 
-**The integration gate.** Phase 8's `ReconciliationResult.safe_to_trade`
-becomes the startup-safety answer C9 already asks for and already fails closed
-against, and C9's in-process bar checkpoint gains a durable counterpart so a
-restart cannot replay a completed bar. The boundary between the two phases is
-deliberately one sentence:
+The two phases were built in parallel against one written contract:
 
 > A runtime may begin trading only when a reconciliation result reports
 > `safe_to_trade` true.
+
+**The frozen startup sequence.** Every `crypto-run` start, in this order:
+
+```
+1. acquire the OS single-instance runtime lock
+2. open the operational SQLite database
+3. apply any pending schema migration (transactionally)
+4. construct/verify the Alpaca PAPER read boundary
+5. run reconcile_paper_state(connection)
+6. evaluate the result
+7. CLEAN or REPAIRED -> safe_to_trade true
+   UNRESOLVED or FAILED -> safe_to_trade false
+8. start runtime observation
+9. a paper order is possible ONLY when all three hold:
+      safe_to_trade
+      AND AUTOTRADER_PAPER_TRADING_ENABLED=true
+      AND --confirm-paper-runtime PAPER
+```
+
+**No environment variable, flag, or combination of the two can bypass step 5.**
+The gates are independent conditions, not alternatives, and each defaults
+closed. Tests assert that both paper gates fully open plus a non-green
+reconciliation still submits zero orders.
+
+**The status mapping**, written once in
+`runtime.safety.startup_safety_from_reconciliation_result`:
+
+| Reconciliation | Startup safety | May trade |
+| --- | --- | --- |
+| `CLEAN` | `SAFE` | yes |
+| `REPAIRED` | `SAFE` | yes |
+| `UNRESOLVED` | `UNSAFE` | no |
+| `FAILED` | `UNSAFE` | no |
+
+The decision is read off `result.safe_to_trade` rather than re-derived from
+`status`, so the mapping cannot drift from C8's own rule. **`REPAIRED` is
+safe**: a local snapshot rewritten *from the broker* is now correct, and
+blocking the runner afterwards would let one resolved historical difference
+stop it permanently.
+
+**Not safe is observation, not a crash.** An unsafe start continues in an
+explicit observation-only state, exits `0`, and says so loudly -
+`RECONCILIATION NOT SAFE - TRADING DISABLED` on the banner, in the
+`startup_safety` log line at `WARNING`, in the heartbeat's
+`reconciliation_status`, and in `system_events`. This is the smallest behaviour
+consistent with C9's existing contract, which already observed while unsafe. It
+never continues silently as though safe.
+
+**Reconciliation is per process, never cached.** Each start runs a fresh pass.
+A previous run's green result describes the world at the moment it was
+produced; a new process inherits the database, not the conclusion.
+
+**`--observe-only` still reconciles** - startup-safety visibility is useful even
+when nothing could be sent - and remains incapable of submission whatever the
+result, because it constructs no execution path at all.
+
+**Two locks for two problems, both kept.** The `fcntl` lock stops two runners
+existing against one database. The durable checkpoint stops one runner - or its
+replacement after a crash - acting twice on one bar. Neither substitutes for
+the other.
+
+**The safety preference, stated plainly: miss a trade rather than duplicate a
+trade.** A completed bar is durably claimed *before* it can cause a broker
+submission:
+
+```
+completed bar
+ -> durable bar claim (committed)
+ -> signal
+ -> risk
+ -> OrderIntent committed
+ -> broker submission
+```
+
+Crash recovery by position in that chain:
+
+| Crash point | Consequence after restart |
+| --- | --- |
+| before the durable claim | the bar may be processed |
+| after the claim, before the intent | the bar is **skipped** - that trade is missed, permanently |
+| after the intent, before submit | C8 resolves `CREATED` / no broker order safely |
+| during submit | C8 resolves `UNKNOWN` using the persisted `client_order_id` |
+| after submit | C8 repairs from broker truth |
+
+This is **at-most-once**, and it is not exactly-once. Nothing here pretends to
+provide mathematically perfect exactly-once distributed execution; that is not
+achievable with one local SQLite file and one remote broker, and claiming it
+would be worse than not having it. Losing a fifteen-minute crossover is
+recoverable. A duplicate position is not.
+
+**Dependencies unchanged.** No Redis, no Postgres, no distributed lock service,
+no Kafka. One SQLite file and one `fcntl` lock.
+
+**Still pending after this gate:** no integrated paper BUY has been observed end
+to end. That smoke gate comes first, then failure injection, then Phase 10.
+
+### Later phases
+
+**The integrated crypto paper smoke gate.** The integration is code-complete and
+green offline, and the runtime has been exercised read-only against the real
+paper account. What has **not** happened is an integrated paper BUY observed end
+to end. That is the next gate, and nothing is deployed before it.
+
+**Failure injection** follows: crash the process at each point in the
+claim/intent/submit chain against the real paper account and confirm the
+documented recovery in every case.
 
 **Phase 10 - Deployment.** Systemd units, container images, host provisioning,
 and supervision. Deliberately after the integrated paper smoke gate and failure

@@ -19,9 +19,11 @@ a signal actually needs sizing.
 
 **Fail closed, in three different directions.**
 
-*Startup.* Broker submission is off until an external startup-safety check
-says otherwise, and the shipped default says `UNRESOLVED` because Phase 8 is
-not integrated here. Observation continues; trading does not begin.
+*Startup.* Broker submission is off until the startup-safety check says
+otherwise, and in production that check is Phase 8's reconciliation pass:
+`reconcile_paper_state(...).safe_to_trade` is the trading authority. A runtime
+constructed without a check keeps the `UNRESOLVED` default, which is also
+closed. Observation continues either way; trading does not begin.
 
 *Gates.* Unattended paper execution needs the `AUTOTRADER_PAPER_TRADING_ENABLED`
 environment gate **and** a runtime-start `PAPER` confirmation that authorizes
@@ -32,15 +34,22 @@ merely refused but unexpressible.
 *Ambiguity.* An `UNKNOWN` submission outcome pauses trading permanently for
 this process. Nothing here resolves it, retries it, or reasons about what the
 broker might have done - that is Phase 8's, and guessing is how one uncertain
-order becomes two real ones.
+order becomes two real ones. Resuming requires a new process, which reconciles
+again before it may trade.
+
+**One completed bar, one action, across restarts.** The per-symbol bar
+checkpoint is claimed *before* the strategy sees the bar, and in production it
+is durable (`SqliteCheckpoint`, schema v5). The preference is explicit and
+one-sided: **miss a trade rather than duplicate a trade.**
 
 **Every boundary is injected.** The clock, the sleep, the market data, the
 execution path, the startup-safety check and the processed-bar checkpoint are
 all constructor arguments, so the entire loop is testable offline and no test
 ever waits fifteen real minutes or reaches a network.
 
-There is no reconciliation here, no live mode, no equity symbol, no market
-session, and no deployment artefact. See docs/SPEC.md section 8.
+Reconciliation is not re-implemented here; this module calls it and reads its
+answer. There is no live mode, no equity symbol, no market session, and no
+deployment artefact. See docs/SPEC.md section 8.
 """
 
 from __future__ import annotations
@@ -70,7 +79,7 @@ from autotrader.execution.paper import (
     PaperExecutionResult,
     paper_trading_enabled,
 )
-from autotrader.runtime.checkpoint import InMemoryCheckpoint, ProcessedBarCheckpoint
+from autotrader.runtime.checkpoint import ProcessedBarCheckpoint, SqliteCheckpoint
 from autotrader.runtime.execution import BrokerAuthenticationError, ExecutionGateway
 from autotrader.runtime.market_data import MarketDataSource
 from autotrader.runtime.monitoring import (
@@ -324,6 +333,11 @@ class CryptoRuntime:
     an `ExecutionGateway` only when this process is meant to be able to trade.
     Call `run_once()` for a single completed-bar cycle or `run_forever()` for
     the daemon.
+
+    Two arguments carry the integration and both default closed-and-durable:
+    `startup_safety` defaults to `unresolved_startup_safety` (production passes
+    `startup_safety_from_reconciliation(connection)`), and `checkpoint`
+    defaults to the durable `SqliteCheckpoint` on the same connection.
     """
 
     def __init__(
@@ -348,8 +362,13 @@ class CryptoRuntime:
         # edit that forgets to check a flag.
         self._execution = None if self._config.observe_only else execution
         self._startup_safety = startup_safety
+        # Durable by default. An in-memory default would look identical in
+        # every test and quietly reintroduce the restart-replay bug in
+        # production, where the checkpoint has to outlive the process that
+        # made it. A caller that genuinely wants a process-scoped guard passes
+        # `InMemoryCheckpoint()` explicitly and says so.
         self._checkpoint: ProcessedBarCheckpoint = (
-            checkpoint if checkpoint is not None else InMemoryCheckpoint()
+            checkpoint if checkpoint is not None else SqliteCheckpoint(connection)
         )
         self._clock = clock
         self._sleep = sleep
@@ -379,6 +398,36 @@ class CryptoRuntime:
     @property
     def authorization(self) -> ExecutionAuthorization:
         return self._authorization
+
+    @property
+    def startup_safety(self) -> StartupSafetyResult | None:
+        """The startup answer this process got, or None before `start()`."""
+        return self._safety
+
+    @property
+    def startup_safety_message(self) -> str:
+        """Why this process may or may not trade, in one operator-readable line."""
+        if self._safety is None:
+            return "Startup safety has not been resolved yet."
+        return self._safety.message
+
+    @property
+    def checkpoints(self) -> dict[str, datetime]:
+        """The bar claims this runtime can currently see, per symbol.
+
+        Read from the checkpoint itself rather than from the heartbeat, so a
+        durable claim written by an *earlier* process shows up too - which is
+        the whole point of it being durable.
+        """
+        as_dict = getattr(self._checkpoint, "as_dict", None)
+        if callable(as_dict):
+            return dict(as_dict())
+        found: dict[str, datetime] = {}
+        for symbol in PROCESSING_ORDER:
+            claimed = self._checkpoint.last_processed(symbol)
+            if claimed is not None:
+                found[symbol] = claimed
+        return found
 
     @property
     def strategy_run_id(self) -> int | None:
@@ -451,7 +500,13 @@ class CryptoRuntime:
 
         self._heartbeat.state = RuntimeState.RUNNING
         self._heartbeat.started_at = now
+        # A restart inherits its predecessor's claims. Reporting "none" here
+        # would make a durable checkpoint look empty to whoever is reading the
+        # heartbeat to decide whether the restart was safe.
+        for symbol in PROCESSING_ORDER:
+            self._heartbeat.last_processed_bars[symbol] = self._checkpoint.last_processed(symbol)
         self._heartbeat.startup_safety_code = safety.code
+        self._heartbeat.reconciliation_status = safety.reconciliation_status
         self._heartbeat.paper_execution_enabled = self._authorization.enabled
         self._heartbeat.execution_disabled_reason = self._authorization.reason
         self._started = True
@@ -465,10 +520,18 @@ class CryptoRuntime:
             lookback_bars=self._config.lookback_bars,
             safety_delay_seconds=self._config.safety_delay.total_seconds(),
             startup_safety=safety.code,
+            reconciliation_status=safety.reconciliation_status,
             paper_execution_enabled=self._authorization.enabled,
             execution_disabled_reason=self._authorization.reason,
         )
-        log_event(self._logger, "startup_safety", code=safety.code, message=safety.message)
+        log_event(
+            self._logger,
+            "startup_safety",
+            level=logging.INFO if safety.safe_to_trade else logging.WARNING,
+            code=safety.code,
+            reconciliation_status=safety.reconciliation_status,
+            message=safety.message,
+        )
         execution_status = (
             "enabled" if self._authorization.enabled else f"disabled ({self._authorization.reason})"
         )
@@ -478,7 +541,9 @@ class CryptoRuntime:
             event_type=EVENT_RUNTIME_STARTED,
             message=(
                 f"Crypto runtime started for {', '.join(PROCESSING_ORDER)}. "
-                f"Startup safety {safety.code}; paper execution {execution_status}."
+                f"Startup safety {safety.code} "
+                f"(reconciliation {safety.reconciliation_status or 'NOT RUN'}); "
+                f"paper execution {execution_status}."
             ),
         )
 
@@ -540,8 +605,9 @@ class CryptoRuntime:
             event_type=EVENT_RUNTIME_TRADING_PAUSED,
             message=(
                 f"Trading paused: {reason}. No further order will be submitted by this "
-                "process. Reconciliation (Phase 8) must resolve the outcome before "
-                "trading resumes."
+                "process. A new process must run startup reconciliation and get a "
+                "safe_to_trade answer before trading resumes; nothing in this cycle "
+                "resolves the outcome or submits again."
             ),
         )
         log_event(self._logger, "trading_paused", reason=reason)
@@ -750,10 +816,13 @@ class CryptoRuntime:
                 skipped_reason="ALREADY_PROCESSED",
             )
 
-        # Claimed before anything is decided or sent. A failure after this
-        # point must not hand the same bar to the strategy a second time: one
-        # completed bar is one decision, and a retry of the decision is how a
-        # second order gets placed for a crossover that happened once.
+        # Claimed - durably, in production - before anything is decided or
+        # sent. A failure after this point must not hand the same bar to the
+        # strategy a second time: one completed bar is one decision, and a
+        # retry of the decision is how a second order gets placed for a
+        # crossover that happened once. The claim commits before the broker is
+        # reachable from here, so a crash in between loses the trade rather
+        # than duplicating it. That is the intended side of the trade.
         self._checkpoint.mark_processed(symbol, latest_timestamp)
         self._heartbeat.last_processed_bars[symbol] = latest_timestamp
         log_event(

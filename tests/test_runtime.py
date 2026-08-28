@@ -349,6 +349,20 @@ def _closed_gate_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(PAPER_TRADING_ENABLED_ENV, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_credentials_in_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may reach a broker because the developer's shell had credentials.
+
+    Startup safety now runs a real reconciliation pass, which builds a paper
+    client from the environment. Without this, a CLI test on a machine with
+    `ALPACA_API_KEY` exported would open a socket - and the whole test suite is
+    supposed to be offline. Cleared credentials make that pass fail locally and
+    closed, which is also what the fail-closed assertions want to see.
+    """
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
+
+
 @pytest.fixture
 def enabled_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(PAPER_TRADING_ENABLED_ENV, PAPER_TRADING_ENABLED_VALUE)
@@ -1629,8 +1643,13 @@ def test_the_runtime_defines_no_deployment_artefact() -> None:
         assert forbidden not in source, forbidden
 
 
-def test_the_runtime_modifies_no_database_schema() -> None:
-    """Phase 9 stores nothing new. The checkpoint lives in memory."""
+def test_the_runtime_layer_owns_no_database_schema() -> None:
+    """Schema is `autotrader.state`'s, including the v5 checkpoint table.
+
+    The runtime reads and writes checkpoints through the storage layer's own
+    helpers. It does not carry DDL of its own, so there is exactly one file in
+    the repository that can change the shape of the database.
+    """
     source = runtime_source()
     for forbidden in (
         "CREATE TABLE",
@@ -1673,7 +1692,14 @@ def test_crypto_run_once_observes_without_submitting(
 def test_crypto_run_reports_the_startup_safety_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enabled_gate: None
 ) -> None:
-    """Both gates open, and it still refuses - because nothing reconciled."""
+    """Both paper gates open, and it still refuses - because reconciliation is not green.
+
+    No credentials are set, so the real startup pass cannot even build a paper
+    client: it returns FAILED, which closes the gate. This is the integrated
+    replacement for the pre-integration `UNRESOLVED` refusal, and it is the
+    reason `--confirm-paper-runtime PAPER` plus the environment gate is still
+    not enough to submit anything.
+    """
     database = tmp_path / "state.db"
     frames = {BTC: make_bars(BTC), ETH: make_bars(ETH)}
     monkeypatch.setattr(
@@ -1699,7 +1725,8 @@ def test_crypto_run_reports_the_startup_safety_refusal(
         ],
     )
     assert result.exit_code == 0, result.output
-    assert "STARTUP_SAFETY_UNRESOLVED" in result.output
+    assert "STARTUP_SAFETY_UNSAFE" in result.output
+    assert "RECONCILIATION NOT SAFE - TRADING DISABLED" in result.output
     assert "OBSERVATION ONLY" in result.output
 
 

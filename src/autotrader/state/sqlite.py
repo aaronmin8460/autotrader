@@ -72,10 +72,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 #: The schema this module understands. There is no migration *framework*, but
-#: there is an explicit ordered upgrade path - v1 -> v2 -> v3 -> v4 - applied in
-#: a single transaction by `initialize_database`. A database written by a
-#: **newer** version is refused, never downgraded.
-SCHEMA_VERSION = 4
+#: there is an explicit ordered upgrade path - v1 -> v2 -> v3 -> v4 -> v5 -
+#: applied in a single transaction by `initialize_database`. A database written
+#: by a **newer** version is refused, never downgraded.
+SCHEMA_VERSION = 5
 
 #: The oldest on-disk version this module can still open. Anything below it
 #: predates the migration path and is refused rather than guessed at.
@@ -105,6 +105,7 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "daily_risk_baselines",
     "reconciliation_runs",
     "reconciliation_events",
+    "runtime_checkpoints",
 )
 
 #: The tables v2 added on top of v1. Kept separate so the v1 -> v2 migration
@@ -116,6 +117,11 @@ V3_TABLES: tuple[str, ...] = ("daily_risk_baselines",)
 
 #: The tables v4 adds on top of v3, both of them Phase 8 reconciliation audit.
 V4_TABLES: tuple[str, ...] = ("reconciliation_runs", "reconciliation_events")
+
+#: The table v5 adds on top of v4: the durable per-symbol completed-bar claim
+#: that survives a process restart. Phase 9's checkpoint was in-process only,
+#: which cannot stop a restart from replaying the bar it already acted on.
+V5_TABLES: tuple[str, ...] = ("runtime_checkpoints",)
 
 #: Transient names the v2 -> v3 rebuild parks the old tables under. They exist
 #: only inside the migration transaction and are dropped before it commits, so
@@ -591,7 +597,7 @@ class StoredOrderIntent:
     Named distinctly from `autotrader.execution.OrderIntent`: that one is the
     freshly built domain object, this one is the row it became. It is written
     **before** the broker is called, and its `client_order_id` is the anchor
-    that lets a later phase ask the broker what happened to it.
+    that lets reconciliation ask the broker what happened to it.
 
     `approved_quantity` is the risk engine's number, never the caller's
     original request. There is deliberately no broker order id here - that
@@ -714,6 +720,21 @@ class DailyRiskBaseline:
     risk_date_utc: date
     baseline_equity: Decimal
     captured_at: datetime
+
+
+@dataclass(frozen=True)
+class RuntimeCheckpoint:
+    """The newest completed bar a runtime has durably claimed for one symbol.
+
+    A claim, not an observation: the row is written *before* the bar is allowed
+    to cause a strategy decision or a broker submission, so a process that dies
+    between the claim and the submission leaves a bar recorded as taken. That
+    is the intended trade - see `upsert_runtime_checkpoint`.
+    """
+
+    symbol: str
+    last_processed_bar_timestamp: datetime
+    updated_at: datetime
 
 
 # --------------------------------------------------------------------------
@@ -997,6 +1018,13 @@ _CREATE_RECONCILIATION_EVENTS = """
 _CREATE_INDEX_RECONCILIATION_EVENTS = (
     "CREATE INDEX idx_reconciliation_events_run ON reconciliation_events (reconciliation_run_id)"
 )
+_CREATE_RUNTIME_CHECKPOINTS = """
+    CREATE TABLE runtime_checkpoints (
+        symbol                       TEXT PRIMARY KEY CHECK (symbol <> ''),
+        last_processed_bar_timestamp TEXT NOT NULL CHECK (last_processed_bar_timestamp <> ''),
+        updated_at                   TEXT NOT NULL
+    )
+    """
 
 #: A fresh database is built directly from these, at `SCHEMA_VERSION`. It is
 #: never created at v1 and then migrated forward.
@@ -1012,6 +1040,7 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     _CREATE_DAILY_RISK_BASELINES,
     _CREATE_RECONCILIATION_RUNS,
     _CREATE_RECONCILIATION_EVENTS,
+    _CREATE_RUNTIME_CHECKPOINTS,
     _CREATE_INDEX_SIGNALS,
     _CREATE_INDEX_RISK_EVENTS,
     _CREATE_INDEX_ORDER_INTENTS_STATUS,
@@ -1403,14 +1432,45 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
     connection.execute(_CREATE_INDEX_RECONCILIATION_EVENTS)
 
 
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """Add the durable per-symbol completed-bar checkpoint table.
+
+    Purely additive: one new table, no existing table touched, no column
+    widened, no row rewritten. Phase 8's `reconciliation_runs` and
+    `reconciliation_events` rows, every order intent, every broker snapshot,
+    every fractional quantity and every daily risk baseline are carried across
+    untouched because nothing here reads or writes them.
+
+    The table starts **empty**, and that is the correct starting state rather
+    than an omission. A checkpoint claims that some process already acted on a
+    bar; a database that has never held one has no such claim to make, and
+    backfilling a "last processed bar" from `signals` would be inventing a
+    claim about work this schema never recorded as claimed.
+
+    Runs inside the caller's transaction, so a failure anywhere in the upgrade
+    rolls this table back with the rest of it.
+    """
+    existing = _existing_table_names(connection)
+    conflicting = sorted(table for table in V5_TABLES if table in existing)
+    if conflicting:
+        raise DatabaseStateError(
+            f"Cannot upgrade this database to schema version {SCHEMA_VERSION}: it "
+            f"already contains table(s) {', '.join(conflicting)}. Refusing to "
+            "migrate over an inconsistent database."
+        )
+
+    connection.execute(_CREATE_RUNTIME_CHECKPOINTS)
+
+
 #: Each supported upgrade, in order: the version it produces and how to get
 #: there. `initialize_database` runs every step above the database's current
-#: version, in one transaction, so v1 -> v4 is v1 -> v2 -> v3 -> v4 and never a
-#: separate shortcut path that could drift from any of them.
+#: version, in one transaction, so v1 -> v5 is v1 -> v2 -> v3 -> v4 -> v5 and
+#: never a separate shortcut path that could drift from any of them.
 _MIGRATIONS = (
     (2, _migrate_v1_to_v2),
     (3, _migrate_v2_to_v3),
     (4, _migrate_v3_to_v4),
+    (5, _migrate_v4_to_v5),
 )
 
 
@@ -1947,7 +2007,7 @@ def list_positions(connection: sqlite3.Connection) -> list[Position]:
 #
 # The durable local record written *before* the broker is called. Its
 # `client_order_id` is the idempotency key required by docs/SPEC.md section
-# 6E, and it is what a later phase uses to ask the broker what happened to a
+# 6E, and it is what reconciliation uses to ask the broker what happened to a
 # submission this process did not live to see the answer to.
 # --------------------------------------------------------------------------
 
@@ -2373,11 +2433,10 @@ def ensure_daily_risk_baseline(
     fresh date still agree on the same baseline.
 
     Honest limitation: this records the first equity this system *observed*,
-    not the equity at exactly 00:00 UTC. Nothing in this milestone runs
-    continuously, so if the first observation of a day happens hours in, the
-    baseline is that later figure. A 24/7 runner (Phase 9) is what will make
-    the first observation land near the boundary; until then, the recorded
-    `captured_at` is what says how close it actually was.
+    not the equity at exactly 00:00 UTC. If the first observation of a day
+    happens hours in, the baseline is that later figure. The C9 runner, running
+    continuously, is what makes the first observation land near the boundary,
+    and the recorded `captured_at` is what says how close it actually was.
     """
     date_text = to_risk_date_text(risk_date_utc)
     equity_text = to_decimal_text(_require_positive_quantity(baseline_equity, "baseline_equity"))
@@ -2650,6 +2709,93 @@ def list_reconciliation_events(
     return [_to_reconciliation_event(row) for row in rows]
 
 
+# --------------------------------------------------------------------------
+# Runtime checkpoints (schema v5)
+#
+# The durable half of the duplicate-bar guard. Phase 9 shipped an in-process
+# checkpoint, which is enough to stop one process acting twice on one bar and
+# useless across a restart: a runner that came back up would see the same
+# newest completed bar and act on it again. This table is what makes the claim
+# outlive the process that made it.
+#
+# One row per symbol. The claim is monotonic and is enforced in SQL as well as
+# in the caller, so an out-of-order write cannot move a symbol's checkpoint
+# backwards and re-open a bar something already acted on.
+# --------------------------------------------------------------------------
+
+_UPSERT_RUNTIME_CHECKPOINT = """
+INSERT INTO runtime_checkpoints (symbol, last_processed_bar_timestamp, updated_at)
+VALUES (?, ?, ?)
+ON CONFLICT (symbol) DO UPDATE SET
+    last_processed_bar_timestamp = excluded.last_processed_bar_timestamp,
+    updated_at = excluded.updated_at
+WHERE excluded.last_processed_bar_timestamp > runtime_checkpoints.last_processed_bar_timestamp
+"""
+_SELECT_RUNTIME_CHECKPOINT = """
+SELECT symbol, last_processed_bar_timestamp, updated_at
+FROM runtime_checkpoints WHERE symbol = ?
+"""
+_SELECT_RUNTIME_CHECKPOINTS = """
+SELECT symbol, last_processed_bar_timestamp, updated_at
+FROM runtime_checkpoints ORDER BY symbol
+"""
+
+
+def _to_runtime_checkpoint(row: sqlite3.Row) -> RuntimeCheckpoint:
+    return RuntimeCheckpoint(
+        symbol=str(row["symbol"]),
+        last_processed_bar_timestamp=from_utc_text(row["last_processed_bar_timestamp"]),
+        updated_at=from_utc_text(row["updated_at"]),
+    )
+
+
+def upsert_runtime_checkpoint(
+    connection: sqlite3.Connection,
+    *,
+    symbol: str,
+    last_processed_bar_timestamp: datetime,
+    updated_at: datetime,
+) -> None:
+    """Durably claim `last_processed_bar_timestamp` as acted on for `symbol`.
+
+    **Committed before it returns.** This is the whole point of the table: the
+    caller writes the claim, the transaction commits, and only then may the bar
+    reach a strategy decision or a broker. A separate connection - a second
+    process, or a test - can read the claim the instant this returns.
+
+    **Monotonic, in SQL.** An older timestamp than the stored one updates
+    nothing. The `WHERE` on the upsert is not belt-and-braces around a caller
+    check; it is where the rule lives, so a provider that repeats an older bar
+    or a write that arrives out of order cannot re-open a claimed bar.
+
+    Timestamps are stored in the same canonical UTC text form as every other
+    column here, which is lexicographically ordered for a fixed offset - so the
+    string comparison above is a time comparison.
+
+    The safety preference this encodes is explicit: **miss a trade rather than
+    duplicate a trade.** A crash after this commits and before the order is
+    submitted loses that bar's opportunity permanently. A crash without it
+    would let a restart submit a second order for a crossover that happened
+    once, which is the failure that actually costs money.
+    """
+    ticker = _require_symbol(symbol)
+    bar_text = to_utc_text(last_processed_bar_timestamp, "last_processed_bar_timestamp")
+    updated_text = to_utc_text(updated_at, "updated_at")
+    with transaction(connection):
+        connection.execute(_UPSERT_RUNTIME_CHECKPOINT, (ticker, bar_text, updated_text))
+
+
+def get_runtime_checkpoint(connection: sqlite3.Connection, symbol: str) -> RuntimeCheckpoint | None:
+    """The durable claim for `symbol`, or None when no bar has been claimed."""
+    row = connection.execute(_SELECT_RUNTIME_CHECKPOINT, (_require_symbol(symbol),)).fetchone()
+    return None if row is None else _to_runtime_checkpoint(row)
+
+
+def list_runtime_checkpoints(connection: sqlite3.Connection) -> list[RuntimeCheckpoint]:
+    """Every durable bar claim, ordered by symbol."""
+    return [_to_runtime_checkpoint(row) for row in connection.execute(_SELECT_RUNTIME_CHECKPOINTS)]
+
+
 __all__ = [
     "BUSY_TIMEOUT_MS",
     "DEFAULT_DATABASE_PATH",
@@ -2683,6 +2829,7 @@ __all__ = [
     "V2_TABLES",
     "V3_TABLES",
     "V4_TABLES",
+    "V5_TABLES",
     "DailyRiskBaseline",
     "DatabaseStateError",
     "DuplicateBrokerOrderError",
@@ -2691,6 +2838,7 @@ __all__ = [
     "Position",
     "ReconciliationEvent",
     "ReconciliationRun",
+    "RuntimeCheckpoint",
     "RiskEvent",
     "StateError",
     "StateInputError",
@@ -2716,6 +2864,7 @@ __all__ = [
     "get_order_intent_by_client_id",
     "get_position",
     "get_reconciliation_run",
+    "get_runtime_checkpoint",
     "get_schema_version",
     "get_strategy_run",
     "initialize_database",
@@ -2726,6 +2875,7 @@ __all__ = [
     "list_positions",
     "list_reconciliation_events",
     "list_reconciliation_runs",
+    "list_runtime_checkpoints",
     "list_risk_events",
     "list_signals",
     "list_strategy_runs",
@@ -2744,5 +2894,6 @@ __all__ = [
     "update_order_intent_status",
     "upsert_broker_order",
     "upsert_position",
+    "upsert_runtime_checkpoint",
     "utc_risk_date",
 ]

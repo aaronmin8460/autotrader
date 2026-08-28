@@ -12,7 +12,7 @@ cannot trade live" checkable by reading a single module.
 decided to do, at what size risk allowed, and under which idempotency key -
 before any broker is contacted. Constructing one places nothing; it is inert
 data. Its `client_order_id` is generated exactly once, at construction, and is
-the anchor that lets a later phase ask the broker what became of a submission
+the anchor that lets reconciliation ask the broker what became of a submission
 this process did not live to see the answer to (docs/SPEC.md section 6E).
 
 **Quantities are exact Decimals, and already risk-approved.** Crypto is

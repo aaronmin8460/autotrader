@@ -6,18 +6,23 @@ run as a local Python CLI process against an Alpaca **paper** account.
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Crypto V0.2 with Phase 8 and Phase 9 merged. Next: the integration gate
+## Status: Crypto V0.2 with Phase 8 and Phase 9 integrated. Next: the integrated paper smoke gate
 
 **Current active version: Crypto V0.2.** The system trades BTC/USD and ETH/USD
 only, on 15-minute bars, 24 hours a day and 7 days a week.
 
-**Phase 8 and Phase 9 are both merged here, and not yet wired together.** The
-runtime wakes on completed 15-minute UTC boundaries, fetches, validates,
-evaluates the strategy, records signals and logs a heartbeat - but broker
-submission stays off until its startup-safety check says trading is safe, and
-that check still reports `UNRESOLVED` until reconciliation is connected to it.
-That is the intended state at this commit: a process that assumes its local
-view survived the last shutdown is how a duplicate position gets created.
+**Phase 8 and Phase 9 are integrated.** The runtime wakes on completed
+15-minute UTC boundaries, fetches, validates, evaluates the strategy, records
+signals and logs a heartbeat - and before any of that, it reconciles local
+state against the paper broker and refuses to submit unless that pass reports
+`safe_to_trade`. A process that assumed its local view survived the last
+shutdown is how a duplicate position gets created, so the runtime asks the
+broker instead of assuming.
+
+**No integrated paper BUY has been observed end to end yet.** The integration
+is green offline and has been exercised read-only against the real paper
+account; the smoke gate that actually places one order is the next step, and
+nothing is deployed before it.
 
 **Archived milestone: Equity V0.1** is preserved at the Git tag
 [`equity-v0.1-phase7`](#the-archived-equity-milestone). It was a complete,
@@ -31,7 +36,7 @@ What exists today: downloading historical 15-minute crypto bars from Alpaca's
 US crypto feed as Parquet, validating a stored dataset, the EMA 20 / EMA 50
 signal generator, a deterministic backtester with fractional positions and a
 modelled taker fee, a deterministic risk engine, a local SQLite
-operational-state database at schema v4, a single deliberately awkward
+operational-state database at schema v5, a single deliberately awkward
 paper-order command, a crash-recovery reconciliation command, and the 24/7
 runtime that drives all of it on a schedule. Validation never downloads or
 repairs data; the strategy emits signals only; the backtester is local
@@ -61,10 +66,10 @@ A position mismatch is corrected in the database, never by trading. The
 command reports one answer a runtime can act on, `safe_to_trade`, which is
 false for anything ambiguous.
 
-**The 24/7 runner exists, and it is deliberately not allowed to trade yet.**
-It loops on completed 15-minute UTC boundaries, observes, and records; broker
-submission is gated on a startup-safety answer that only reconciliation can
-give, and connecting the two is the integration gate. See
+**The 24/7 runner reconciles before it is allowed to trade.** It loops on
+completed 15-minute UTC boundaries, observes, and records; broker submission is
+gated on the startup reconciliation answer, on the paper environment gate, and
+on a runtime `PAPER` confirmation - all three, on every start. See
 [The 24/7 runtime](#the-247-runtime).
 
 ## Scope summary
@@ -82,8 +87,11 @@ give, and connecting the two is the integration gate. See
 | Leverage / shorting | None |
 | Research strategy | EMA 20 / EMA 50 crossover (engineering validation only) |
 | Historical storage | Parquet |
-| Operational state | SQLite, local file, schema v4 |
+| Operational state | SQLite, local file, schema v5 |
 | Quantities | Fractional, `decimal.Decimal` |
+| Startup authority | Reconciliation `safe_to_trade` - no green result, no order |
+| Duplicate protection | OS process lock + durable per-symbol bar checkpoints |
+| Safety preference | At-most-once: miss a trade rather than duplicate one |
 | Interface | Python CLI, local process - no web frontend |
 
 Out of scope: live trading, US equities, options, futures, forex, perpetual
@@ -209,8 +217,8 @@ present - non-negative `trade_count` and positive `vwap`.
 
 It deliberately does **not** check bar-to-bar spacing or bar freshness.
 Crypto is continuous, but a provider outage can still leave a gap, and
-"did we receive the newest completed bar?" is a runtime question that belongs
-to the future 24/7 runner rather than to structural validation. There is no
+"did we receive the newest completed bar?" is a runtime question, answered by
+[the 24/7 runner](#the-247-runtime) rather than by structural validation. There is no
 exchange calendar here and no session logic: a Saturday bar and a 03:00 UTC bar
 are ordinary data.
 
@@ -449,7 +457,7 @@ Writes are transactional: `transaction()` commits on success and rolls back on
 **any** exception. All timestamps are ISO-8601 UTC in one canonical form, and
 **naive datetimes are rejected**.
 
-Eleven tables exist:
+Twelve tables exist:
 
 | Table | Holds |
 | --- | --- |
@@ -464,6 +472,7 @@ Eleven tables exist:
 | `daily_risk_baselines` | The UTC-day equity baseline the loss halt measures against |
 | `reconciliation_runs` | What one finished reconciliation pass concluded (v4) |
 | `reconciliation_events` | Which order or position it repaired, observed, or could not settle (v4) |
+| `runtime_checkpoints` | The newest completed bar the runtime durably claimed, per symbol (v5) |
 
 **There is still no fill persistence.** No `fills`, `executions`, or
 `broker_accounts` table exists. Order-level `filled_quantity` is what
@@ -481,6 +490,23 @@ fresh database uses, copied across column by column, and the old copy dropped.
 No row's meaning changes: the rebuild only makes one more status storable, and
 writes no row into it. The two new tables arrive empty, because backfilling an
 audit trail that never happened would be a fabrication.
+
+### Schema v5: the durable bar checkpoint
+
+v5 adds one table, `runtime_checkpoints`, and changes nothing else. One row per
+symbol, holding the newest completed bar that runtime has durably claimed:
+
+| Column | Holds |
+| --- | --- |
+| `symbol` | `BTC/USD` or `ETH/USD`, PRIMARY KEY |
+| `last_processed_bar_timestamp` | The newest completed bar start acted on |
+| `updated_at` | When the claim was written |
+
+The claim is **monotonic in SQL**, not merely in the caller: an upsert with an
+older timestamp updates nothing, so an out-of-order write cannot re-open a bar
+something already acted on. See [One bar, one
+decision](#one-bar-one-decision---including-across-a-restart) for why the claim
+is committed before the broker is ever called.
 
 ### Exact decimal quantities (schema v3)
 
@@ -508,9 +534,9 @@ fractional USD mark, and moving prices to text would discard the
 `CHECK (... > 0)` constraints that make an impossible price unstorable even by
 a writer bypassing this module. A price here is a mark, never a quantity.
 
-### Schema migration (v1 -> v2 -> v3 -> v4)
+### Schema migration (v1 -> v2 -> v3 -> v4 -> v5)
 
-A new database is created directly at v4. An older one is upgraded through an
+A new database is created directly at v5. An older one is upgraded through an
 explicit ordered path, in a single transaction, so a failed upgrade rolls back
 and leaves the database on its original version rather than half-migrated.
 
@@ -532,6 +558,11 @@ v3 -> v4 uses the same rebuild machinery for a smaller reason: only
 is copied verbatim - no value is converted and no row changes meaning - and the
 two reconciliation tables are created empty alongside it. The byte-identity
 test covers this path too, from v1, v2, and v3 alike.
+
+**v4 -> v5 is purely additive** - one new table and nothing else. A test asserts
+every pre-existing schema object comes through byte-identical, and that the
+reconciliation runs and events, order intents, fractional quantities and daily
+risk baselines a v4 database already held are all still there afterwards.
 
 A database written by a **newer** version is still refused and left untouched.
 
@@ -811,17 +842,25 @@ the database - no repair, no run row, no event. Opening the database still
 applies any pending schema migration, as every command here does; that is a
 structural upgrade, not a reconciliation result.
 
+### Run by hand, and run automatically
+
+`autotrader reconcile` remains available for diagnostics and manual repair, and
+it runs once, when asked, and returns. It is **not** a step an operator has to
+remember before every daemon start: [`crypto-run`](#the-247-runtime) invokes
+this same pass itself at startup. Both callers share one implementation - there
+is no second copy of reconciliation anywhere in the repository.
+
 ### Not implemented here
 
 No order replacement or cancellation, no fill history, no automatic retry, and
-no loop, scheduler, or heartbeat. Reconciliation runs once, when asked, and
-returns.
+no loop, scheduler, or heartbeat of its own.
 
 ## The 24/7 runtime
 
 `crypto-run` is the long-running process. It adds no trading logic: the data,
-validation, strategy, risk, state, and paper-execution stages are the existing
-ones, and it is the schedule and the safety envelope around them.
+validation, strategy, risk, state, reconciliation and paper-execution stages
+are the existing ones, and it is the schedule and the safety envelope around
+them.
 
 Run one completed-bar cycle and exit - the intended way to check the runtime by
 hand, and safe with no gate open:
@@ -830,11 +869,49 @@ hand, and safe with no gate open:
 python -m autotrader.cli crypto-run --once --observe-only
 ```
 
-Run it continuously:
+Run it continuously, with paper submission enabled:
 
 ```bash
-python -m autotrader.cli crypto-run --confirm-paper-runtime PAPER
+AUTOTRADER_PAPER_TRADING_ENABLED=true python -m autotrader.cli crypto-run --confirm-paper-runtime PAPER
 ```
+
+You do **not** have to run `reconcile` first. Every start reconciles on its
+own; the standalone command remains for diagnostics and manual repair.
+
+### Startup: reconcile, then decide
+
+Every `crypto-run` start does this, in this order, before it observes anything:
+
+```
+1. acquire the OS single-instance runtime lock
+2. open the operational SQLite database
+3. apply any pending schema migration
+4. construct/verify the Alpaca PAPER read boundary
+5. run reconcile_paper_state(connection)
+6. evaluate the result
+7. CLEAN or REPAIRED -> safe to trade
+   UNRESOLVED or FAILED -> not safe to trade
+8. start runtime observation
+9. submit only if safe AND the env gate is open AND PAPER was confirmed
+```
+
+Step 5 is the real Phase 8 pass, not a placeholder, and **nothing bypasses it**.
+There is no environment variable and no flag combination that reaches the broker
+while reconciliation says no.
+
+A start that is not safe does not crash and does not continue silently: it says
+
+```
+RECONCILIATION NOT SAFE - TRADING DISABLED
+```
+
+on the banner and in the logs, reports the reconciliation status in the
+heartbeat, keeps observing, and exits `0`. `--observe-only` still reconciles -
+knowing whether local state survived is useful either way - and still cannot
+submit, because it constructs no execution path at all.
+
+Each start reconciles for itself. A previous run's green result describes the
+world at the moment it was produced, and is never carried across a restart.
 
 ### The schedule
 
@@ -865,17 +942,41 @@ request. Two provider calls every fifteen minutes for the whole system: nothing
 polls, and the account and positions are read only when a signal actually needs
 sizing.
 
-### One bar, one decision
+### One bar, one decision - including across a restart
 
 BTC/USD is processed to completion before ETH/USD is looked at, so two signals
 landing on the same boundary cannot size themselves against the same stale cash
 figure. Only the **newest completed bar** may cause an action: older crossovers
-in the lookback exist to establish EMA state and are never replayed. A
-per-symbol checkpoint means a completed bar is acted on at most once per
-process, even if the provider repeats it.
+in the lookback exist to establish EMA state and are never replayed.
 
-Cross-restart exactly-once recovery is Phase 8's, and is deliberately not
-invented here.
+A per-symbol checkpoint in `runtime_checkpoints` (schema v5) is **committed
+before** the bar can reach the strategy, so the claim outlives the process that
+made it. A restarted runner sees its predecessor's claim and skips the bar.
+
+The lock and the checkpoint solve different problems and both are kept: the
+`fcntl` lock stops two runners existing at once, the checkpoint stops one
+runner - or its replacement after a crash - acting twice on one bar.
+
+#### Safety preference: miss a trade rather than duplicate a trade
+
+The chain is:
+
+```
+completed bar -> durable claim (committed) -> signal -> risk
+              -> OrderIntent committed -> broker submission
+```
+
+| Crash point | After restart |
+| --- | --- |
+| before the durable claim | the bar may be processed |
+| after the claim, before the intent | the bar is **skipped** - that trade is missed, permanently |
+| after the intent, before submit | reconciliation resolves `CREATED` / no broker order |
+| during submit | reconciliation resolves `UNKNOWN` by the persisted `client_order_id` |
+| after submit | reconciliation repairs from broker truth |
+
+This is **at-most-once**, not exactly-once, and it does not pretend otherwise.
+Losing one fifteen-minute crossover is recoverable; a duplicate position is
+not.
 
 ### Three gates, all closed by default
 
@@ -886,8 +987,7 @@ Unattended paper execution requires **all** of:
 2. `--confirm-paper-runtime PAPER`, which authorizes *this process* for its
    lifetime. A daemon cannot have a token typed every fifteen minutes, so the
    confirmation moved to process start rather than being removed;
-3. a startup-safety check reporting that trading is safe - which, until Phase 8
-   is integrated, it never does.
+3. startup reconciliation reporting `safe_to_trade` - `CLEAN` or `REPAIRED`.
 
 `--observe-only` goes further than refusing: it constructs no execution path at
 all. There is still no live mode, no `--live`, and no `paper=False`.
@@ -902,7 +1002,9 @@ all. There is still no live mode, no `--live`, and no `paper=False`.
 | Rejected credentials, untradable account, broken state | stops, fails closed; exit `1` |
 
 An `UNKNOWN` outcome means an order may or may not exist at the broker. Nothing
-here resolves it, and nothing else is submitted on top of it.
+resolves it *inside that cycle*, and nothing else is submitted on top of it.
+Recovery is a **new process**, which runs startup reconciliation before it may
+trade again - the same pass, at the only moment allowed to reopen the gate.
 
 ### Monitoring and operation
 
@@ -946,15 +1048,16 @@ src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals
 src/autotrader/backtest/    deterministic next-bar-open backtester, fractional
                             quantities, modelled taker fee
 src/autotrader/risk/        deterministic risk decisions and sizing
-src/autotrader/state/       local SQLite operational state, schema v4
+src/autotrader/state/       local SQLite operational state, schema v5
 src/autotrader/execution/   Alpaca PAPER crypto execution - the only place a
                             trading client exists or an order is sent
 src/autotrader/reconciliation/
                             crash recovery: broker truth -> local state, and
                             the safe_to_trade startup answer
 src/autotrader/runtime/     the 24/7 loop: UTC boundary scheduling, bounded
-                            bar fetching, startup safety, duplicate
-                            protection, heartbeat, process lock
+                            bar fetching, startup reconciliation, durable
+                            per-symbol bar checkpoints, heartbeat, process
+                            lock
 tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)
 data/processed/             validated market data (git-ignored)
@@ -964,11 +1067,13 @@ docs/SPEC.md                authoritative scope specification
 
 ## What comes next
 
-**The integration gate.** Phase 8's reconciliation result becomes the
-startup-safety answer the runtime already asks for and already fails closed
-against, and the in-process bar checkpoint gains a durable counterpart. Until
-that lands, the runtime observes and does not trade - by design, not by
-accident.
+**The integrated crypto paper smoke gate.** The integration is code-complete,
+green offline, and has been exercised read-only against the real paper account.
+What has not happened is an integrated paper BUY observed end to end. That is
+next.
 
-**Phase 10 - Deployment** comes after the integrated paper smoke gate and
-failure injection.
+**Failure injection** follows: crash the process at each point in the
+claim/intent/submit chain and confirm the documented recovery in every case.
+
+**Phase 10 - Deployment** comes after both. Supervising a process whose first
+integrated paper order has not been observed would be premature.

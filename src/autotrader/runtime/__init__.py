@@ -13,10 +13,11 @@ What this package owns:
   rule that a bar is complete only once its whole interval has elapsed.
 - **Bounded fetching** (`market_data`) - one small request per symbol per
   boundary, never a re-download of history.
-- **Startup safety** (`safety`) - the narrow seam Phase 8's reconciliation will
-  be connected to. Until it is, the answer is `UNRESOLVED` and no order is sent.
+- **Startup safety** (`safety`) - the seam Phase 8's reconciliation is
+  connected to. `reconcile_paper_state(...).safe_to_trade` is the startup
+  trading authority; anything but `CLEAN` or `REPAIRED` sends no order.
 - **Duplicate protection** (`checkpoint`) - one completed bar, one decision,
-  per symbol, per process.
+  per symbol, durably, across restarts (schema v5).
 - **Monitoring** (`monitoring`) - a heartbeat and structured standard-library
   logging. No agent, no service, no chat integration.
 - **Single-instance protection** (`lock`) - an OS file lock, because two
@@ -24,11 +25,16 @@ What this package owns:
 - **The loop** (`runner`) - synchronous, signal-aware, and fail-closed in three
   directions: startup safety, the paper gates, and an ambiguous outcome.
 
-There is no reconciliation here, no live mode, no equity symbol, no market
-session, and no deployment artefact (docs/SPEC.md section 8).
+Reconciliation itself is not re-implemented here - `autotrader.reconciliation`
+owns it, and this package calls it. There is no live mode, no equity symbol, no
+market session, and no deployment artefact (docs/SPEC.md section 8).
 """
 
-from autotrader.runtime.checkpoint import InMemoryCheckpoint, ProcessedBarCheckpoint
+from autotrader.runtime.checkpoint import (
+    InMemoryCheckpoint,
+    ProcessedBarCheckpoint,
+    SqliteCheckpoint,
+)
 from autotrader.runtime.execution import (
     BrokerAuthenticationError,
     ExecutionGateway,
@@ -68,12 +74,15 @@ from autotrader.runtime.runner import (
     classify,
 )
 from autotrader.runtime.safety import (
+    RECONCILIATION_NOT_SAFE_BANNER,
     STARTUP_SAFETY_CODES,
     STARTUP_SAFETY_SAFE,
     STARTUP_SAFETY_UNRESOLVED,
     STARTUP_SAFETY_UNSAFE,
     StartupSafetyCheck,
     StartupSafetyResult,
+    startup_safety_from_reconciliation,
+    startup_safety_from_reconciliation_result,
     unresolved_startup_safety,
 )
 from autotrader.runtime.schedule import (
@@ -109,6 +118,7 @@ __all__ = [
     "MAX_SAFETY_DELAY",
     "MIN_LOOKBACK_BARS",
     "PROCESSING_ORDER",
+    "RECONCILIATION_NOT_SAFE_BANNER",
     "RISK_SIZED_REQUEST_QUANTITY",
     "RUNTIME_CONFIRMATION_TOKEN",
     "RUNTIME_RUN_MODE",
@@ -138,6 +148,7 @@ __all__ = [
     "RuntimeState",
     "ScheduleError",
     "ShutdownRequest",
+    "SqliteCheckpoint",
     "StartupSafetyCheck",
     "StartupSafetyResult",
     "SymbolCycleResult",
@@ -158,5 +169,7 @@ __all__ = [
     "require_lookback_bars",
     "require_safety_delay",
     "require_utc",
+    "startup_safety_from_reconciliation",
+    "startup_safety_from_reconciliation_result",
     "unresolved_startup_safety",
 ]

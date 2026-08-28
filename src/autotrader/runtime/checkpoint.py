@@ -1,28 +1,44 @@
-"""C9: the in-process per-symbol processed-bar checkpoint.
+"""C9: the per-symbol processed-bar checkpoint, in memory and on disk.
 
-One completed bar must produce at most one strategy action per symbol per
-process. Sleep timing is not what guarantees that: a provider can repeat the
-newest completed bar across two fetches, a cycle can overrun into the next
-boundary, and `--once` can be run twice in quick succession. So the runtime
-records what it has already acted on and checks it explicitly.
+One completed bar must produce at most one strategy action per symbol. Sleep
+timing is not what guarantees that: a provider can repeat the newest completed
+bar across two fetches, a cycle can overrun into the next boundary, `--once`
+can be run twice in quick succession, and a process can be restarted a second
+after it died. So the runtime records what it has already acted on and checks
+it explicitly.
 
-**Scope: this process only.** Cross-restart exactly-once recovery is Phase 8's
-and is deliberately not invented here - a checkpoint that survived a restart
-without being reconciled against the broker would be a *claim* about the
-broker's state, which is precisely the claim only reconciliation may make.
+**Two problems, two mechanisms, and both are needed.** The single-instance lock
+(`runtime.lock`) stops two runners existing at once. This checkpoint stops one
+runner - or its replacement after a crash - acting twice on the same bar. A
+lock says "only one of you"; a checkpoint says "and that one has already done
+this bar". Neither substitutes for the other.
 
-The interface is separate from its implementation for exactly that reason. The
-runtime depends on `ProcessedBarCheckpoint`; Phase 9 ships
-`InMemoryCheckpoint`; the integration gate can supply a durable one without
-the runtime changing, and **without this branch touching the SQLite schema**.
+**The durable implementation is the production one.** `SqliteCheckpoint`
+records the claim in `runtime_checkpoints` (schema v5) and commits it before
+returning, so the claim outlives the process that made it.
+`InMemoryCheckpoint` remains for tests and for a caller that genuinely wants a
+process-scoped guard.
+
+**The safety preference is explicit: miss a trade rather than duplicate one.**
+A bar is claimed *before* it may cause a decision or a submission, so a crash
+between the claim and the broker call loses that bar permanently. That is the
+side of the trade this system chooses. The other side - claiming after
+submission - would let a restart place a second order for a crossover that
+happened once, and no reconciliation pass can un-place an order.
+
+This is not exactly-once execution, and nothing here pretends it is. It is
+at-most-once, which is achievable locally with one SQLite file and is the
+property actually worth having.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import sqlite3
+from datetime import UTC, datetime
 from typing import Protocol
 
 from autotrader.runtime.schedule import require_utc
+from autotrader.state import sqlite as state
 
 
 class ProcessedBarCheckpoint(Protocol):
@@ -36,7 +52,7 @@ class ProcessedBarCheckpoint(Protocol):
 
 
 class InMemoryCheckpoint:
-    """The Phase 9 implementation: a dict that dies with the process.
+    """A dict that dies with the process. For tests and process-scoped use.
 
     Monotonic on purpose. A bar older than the newest one already processed
     never moves the checkpoint backwards, so an out-of-order provider response
@@ -62,4 +78,45 @@ class InMemoryCheckpoint:
         return dict(self._latest)
 
 
-__all__ = ["InMemoryCheckpoint", "ProcessedBarCheckpoint"]
+class SqliteCheckpoint:
+    """The production checkpoint: one committed row per symbol, in schema v5.
+
+    `mark_processed` returns only once the claim is committed. A second
+    connection - another process, or a test holding one open - can read it
+    immediately, which is exactly the property that makes a restart safe and
+    exactly what a test can assert without trusting this docstring.
+
+    Reads are not cached. The database is the claim; a cache in front of it
+    would be a second answer that could disagree with the one that matters, and
+    two reads per cycle of a one-row-per-symbol table costs nothing.
+
+    Monotonicity is enforced by the storage layer's upsert rather than here, so
+    a bar older than the stored claim cannot move it backwards even if this
+    class is bypassed.
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def last_processed(self, symbol: str) -> datetime | None:
+        checkpoint = state.get_runtime_checkpoint(self._connection, symbol)
+        return None if checkpoint is None else checkpoint.last_processed_bar_timestamp
+
+    def mark_processed(self, symbol: str, bar_timestamp: datetime) -> None:
+        moment = require_utc(bar_timestamp, "bar_timestamp")
+        state.upsert_runtime_checkpoint(
+            self._connection,
+            symbol=symbol,
+            last_processed_bar_timestamp=moment,
+            updated_at=datetime.now(UTC),
+        )
+
+    def as_dict(self) -> dict[str, datetime]:
+        """A copy of the stored checkpoints, for status reporting."""
+        return {
+            checkpoint.symbol: checkpoint.last_processed_bar_timestamp
+            for checkpoint in state.list_runtime_checkpoints(self._connection)
+        }
+
+
+__all__ = ["InMemoryCheckpoint", "ProcessedBarCheckpoint", "SqliteCheckpoint"]

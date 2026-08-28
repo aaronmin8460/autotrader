@@ -72,6 +72,7 @@ from autotrader.reconciliation import (
     ReconciliationStatus,
     reconcile_paper_state,
 )
+from autotrader.runtime.checkpoint import SqliteCheckpoint
 from autotrader.runtime.execution import PaperExecutionGateway
 from autotrader.runtime.lock import RuntimeLock, RuntimeLockError, lock_path_for
 from autotrader.runtime.market_data import AlpacaCryptoBars
@@ -82,6 +83,11 @@ from autotrader.runtime.runner import (
     CryptoRuntime,
     RuntimeConfig,
     ShutdownRequest,
+)
+from autotrader.runtime.safety import (
+    RECONCILIATION_NOT_SAFE_BANNER,
+    STARTUP_SAFETY_SAFE,
+    startup_safety_from_reconciliation,
 )
 from autotrader.runtime.schedule import (
     DEFAULT_LOOKBACK_BARS,
@@ -151,14 +157,16 @@ def cli() -> None:
 
     Historical crypto market data, dataset validation, EMA crossover signals,
     local backtesting, a deterministic risk engine, local SQLite state, Alpaca
-    **paper** order submission, and crash-recovery reconciliation. Crypto spot
-    only: BTC/USD and ETH/USD.
+    **paper** order submission, crash-recovery reconciliation, and the 24/7
+    runtime that drives all of it. Crypto spot only: BTC/USD and ETH/USD.
 
-    There is no live trading. `paper-submit` talks to Alpaca's paper
-    environment only, behind an environment gate and an explicit confirmation
-    token; no command, flag, or environment variable can direct an order at a
-    real-money account. `reconcile` reads that same paper account and repairs
-    local state from it, and can never place an order.
+    There is no live trading. `paper-submit` and `crypto-run` talk to Alpaca's
+    paper environment only, behind an environment gate and an explicit
+    confirmation token; no command, flag, or environment variable can direct an
+    order at a real-money account. `reconcile` reads that same paper account
+    and repairs local state from it, and can never place an order - and
+    `crypto-run` runs that same pass itself at startup, refusing to submit
+    anything unless it comes back safe.
     """
 
 
@@ -525,7 +533,7 @@ def paper_submit(
         typer.echo(_field("Filled Qty", format_quantity(snapshot.filled_quantity)))
     typer.echo("")
     typer.echo("Accepted is not filled. Local positions are not updated from an")
-    typer.echo("accepted order; reconciliation against the broker is a later phase.")
+    typer.echo("accepted order. Run `autotrader reconcile` to settle it against the broker.")
 
 
 _RECONCILE_EXIT_CODES = {
@@ -678,9 +686,17 @@ def _echo_runtime_banner(runtime: CryptoRuntime, *, once: bool, lock: Path) -> N
     typer.echo(_field("Symbols", ", ".join(PROCESSING_ORDER)))
     typer.echo(_field("Mode", "ONCE" if once else "RUN"))
     typer.echo(_field("Bar Interval", "15m, completed bars only"))
+    typer.echo(_field("Reconciliation", heartbeat.reconciliation_status or "NOT RUN"))
     typer.echo(_field("Startup Safety", heartbeat.startup_safety_code))
     typer.echo(_field("Lock File", str(lock)))
     typer.echo("")
+    if heartbeat.startup_safety_code != STARTUP_SAFETY_SAFE:
+        # Loud, and separate from the execution line below: a closed paper gate
+        # and an unsafe reconciliation both end in "no order", and an operator
+        # has to be able to tell which one they are looking at.
+        typer.secho(RECONCILIATION_NOT_SAFE_BANNER, fg=typer.colors.RED)
+        typer.echo(runtime.startup_safety_message)
+        typer.echo("")
     if authorization.enabled:
         typer.secho("PAPER EXECUTION ENABLED", fg=typer.colors.YELLOW)
         typer.echo("Signals on completed bars may be submitted to the PAPER account.")
@@ -700,6 +716,8 @@ def _echo_runtime_summary(runtime: CryptoRuntime) -> None:
     for symbol, timestamp in heartbeat.last_processed_bars.items():
         label = f"Last {symbol} Bar"
         typer.echo(_field(label, timestamp.isoformat() if timestamp else "none"))
+    for symbol, timestamp in runtime.checkpoints.items():
+        typer.echo(_field(f"Checkpoint {symbol}", timestamp.isoformat()))
     typer.echo(_field("Orders Submitted", str(heartbeat.orders_submitted)))
     typer.echo(_field("Provider Calls", str(heartbeat.api_calls_total)))
     if heartbeat.last_error is not None:
@@ -753,22 +771,35 @@ def crypto_run(
     every gate is open - hand that signal to the existing paper execution path.
 
     An in-progress candle is never processed, and a completed bar is never
-    processed twice within one process.
+    processed twice - not within one process, and not across a restart: the
+    per-symbol bar checkpoint is committed to SQLite before the bar can reach
+    the strategy, so a restarted runner skips what its predecessor claimed. The
+    preference that encodes is deliberate and one-sided: miss a trade rather
+    than duplicate a trade.
+
+    \b
+    Every start reconciles first, in this order:
+      1. acquire the single-instance runtime lock
+      2. open the database and apply any pending migration
+      3. run reconciliation against the Alpaca PAPER account
+      4. CLEAN or REPAIRED -> safe to trade; UNRESOLVED or FAILED -> not
+
+    Running `autotrader reconcile` beforehand is NOT required; that command
+    remains available for diagnostics and manual repair.
 
     \b
     Unattended paper execution requires ALL of:
       1. AUTOTRADER_PAPER_TRADING_ENABLED=true in the environment
       2. --confirm-paper-runtime PAPER on the command line
-      3. a startup-safety check reporting that trading is safe
+      3. startup reconciliation reporting that trading is safe
 
-    The third is the one that is not satisfiable in this build: reconciliation
-    against the broker is Phase 8 and is not integrated here, so startup safety
-    reports UNRESOLVED and no order is submitted. The runtime still fetches,
-    validates, evaluates, records and logs - which is exactly what it is for
-    until crash recovery exists.
+    No environment variable and no flag combination bypasses the third. A start
+    that is not safe prints RECONCILIATION NOT SAFE - TRADING DISABLED, keeps
+    observing - fetching, validating, evaluating, recording, logging - and
+    submits nothing.
 
     There is no live mode. `--observe-only` goes further than the gates and
-    constructs no execution path at all.
+    constructs no execution path at all; it still reports startup safety.
 
     Only one runner may hold a given database at a time; a second exits
     immediately rather than processing the same bar twice.
@@ -811,6 +842,11 @@ def crypto_run(
                 connection,
                 market_data=AlpacaCryptoBars(safety_delay=config.safety_delay),
                 execution=None if observe_only else PaperExecutionGateway(),
+                # The startup trading authority. Runs on every start, including
+                # `--observe-only`, because knowing whether local state survived
+                # is useful even when nothing could be submitted anyway.
+                startup_safety=startup_safety_from_reconciliation(connection),
+                checkpoint=SqliteCheckpoint(connection),
                 config=config,
                 shutdown=shutdown,
             )

@@ -858,11 +858,10 @@ def resolve_daily_baseline_equity(
     re-running a command.
 
     **Honest limitation.** This is the first equity this system *observed* on
-    the date, not the equity at exactly 00:00 UTC. Nothing in this milestone
-    runs continuously, so a day whose first observation is at 14:00 UTC is
-    measured from 14:00 UTC. The stored `captured_at` records how close that
-    was, and a 24/7 runner (Phase 9) is what will make the first observation
-    land near the boundary.
+    the date, not the equity at exactly 00:00 UTC. A day whose first
+    observation is at 14:00 UTC is measured from 14:00 UTC. The stored
+    `captured_at` records how close that was; the C9 runner, running
+    continuously, is what makes the first observation land near the boundary.
     """
     baseline = state.ensure_daily_risk_baseline(
         connection,

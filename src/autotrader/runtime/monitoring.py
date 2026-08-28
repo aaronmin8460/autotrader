@@ -113,6 +113,7 @@ class HeartbeatSnapshot:
     paper_execution_enabled: bool
     execution_disabled_reason: str | None
     startup_safety_code: str
+    reconciliation_status: str | None
     cycles_started: int
     cycles_completed: int
     orders_submitted: int
@@ -135,6 +136,7 @@ class HeartbeatSnapshot:
                 "paper_execution_enabled": self.paper_execution_enabled,
                 "execution_disabled_reason": self.execution_disabled_reason,
                 "startup_safety": self.startup_safety_code,
+                "reconciliation_status": self.reconciliation_status,
                 "cycles_started": self.cycles_started,
                 "cycles_completed": self.cycles_completed,
                 "orders_submitted": self.orders_submitted,
@@ -163,6 +165,8 @@ class Heartbeat:
     paper_execution_enabled: bool = False
     execution_disabled_reason: str | None = None
     startup_safety_code: str = "UNRESOLVED"
+    #: The C8 status the startup answer came from, or None when no pass ran.
+    reconciliation_status: str | None = None
     cycles_started: int = 0
     cycles_completed: int = 0
     orders_submitted: int = 0
@@ -181,6 +185,7 @@ class Heartbeat:
             paper_execution_enabled=self.paper_execution_enabled,
             execution_disabled_reason=self.execution_disabled_reason,
             startup_safety_code=self.startup_safety_code,
+            reconciliation_status=self.reconciliation_status,
             cycles_started=self.cycles_started,
             cycles_completed=self.cycles_completed,
             orders_submitted=self.orders_submitted,

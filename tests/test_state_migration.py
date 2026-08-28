@@ -33,6 +33,7 @@ from autotrader.state.sqlite import (
     V2_TABLES,
     V3_TABLES,
     V4_TABLES,
+    V5_TABLES,
     DatabaseStateError,
     DuplicateBrokerOrderError,
     DuplicateOrderIntentError,
@@ -48,6 +49,7 @@ from autotrader.state.sqlite import (
     get_order_intent,
     get_order_intent_by_client_id,
     get_position,
+    get_runtime_checkpoint,
     get_schema_version,
     get_strategy_run,
     initialize_database,
@@ -57,6 +59,7 @@ from autotrader.state.sqlite import (
     list_reconciliation_events,
     list_reconciliation_runs,
     list_risk_events,
+    list_runtime_checkpoints,
     list_signals,
     list_strategy_runs,
     record_order_intent,
@@ -69,6 +72,7 @@ from autotrader.state.sqlite import (
     update_order_intent_status,
     upsert_broker_order,
     upsert_position,
+    upsert_runtime_checkpoint,
 )
 
 T0 = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
@@ -284,10 +288,11 @@ def schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]]
 def test_a_new_database_initializes_directly_at_the_current_version(database_path: Path) -> None:
     """A fresh database is never created at an older version and then upgraded."""
     with connect(database_path) as connection:
-        assert get_schema_version(connection) == SCHEMA_VERSION == 4
+        assert get_schema_version(connection) == SCHEMA_VERSION == 5
         assert set(REQUIRED_TABLES) <= table_names(connection)
         assert set(V3_TABLES) <= table_names(connection)
         assert set(V4_TABLES) <= table_names(connection)
+        assert set(V5_TABLES) <= table_names(connection)
 
 
 def test_a_version_one_database_migrates_all_the_way_to_three(v1_database: Path) -> None:
@@ -688,16 +693,20 @@ def test_the_migration_rebuilds_only_the_tables_that_hold_quantities(
 # --------------------------------------------------------------------------
 
 
-def test_a_version_three_database_migrates_to_four(v3_database: Path) -> None:
+def test_a_version_three_database_migrates_through_four_to_the_current_version(
+    v3_database: Path,
+) -> None:
+    """v3 -> v4 -> v5 in one pass, and the v4 step is not skipped on the way."""
     with connect(v3_database) as connection:
         assert get_schema_version(connection) == 3
-        assert not set(V4_TABLES) & table_names(connection)
+        assert not (set(V4_TABLES) | set(V5_TABLES)) & table_names(connection)
 
     initialize_database(v3_database)
 
     with connect(v3_database) as connection:
-        assert get_schema_version(connection) == SCHEMA_VERSION == 4
+        assert get_schema_version(connection) == SCHEMA_VERSION == 5
         assert set(V4_TABLES) <= table_names(connection)
+        assert set(V5_TABLES) <= table_names(connection)
 
 
 def test_the_v4_migration_carries_every_intent_across_unchanged(v3_database: Path) -> None:
@@ -1615,3 +1624,319 @@ def test_the_state_module_needs_no_credentials(
         risk_reason_code="APPROVED",
     )
     assert len(list_order_intents(connection)) == 1
+
+
+# --------------------------------------------------------------------------
+# v4 -> v5: the durable runtime bar checkpoint
+#
+# The integration schema. It exists so a restarted 24/7 runtime cannot replay a
+# completed bar its predecessor already acted on, and the thing these tests are
+# really protecting is that adding it did not disturb anything Phase 8 wrote.
+# --------------------------------------------------------------------------
+
+
+def build_v4_database(path: Path) -> Path:
+    """A database exactly as the Phase 8 (v4) release would have left it.
+
+    Built from the module's own current statements minus the v5 table, so it is
+    the real historical shape rather than an approximation of it.
+    """
+    with connect(path) as connection, transaction(connection):
+        for statement in (
+            state._CREATE_SCHEMA_METADATA,
+            state._CREATE_STRATEGY_RUNS,
+            state._CREATE_SIGNALS,
+            state._CREATE_RISK_EVENTS,
+            state._CREATE_SYSTEM_EVENTS,
+            state._CREATE_POSITIONS,
+            state._CREATE_ORDER_INTENTS,
+            state._CREATE_BROKER_ORDERS,
+            state._CREATE_DAILY_RISK_BASELINES,
+            state._CREATE_RECONCILIATION_RUNS,
+            state._CREATE_RECONCILIATION_EVENTS,
+            state._CREATE_INDEX_SIGNALS,
+            state._CREATE_INDEX_RISK_EVENTS,
+            state._CREATE_INDEX_ORDER_INTENTS_STATUS,
+            state._CREATE_INDEX_RECONCILIATION_EVENTS,
+        ):
+            connection.execute(statement)
+        connection.execute(state._INSERT_SCHEMA_VERSION, (4, "2026-08-01T00:00:00.000000+00:00"))
+    return path
+
+
+@pytest.fixture
+def v4_database(tmp_path: Path) -> Path:
+    return build_v4_database(tmp_path / "v4.db")
+
+
+def populate_v4_reconciliation_history(path: Path) -> tuple[int, int]:
+    """One finished reconciliation run and one event, as Phase 8 would have written them."""
+    with connect(path) as connection:
+        run_id = record_reconciliation_run(
+            connection,
+            started_at=T0,
+            completed_at=T0 + STEP,
+            status="REPAIRED",
+            safe_to_trade=True,
+            orders_checked=3,
+            positions_checked=2,
+            issues_count=1,
+            unresolved_count=0,
+        )
+        event_id = record_reconciliation_event(
+            connection,
+            reconciliation_run_id=run_id,
+            event_timestamp=T0 + STEP,
+            category="ORDER",
+            outcome="REPAIRED",
+            detail="accepted -> filled from verified broker truth",
+            symbol="BTC/USD",
+            client_order_id="autotrader-v4-history",
+        )
+    return run_id, event_id
+
+
+def test_a_version_four_database_migrates_to_five(v4_database: Path) -> None:
+    with connect(v4_database) as connection:
+        assert get_schema_version(connection) == 4
+        assert not set(V5_TABLES) & table_names(connection)
+
+    initialize_database(v4_database)
+
+    with connect(v4_database) as connection:
+        assert get_schema_version(connection) == SCHEMA_VERSION == 5
+        assert set(V5_TABLES) <= table_names(connection)
+        assert set(REQUIRED_TABLES) <= table_names(connection)
+
+
+def test_the_v5_migration_preserves_existing_reconciliation_runs(v4_database: Path) -> None:
+    """Phase 8's audit history is not disturbed by adding a table beside it."""
+    populate_v4_reconciliation_history(v4_database)
+    with connect(v4_database) as connection:
+        before = list_reconciliation_runs(connection)
+    assert len(before) == 1
+
+    initialize_database(v4_database)
+
+    with connect(v4_database) as connection:
+        assert list_reconciliation_runs(connection) == before
+
+
+def test_the_v5_migration_preserves_existing_reconciliation_events(v4_database: Path) -> None:
+    populate_v4_reconciliation_history(v4_database)
+    with connect(v4_database) as connection:
+        before = list_reconciliation_events(connection)
+    assert len(before) == 1
+
+    initialize_database(v4_database)
+
+    with connect(v4_database) as connection:
+        after = list_reconciliation_events(connection)
+    assert after == before
+    assert after[0].detail == "accepted -> filled from verified broker truth"
+    assert after[0].client_order_id == "autotrader-v4-history"
+
+
+def test_the_v5_migration_leaves_fractional_quantities_exact(v4_database: Path) -> None:
+    """A crypto position is fractional, and an upgrade must not round it."""
+    with connect(v4_database) as connection:
+        upsert_position(
+            connection, symbol="BTC/USD", quantity=Decimal("0.000123456789"), updated_at=T0
+        )
+
+    initialize_database(v4_database)
+
+    with connect(v4_database) as connection:
+        position = get_position(connection, "BTC/USD")
+    assert position is not None
+    assert position.quantity == Decimal("0.000123456789")
+    assert str(position.quantity) == "0.000123456789"
+
+
+def test_the_v5_migration_preserves_daily_risk_baselines(v4_database: Path) -> None:
+    with connect(v4_database) as connection:
+        ensure_daily_risk_baseline(
+            connection,
+            risk_date_utc=date(2026, 8, 26),
+            baseline_equity=Decimal("200000"),
+            captured_at=T0,
+        )
+        before = list_daily_risk_baselines(connection)
+    assert len(before) == 1
+
+    initialize_database(v4_database)
+
+    with connect(v4_database) as connection:
+        assert list_daily_risk_baselines(connection) == before
+
+
+def test_the_v5_migration_adds_only_the_checkpoint_table(v4_database: Path) -> None:
+    """Purely additive. No existing table is rebuilt, renamed, or reindexed."""
+    with connect(v4_database) as connection:
+        before = {name: sql for _type, name, sql in schema_objects(connection)}
+
+    initialize_database(v4_database)
+
+    with connect(v4_database) as connection:
+        after = {name: sql for _type, name, sql in schema_objects(connection)}
+
+    assert before.items() <= after.items(), "every pre-existing object is byte-identical"
+    # The new table's TEXT PRIMARY KEY brings SQLite's implicit autoindex with
+    # it; that belongs to the new table, not to anything that already existed.
+    added = set(after) - set(before)
+    assert added == set(V5_TABLES) | {"sqlite_autoindex_runtime_checkpoints_1"}
+
+
+def test_a_failed_v4_to_v5_migration_rolls_back_completely(v4_database: Path) -> None:
+    """A conflicting table refuses the upgrade, and leaves a working v4 behind."""
+    populate_v4_reconciliation_history(v4_database)
+    with connect(v4_database) as connection, transaction(connection):
+        connection.execute("CREATE TABLE runtime_checkpoints (surprise TEXT)")
+
+    with pytest.raises(DatabaseStateError) as error:
+        initialize_database(v4_database)
+
+    assert "runtime_checkpoints" in str(error.value)
+
+    with connect(v4_database) as connection:
+        assert get_schema_version(connection) == 4
+        # The pre-existing table is untouched and the Phase 8 history survives.
+        assert connection.execute("SELECT surprise FROM runtime_checkpoints").fetchall() == []
+        assert len(list_reconciliation_runs(connection)) == 1
+        assert len(list_reconciliation_events(connection)) == 1
+
+
+def test_foreign_keys_and_wal_survive_the_v5_migration(v4_database: Path) -> None:
+    initialize_database(v4_database)
+
+    with connect(v4_database) as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_a_database_newer_than_version_five_is_still_refused(database_path: Path) -> None:
+    """Fail closed on the future: downgrading would discard data this code cannot read."""
+    with connect(database_path) as connection, transaction(connection):
+        connection.execute(state._UPDATE_SCHEMA_VERSION, (SCHEMA_VERSION + 1,))
+
+    with pytest.raises(UnsupportedSchemaVersionError):
+        initialize_database(database_path)
+
+    with connect(database_path) as connection:
+        assert get_schema_version(connection) == SCHEMA_VERSION + 1, "left untouched"
+
+
+def test_a_version_one_database_migrates_all_the_way_to_five(v1_database: Path) -> None:
+    """The whole chain in one transaction: v1 -> v2 -> v3 -> v4 -> v5."""
+    populate_v1_data(v1_database)
+    with connect(v1_database) as connection:
+        assert get_schema_version(connection) == 1
+
+    initialize_database(v1_database)
+
+    with connect(v1_database) as connection:
+        assert get_schema_version(connection) == SCHEMA_VERSION == 5
+        assert set(REQUIRED_TABLES) <= table_names(connection)
+        assert len(list_strategy_runs(connection)) == 1
+
+
+# --------------------------------------------------------------------------
+# Runtime checkpoints (schema v5)
+# --------------------------------------------------------------------------
+
+
+def test_a_checkpoint_timestamp_round_trips_exactly(connection: sqlite3.Connection) -> None:
+    """A bar start is an identity, so microsecond drift would break the guard."""
+    moment = datetime(2026, 8, 26, 10, 15, 0, 123456, tzinfo=UTC)
+    upsert_runtime_checkpoint(
+        connection,
+        symbol="BTC/USD",
+        last_processed_bar_timestamp=moment,
+        updated_at=T0,
+    )
+
+    stored = get_runtime_checkpoint(connection, "BTC/USD")
+    assert stored is not None
+    assert stored.last_processed_bar_timestamp == moment
+    assert stored.updated_at == T0
+
+
+def test_a_repeated_checkpoint_for_the_same_bar_changes_nothing(
+    connection: sqlite3.Connection,
+) -> None:
+    """One row per symbol, and claiming the same bar twice is not an error.
+
+    A cycle that re-reads the newest completed bar must be able to say so
+    without the storage layer treating it as a conflict.
+    """
+    upsert_runtime_checkpoint(
+        connection, symbol="BTC/USD", last_processed_bar_timestamp=T0, updated_at=T0
+    )
+    upsert_runtime_checkpoint(
+        connection, symbol="BTC/USD", last_processed_bar_timestamp=T0, updated_at=T0 + STEP
+    )
+
+    assert len(list_runtime_checkpoints(connection)) == 1
+    stored = get_runtime_checkpoint(connection, "BTC/USD")
+    assert stored is not None
+    assert stored.last_processed_bar_timestamp == T0
+
+
+def test_a_checkpoint_never_moves_backwards(connection: sqlite3.Connection) -> None:
+    """Monotonic in SQL, so an out-of-order write cannot re-open a claimed bar."""
+    upsert_runtime_checkpoint(
+        connection, symbol="BTC/USD", last_processed_bar_timestamp=T0 + STEP, updated_at=T0
+    )
+    upsert_runtime_checkpoint(
+        connection, symbol="BTC/USD", last_processed_bar_timestamp=T0, updated_at=T0 + 2 * STEP
+    )
+
+    stored = get_runtime_checkpoint(connection, "BTC/USD")
+    assert stored is not None
+    assert stored.last_processed_bar_timestamp == T0 + STEP
+
+
+def test_each_symbol_keeps_its_own_checkpoint(connection: sqlite3.Connection) -> None:
+    upsert_runtime_checkpoint(
+        connection, symbol="BTC/USD", last_processed_bar_timestamp=T0, updated_at=T0
+    )
+    upsert_runtime_checkpoint(
+        connection, symbol="ETH/USD", last_processed_bar_timestamp=T0 + STEP, updated_at=T0
+    )
+
+    checkpoints = {
+        item.symbol: item.last_processed_bar_timestamp
+        for item in list_runtime_checkpoints(connection)
+    }
+    assert checkpoints == {"BTC/USD": T0, "ETH/USD": T0 + STEP}
+
+
+def test_an_unclaimed_symbol_reports_none(connection: sqlite3.Connection) -> None:
+    assert get_runtime_checkpoint(connection, "ETH/USD") is None
+
+
+def test_a_checkpoint_is_committed_and_visible_to_another_connection(
+    database_path: Path,
+) -> None:
+    """The whole point of the table: the claim outlives the connection that made it."""
+    with connect(database_path) as writer:
+        upsert_runtime_checkpoint(
+            writer, symbol="BTC/USD", last_processed_bar_timestamp=T0, updated_at=T0
+        )
+
+    with connect(database_path) as reader:
+        stored = get_runtime_checkpoint(reader, "BTC/USD")
+    assert stored is not None
+    assert stored.last_processed_bar_timestamp == T0
+
+
+def test_a_naive_checkpoint_timestamp_is_refused(connection: sqlite3.Connection) -> None:
+    """There is no correct guess for a naive datetime's offset."""
+    with pytest.raises(StateInputError):
+        upsert_runtime_checkpoint(
+            connection,
+            symbol="BTC/USD",
+            last_processed_bar_timestamp=datetime(2026, 8, 26, 10, 0),
+            updated_at=T0,
+        )

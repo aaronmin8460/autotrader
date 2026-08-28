@@ -1,12 +1,14 @@
 """Local operational state, stored in a single SQLite file.
 
 The persistence layer only: schema creation, schema versioning and a small
-explicit v1 -> v2 -> v3 -> v4 migration path, WAL journalling, enforced foreign
-keys, transactional writes, and a set of durable operational records -
+explicit v1 -> v2 -> v3 -> v4 -> v5 migration path, WAL journalling, enforced
+foreign keys, transactional writes, and a set of durable operational records -
 strategy runs, signals, risk events, system events, local position snapshots,
 order intents, broker-order snapshots, the (schema v3) UTC-day risk baselines
-the crypto daily-loss halt measures against, and the (schema v4) reconciliation
-runs and events that record what crash recovery concluded.
+the crypto daily-loss halt measures against, the (schema v4) reconciliation
+runs and events that record what crash recovery concluded, and the (schema v5)
+per-symbol completed-bar checkpoints that stop a restarted runtime replaying a
+bar it already acted on.
 
 Quantities are exact `decimal.Decimal` values, stored as canonical decimal
 text: crypto positions are fractional, and a binary float cannot hold one
@@ -53,6 +55,7 @@ from autotrader.state.sqlite import (
     V2_TABLES,
     V3_TABLES,
     V4_TABLES,
+    V5_TABLES,
     DailyRiskBaseline,
     DatabaseStateError,
     DuplicateBrokerOrderError,
@@ -62,6 +65,7 @@ from autotrader.state.sqlite import (
     ReconciliationEvent,
     ReconciliationRun,
     RiskEvent,
+    RuntimeCheckpoint,
     StateError,
     StateInputError,
     StoredBrokerOrder,
@@ -86,6 +90,7 @@ from autotrader.state.sqlite import (
     get_order_intent_by_client_id,
     get_position,
     get_reconciliation_run,
+    get_runtime_checkpoint,
     get_schema_version,
     get_strategy_run,
     initialize_database,
@@ -97,6 +102,7 @@ from autotrader.state.sqlite import (
     list_reconciliation_events,
     list_reconciliation_runs,
     list_risk_events,
+    list_runtime_checkpoints,
     list_signals,
     list_strategy_runs,
     list_system_events,
@@ -114,6 +120,7 @@ from autotrader.state.sqlite import (
     update_order_intent_status,
     upsert_broker_order,
     upsert_position,
+    upsert_runtime_checkpoint,
     utc_risk_date,
 )
 
@@ -150,6 +157,7 @@ __all__ = [
     "V2_TABLES",
     "V3_TABLES",
     "V4_TABLES",
+    "V5_TABLES",
     "DailyRiskBaseline",
     "DatabaseStateError",
     "DuplicateBrokerOrderError",
@@ -158,6 +166,7 @@ __all__ = [
     "Position",
     "ReconciliationEvent",
     "ReconciliationRun",
+    "RuntimeCheckpoint",
     "RiskEvent",
     "StateError",
     "StateInputError",
@@ -183,6 +192,7 @@ __all__ = [
     "get_order_intent_by_client_id",
     "get_position",
     "get_reconciliation_run",
+    "get_runtime_checkpoint",
     "get_schema_version",
     "get_strategy_run",
     "initialize_database",
@@ -193,6 +203,7 @@ __all__ = [
     "list_positions",
     "list_reconciliation_events",
     "list_reconciliation_runs",
+    "list_runtime_checkpoints",
     "list_risk_events",
     "list_signals",
     "list_strategy_runs",
@@ -211,5 +222,6 @@ __all__ = [
     "update_order_intent_status",
     "upsert_broker_order",
     "upsert_position",
+    "upsert_runtime_checkpoint",
     "utc_risk_date",
 ]
