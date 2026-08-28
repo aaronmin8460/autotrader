@@ -232,6 +232,7 @@ Equity   Equity V0.2                       <- component-complete (E1)
 C10      Failure injection / hardening     <- done (C10)
 Dash     Read-only operations dashboard    <- done, V0.2 (CI1)
 CI1      Combined integration              <- done, schema v6 (CI1)
+D1       Decision Engine V2 + V3           <- component-complete, unwired (D1)
 Phase 10 Deployment                        <- after the combined paper smoke
 ```
 
@@ -1855,6 +1856,76 @@ partial, and recovery is reconciliation-driven.
 deployment, and any real equity paper order. The combined system has been
 exercised read-only against the real paper account and has submitted **zero**
 orders.
+
+### D1 - Decision Engine V2 and V3 (component-complete, not wired)
+
+A versioned decision-engine contract in `autotrader.decision`, with three
+implementations behind it. **Nothing in it is wired into either runtime.** The
+crypto runtime and the equity runtime both still call
+`autotrader.strategies.ema_cross` directly and are unchanged by this milestone;
+the package produces candidates that nothing yet consumes.
+
+**The contract.** `DecisionResult` carries a version, a symbol, the completed
+bar it was made on, a signal in `{BUY, HOLD, SELL}`, a score bounded to
+`[-1, +1]`, a confidence bounded to `[0, 1]`, stable machine reason tokens,
+the feature values behind the score, and the policy that was in force. Bounds
+are checked on construction, for every version, because an ensemble can only
+combine operands known to share a scale. `to_dict` makes the whole record
+JSON-serializable, which is what satisfies section 7D for a decision.
+
+**V1** is the existing EMA 20 / EMA 50 crossover behind an adapter. The
+crossover itself is untouched. `EXIT` maps to `SELL` and `to_legacy_signal`
+maps back, so C3's vocabulary still works.
+
+**V2** scores five bounded directional factors on the base timeframe - the EMA
+spread, the slow-EMA slope, RSI, the MACD histogram, and a lookback return -
+and combines them as a weighted mean whose weights sum to one. Volatility,
+volume and a four-state regime classification are measured but do not vote:
+they discount confidence and the high-volatility regime can refuse an entry.
+Every directional feature is expressed in ATR and then standardized by its own
+trailing spread, so no magnitude constant is fitted and the scores are
+comparable across symbols and asset classes.
+
+**V3** runs the identical framework on 15 minutes, 1 hour and 4 hours. The
+higher timeframes are *derived* from completed base bars rather than fetched,
+so V3 costs no extra provider call and a derived close is by construction the
+close of the last base bar inside it. A bucket is kept only when every one of
+its constituent bars is present, which is what stops a session-traded symbol
+from ever growing a candle across an overnight gap - with no calendar involved.
+A higher-timeframe bar is usable on the base bar starting at `T` only when
+`bucket_start + interval <= T + 15m`. The signal comes from gates rather than
+from the blend: an entry needs the trigger, the confirmation *and* the context,
+while an exit needs only the trigger and the confirmation and is never blocked
+by regime.
+
+**HOLD is returned with a reason, never guessed around.** Too little history,
+an undefined feature, low confidence, a score inside the band, an unmet gate
+and a blocked regime are distinct tokens. A violated *input contract* -
+unsorted bars, a duplicate timestamp, a naive timestamp, an off-grid bar, a
+non-finite price - is raised instead, because that is a caller error rather
+than a market condition.
+
+**Asset-class separation.** Crypto and equity share every indicator period and
+window and differ only in thresholds: crypto tolerates a 2.5x range expansion
+against equity's 2.0x, equity requires more participation and more confidence.
+Scoring a symbol under the other class's policy is refused, because the
+arithmetic would succeed and nothing downstream could detect it.
+
+**History is stated, not discovered.** Every engine reports
+`required_base_bars` before being called. V2 needs 109 base bars. V3 needs 1744
+for a crypto pair and 2834 for an equity, because a regular session completes
+exactly one 4-hour bucket. Both exceed `MAX_LOOKBACK_BARS`, which this
+milestone deliberately does **not** change: the runtime's fetch window is
+runtime policy with a real API-budget cost, and widening it is a decision for
+whoever wires an engine in.
+
+**Boundaries.** The package imports no broker client, no provider SDK, no
+execution, risk, state or reconciliation module, reads no clock, opens no
+socket and writes nothing - each asserted against the parse tree. The research
+backtester and model training are owned by other branches;
+`features.compute_features` is the vectorized integration point for both, and
+`DecisionResult` is the shape their output should arrive in. V4 (a probability
+model) and V5 (an ensemble) are anticipated and deliberately unimplemented.
 
 ### Later phases
 
