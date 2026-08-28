@@ -7,9 +7,10 @@ Everything here targets **one Alpaca paper account** and **one SQLite
 database**, with four services against them: the 24/7 crypto runtime, the
 market-session equity runtime, the dashboard API, and the dashboard frontend.
 
-Nothing in this document has been run against a server. It is the preparation,
-written so that the deployment itself is configuration and two deliberate
-activations rather than improvisation.
+A host does not have to run all four. The first posture this supports is
+**crypto-only**: the 24/7 runtime active, the equity runtime masked so that it
+cannot be started at all, and the dashboard on loopback. See "Crypto-only
+posture".
 
 ## Contents
 
@@ -22,6 +23,7 @@ activations rather than improvisation.
 - [Networking](#networking)
 - [Runbook](#runbook)
 - [What is still pinned to Combined Integration](#what-is-still-pinned-to-combined-integration)
+- [Crypto-only posture](#crypto-only-posture)
 
 ---
 
@@ -629,23 +631,58 @@ the dashboard is still up, and the database is intact. Run `reconcile
 
 ## What is still pinned to Combined Integration
 
-`feat/combined-integration` is in flight. These artifacts were written against
-`main` plus the published command surfaces of `feat/equity-v0.2` and
-`feat/dashboard-v0.1`, and they deliberately predict none of that branch's
-internals. Everything below is a variable or a command to re-check once it is
-GREEN — nothing here requires redesigning a unit.
+`feat/combined-integration` has landed. These artifacts were originally written
+against `main` plus the published command surfaces of `feat/equity-v0.2` and
+`feat/dashboard-v0.1`, and this table was the list of predictions to re-check
+once that branch was GREEN. Every row has now been checked against the merged
+source rather than against the plan.
 
-| Where | What to check | Why it may change |
+| Where | What was checked | Result |
 |---|---|---|
-| `autotrader.env` → `AUTOTRADER_EQUITY_ARGS` | that `equity-run` still takes `--observe-only`, `--confirm-paper-runtime`, `--db` | the command lives on `feat/equity-v0.2`; `main` has no `equity-run` yet, so `autotrader-equity.service` fails to start until the merge |
-| `autotrader-crypto.service`, `autotrader-equity.service` → `ExecStart` | the subcommand names `crypto-run` and `equity-run` | a combined runner, or a shared `--account-safety` flag, would change the argument list |
-| `autotrader.env` → `AUTOTRADER_DASHBOARD_DB` | that the dashboard still reads `AUTOTRADER_DASHBOARD_DB` | Dashboard V0.2 may add fields; the variable name is what matters here |
-| `RestartPreventExitStatus=2` on both runtimes | that exit 2 still means "paused, needs reconciliation" | a shared account-safety halt may want its own exit code; if one is added, add it to `RestartPreventExitStatus` |
-| `deploy/bin/autotrader-healthcheck` → `_check_account_safety` | replace the `account_safety` / `global_account_safety` name probe with the real table | the shared account-safety record does not exist on any merged schema yet, so the check reports SKIP today |
-| `deploy/bin/autotrader-rollback` → schema gate | that `SCHEMA_VERSION` and `MIN_MIGRATABLE_SCHEMA_VERSION` are still module-level assignments in `src/autotrader/state/sqlite.py` | the gate greps them out of the target commit |
-| lock scoping | that crypto and equity still take differently-scoped locks | a shared execution lock would replace both; if the two runtimes come to share one lock file, they can no longer run concurrently and this deployment shape changes |
-| `deploy/caddy/Caddyfile.example` | the domain and the bcrypt hash | no hostname has been chosen |
+| `autotrader.env` → `AUTOTRADER_EQUITY_ARGS` | that `equity-run` still takes `--observe-only`, `--confirm-paper-runtime`, `--db` | **unchanged** — all three exist on the merged `equity-run`, spelled the same way |
+| `autotrader-crypto.service`, `autotrader-equity.service` → `ExecStart` | the subcommand names `crypto-run` and `equity-run` | **unchanged** — both are still separate top-level commands; there is no combined runner and no shared account-safety flag |
+| `autotrader.env` → `AUTOTRADER_DASHBOARD_DB` | that the dashboard still reads `AUTOTRADER_DASHBOARD_DB` | **unchanged** — `autotrader.dashboard.api.DATABASE_PATH_ENV` is still that name |
+| `RestartPreventExitStatus=2` on both runtimes | that exit 2 still means "paused, needs reconciliation" | **unchanged** — 1 is a controlled refusal, 2 is a paused runtime, and the shared account halt added no third code |
+| `deploy/bin/autotrader-healthcheck` → `_check_account_safety` | replace the name probe with the real table | **adapted** — the table is `account_safety_state`, a single row pinned by `CHECK (id = 1)`, and the check now reports its `state`: `SAFE` is OK, `UNSAFE_UNKNOWN` and `UNSAFE_RECONCILIATION` are FAIL |
+| `deploy/bin/autotrader-rollback` → schema gate | that `SCHEMA_VERSION` and `MIN_MIGRATABLE_SCHEMA_VERSION` are still module-level assignments | **unchanged** — both are still plain assignments in `src/autotrader/state/sqlite.py`; the current schema is v6 |
+| lock scoping | that crypto and equity still take differently-scoped locks | **unchanged** — crypto takes the unscoped runtime lock, equity takes a scoped one, and the shared account execution lock is a third, separate file. The two services still run concurrently |
+| `deploy/caddy/Caddyfile.example` | the domain and the bcrypt hash | **still open** — no hostname has been chosen, and nothing published the dashboard. See "Networking" |
 
-Until the merge lands, `autotrader-equity.service` will not start on a host
-deployed from `main`. That is expected, and `autotrader-healthcheck` reports it
-as a unit that is installed but not running rather than as a fault.
+One further adaptation was made for the crypto-only posture described below:
+`autotrader-healthcheck` now reports a **masked** unit as OK rather than as a
+degraded trading runtime. Masking is a deliberate, root-only, reversible act,
+and a host that has masked the equity runtime on purpose should not report
+DEGRADED forever for having done what its operator intended.
+
+## Crypto-only posture
+
+A host may run the crypto runtime while the equity runtime is not merely
+stopped but *unstartable*. That is a stronger statement than "the market is
+closed", and it is the posture this deployment supports first:
+
+```
+systemctl mask autotrader-equity.service
+```
+
+`mask` symlinks the unit to `/dev/null`. `systemctl start` on it fails, a
+dependency cannot pull it up, and a reboot cannot resume it. It is reversible
+with `systemctl unmask`, and it survives `autotrader-deploy`: that script
+installs unit *files* into `/etc/systemd/system` and the mask is a symlink at
+that same path, so a deploy that would rewrite the unit is refused rather than
+silently unmasking it.
+
+Verify the posture, rather than assuming it:
+
+```
+systemctl is-active autotrader-equity.service     # inactive
+systemctl is-enabled autotrader-equity.service    # masked
+systemctl is-active autotrader-crypto.service     # active
+systemctl is-enabled autotrader-crypto.service    # enabled
+```
+
+Note what masking does **not** do. `/etc/autotrader/autotrader.trading.env`
+sets `AUTOTRADER_EQUITY_ARGS` as well as the crypto one, because activation is
+account-wide rather than per-product. A masked unit never reads it. Unmasking
+the equity runtime is therefore a decision that re-enables equity paper
+submission on the next start, and it should be made with the same deliberation
+as activation itself.

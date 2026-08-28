@@ -18,9 +18,13 @@ there. Only directive lines are evidence.
 from __future__ import annotations
 
 import ast
+import importlib.machinery
+import importlib.util
 import re
+import sqlite3
 import stat
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -633,3 +637,121 @@ def test_the_runbook_exists_and_covers_the_operations_an_operator_needs() -> Non
 def test_the_runbook_documents_the_emergency_stop_as_placing_no_orders() -> None:
     text = (REPOSITORY_ROOT / "docs" / "DEPLOYMENT.md").read_text()
     assert "It places no orders." in text
+
+
+# ---------------------------------------------------------------------------
+# The health check, against the real schema
+#
+# Everything above this point reads the artifacts as text. These load the
+# health check as a module and run it against a database built by the
+# application itself, because the two properties below are about what the
+# script *decides*, and a grep cannot tell a reported halt from a mentioned
+# one.
+# ---------------------------------------------------------------------------
+
+
+def load_healthcheck():
+    """Import `deploy/bin/autotrader-healthcheck` as a module.
+
+    It has no `.py` extension - it is an executable on `PATH` on a deployed
+    host - so it needs an explicit loader rather than a plain import.
+    """
+    path = BIN_ROOT / "autotrader-healthcheck"
+    loader = importlib.machinery.SourceFileLoader("autotrader_healthcheck", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def _safety_row(database: Path, state: str) -> tuple[str, str]:
+    """Build a real v6 database, write one safety row, and check it. -> (status, detail)."""
+    from autotrader.state.sqlite import connect, initialize_database, set_account_safety_state
+
+    initialize_database(database)
+    with connect(database) as connection:
+        set_account_safety_state(
+            connection,
+            account_state=state,
+            reason="written by a test",
+            source="crypto-runtime",
+            updated_at=datetime.now(UTC),
+        )
+
+    healthcheck = load_healthcheck()
+    report = healthcheck.Report()
+    healthcheck.check_database(
+        report,
+        database,
+        max_heartbeat_age=healthcheck.DEFAULT_MAX_HEARTBEAT_AGE_SECONDS,
+        crypto_state="inactive",
+    )
+    rows = [row for row in report.rows if row[1] == "account safety"]
+    assert len(rows) == 1, report.render()
+    return rows[0][0], rows[0][2]
+
+
+def test_the_health_check_reads_the_real_account_safety_table(tmp_path: Path) -> None:
+    """v6 named it `account_safety_state`. The old name probe found nothing."""
+    status, detail = _safety_row(tmp_path / "safe.db", "SAFE")
+    assert status == "OK", detail
+    assert "SAFE" in detail
+
+
+@pytest.mark.parametrize("state", ["UNSAFE_UNKNOWN", "UNSAFE_RECONCILIATION"])
+def test_an_account_halt_is_a_health_check_failure(state: str, tmp_path: Path) -> None:
+    """Not a warning. While the account is halted nothing may submit, and a
+    check that shrugged at it would be the one place the halt went unnoticed."""
+    status, detail = _safety_row(tmp_path / f"{state.lower()}.db", state)
+    assert status == "FAIL", detail
+    assert state in detail
+
+
+def test_the_health_check_still_tolerates_a_database_without_the_safety_table(
+    tmp_path: Path,
+) -> None:
+    """An older database that no current runtime has opened must not crash it."""
+    database = tmp_path / "old.db"
+    with sqlite3.connect(database) as connection:
+        # WAL so the only thing this case is testing is the missing table.
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("CREATE TABLE schema_metadata (id INTEGER, schema_version INTEGER)")
+        connection.execute("INSERT INTO schema_metadata VALUES (1, 5)")
+
+    healthcheck = load_healthcheck()
+    report = healthcheck.Report()
+    healthcheck.check_database(report, database, max_heartbeat_age=2700, crypto_state="unknown")
+    statuses = {check: status for status, check, _ in report.rows}
+    assert statuses["account safety"] == "SKIP"
+    assert report.worst() == 0, report.render()
+
+
+def test_a_masked_unit_is_not_reported_as_a_degraded_runtime(monkeypatch) -> None:
+    """The crypto-only posture masks the equity runtime on purpose.
+
+    A masked unit cannot be started - not by an operator, not by a dependency,
+    not by a reboot - so it is the configuration working. Reporting it as
+    DEGRADED forever would train the reader to ignore this check.
+    """
+    healthcheck = load_healthcheck()
+    monkeypatch.setattr(healthcheck, "_systemctl_available", lambda: True)
+    monkeypatch.setattr(healthcheck, "_unit_state", lambda unit: ("inactive", "masked"))
+
+    report = healthcheck.Report()
+    healthcheck.check_units(report, ("autotrader-equity.service",), required=True)
+    status, _, detail = report.rows[0]
+    assert status == "OK", report.render()
+    assert "masked" in detail
+    assert report.worst() == 0
+
+
+def test_a_stopped_but_startable_runtime_is_still_reported(monkeypatch) -> None:
+    """The mask branch must not swallow a runtime that merely died quietly."""
+    healthcheck = load_healthcheck()
+    monkeypatch.setattr(healthcheck, "_systemctl_available", lambda: True)
+    monkeypatch.setattr(healthcheck, "_unit_state", lambda unit: ("inactive", "loaded"))
+
+    report = healthcheck.Report()
+    healthcheck.check_units(report, ("autotrader-crypto.service",), required=True)
+    assert report.rows[0][0] == "WARN", report.render()

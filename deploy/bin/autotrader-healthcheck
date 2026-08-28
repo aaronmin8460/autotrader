@@ -10,13 +10,12 @@ is careful to take only once, deliberately, with an operator's confirmation
 still required afterwards. When this script says UNRESOLVED, a human runs
 `autotrader reconcile`.
 
-**It is tolerant of a schema it does not recognize.** Combined Integration is
-still in flight and will add tables, columns and probably a global account
-safety record. Every database check here probes `sqlite_master` and
-`PRAGMA table_info` first and reports SKIP for anything absent, so this script
-runs unchanged against schema v5 today and against whatever lands later. A
-health check that crashed on an unexpected schema would fail at exactly the
-moment someone was deploying a change and needed it most.
+**It is tolerant of a schema it does not recognize.** Every database check
+here probes `sqlite_master` and `PRAGMA table_info` first and reports SKIP for
+anything absent, so this script runs unchanged against the current schema and
+against an older database that no current runtime has opened yet. A health
+check that crashed on an unexpected schema would fail at exactly the moment
+someone was deploying a change and needed it most.
 
 Exit codes: 0 all clear, 1 at least one WARN, 2 at least one FAIL.
 """
@@ -132,6 +131,14 @@ def check_units(report: Report, units: tuple[str, ...], *, required: bool) -> No
             continue
         if load == "not-found":
             report.add(SKIP, f"unit {unit}", "not installed on this host")
+        elif load == "masked":
+            # A mask is a deliberate, root-only, reversible act: the unit is
+            # symlinked to /dev/null, so neither an operator typo nor a
+            # dependency of something else can start it. On a crypto-only host
+            # the equity runtime is masked exactly that way, and reporting the
+            # intended configuration as DEGRADED would teach the reader to
+            # ignore this check on the one host it is describing.
+            report.add(OK, f"unit {unit}", f"masked - cannot be started ({active})")
         elif active == "active":
             report.add(OK, f"unit {unit}", "active")
         elif active == "failed":
@@ -356,31 +363,45 @@ def _check_unknown_intents(
 
 
 def _check_account_safety(report: Report, connection: sqlite3.Connection, tables: set[str]) -> None:
-    """Report the shared account-safety record once Combined Integration adds one.
+    """Report the shared account-safety record.
 
-    Nothing on `main` writes such a table today. Rather than guess its name,
-    columns or vocabulary - which would bake a prediction of another branch's
-    design into a deployment artifact - this looks for a small set of plausible
-    names and reports what it finds generically, or SKIP. Replace the probe
-    with the real table name once that branch is GREEN; see docs/DEPLOYMENT.md,
-    "What is still pinned to Combined Integration".
+    `account_safety_state` is the single-row table schema v6 uses to coordinate
+    the two runtimes over one brokerage account. `state` is `SAFE`,
+    `UNSAFE_UNKNOWN` or `UNSAFE_RECONCILIATION`, and anything but `SAFE` is an
+    account-wide halt: a submission the crypto runtime could not resolve stops
+    the equity runtime too, across processes and across restarts.
+
+    A halt found here is reported, never cleared. Only a full-universe
+    reconciliation may clear one, that is a deliberate act with an operator
+    behind it, and a health check that did it on a timer would be exactly the
+    unattended safety decision the halt exists to prevent.
+
+    The table is still probed rather than assumed, and its absence is SKIP
+    rather than a crash: a host carrying a pre-v6 database that no current
+    runtime has opened yet should still get the rest of this report.
     """
-    candidates = [name for name in ("account_safety", "global_account_safety") if name in tables]
-    if not candidates:
+    if "account_safety_state" not in tables:
         report.add(SKIP, "account safety", "no shared safety table on this schema yet")
         return
-    table = candidates[0]
-    cursor = connection.execute(f"SELECT * FROM {table} ORDER BY rowid DESC LIMIT 1")  # noqa: S608
-    row = cursor.fetchone()
-    if row is None:
-        report.add(WARN, "account safety", f"{table} present but empty")
+    columns = _columns(connection, "account_safety_state")
+    if not {"state", "reason", "source", "updated_at"} <= columns:
+        report.add(SKIP, "account safety", "account_safety_state has an unfamiliar shape")
         return
-    # Names come from the cursor, which reports them in the order the row
-    # actually arrived. Pairing a row against a sorted column list instead
-    # silently mislabels every value the moment the table is not alphabetical.
-    names = [description[0] for description in cursor.description]
-    named = dict(zip(names, row, strict=True))
-    report.add(OK, "account safety", f"{table}: {named}")
+    row = connection.execute(
+        "SELECT state, reason, source, updated_at FROM account_safety_state WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        # An empty table is not a halt. The row is written the first time
+        # something establishes the account's safety - a reconciliation, a
+        # runtime start - so before that there is genuinely nothing to report.
+        report.add(WARN, "account safety", "account_safety_state present but empty")
+        return
+    state, reason, source, updated_at = row
+    detail = f"{state} ({source}: {reason})"
+    age = _age_seconds(updated_at)
+    if age is not None:
+        detail += f", {_humanize(age)}"
+    report.add(OK if state == "SAFE" else FAIL, "account safety", detail)
 
 
 def main(argv: list[str] | None = None) -> int:
