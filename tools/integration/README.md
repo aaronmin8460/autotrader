@@ -132,6 +132,22 @@ records the commit it installed, so the scheduled agent can never depend on
 somebody's working directory. Re-run `install.sh` after changing the
 orchestrator.
 
+### The git host
+
+The installed copy carries the orchestrator's *logic*; it still needs a
+repository to fetch into and to create the integration worktree from. That is
+`$AUTOTRADER_QA/worktrees/auto-integrator` by default, overridable with
+`AUTOTRADER_INTEGRATION_GIT_HOST`. Only remote-tracking refs and worktree
+metadata are written there, and the branch that worktree has checked out is
+irrelevant - every git command names an explicit directory, so nothing depends
+on which branch happens to be current. If that worktree is removed, the
+orchestrator exits with code `5` and integrates nothing.
+
+The authoritative repository at `/Users/byeongilmin/dev/autotrader` is never
+checked out, merged, committed to or pushed. Creating the integration worktree
+does register it in that repository's shared `.git/worktrees/` metadata, as any
+`git worktree add` does; its own HEAD, branch and working tree are untouched.
+
 The bootstrap is the only piece on the internal disk, because a program launchd
 cannot find is a spawn failure every five minutes rather than a clean no-op. It
 checks that the workspace is a genuinely mounted APFS volume, finds an
