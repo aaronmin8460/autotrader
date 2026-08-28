@@ -1468,6 +1468,74 @@ no Kafka. One SQLite file and one `fcntl` lock.
 **Still pending after this gate:** no integrated paper BUY has been observed end
 to end. That smoke gate comes first, then failure injection, then Phase 10.
 
+### C10 - Failure injection and production hardening (complete)
+
+Everything above says what the system does when it works. This phase asked what
+it does when it breaks, at each of the seven points where a process death or a
+lost reply straddles something irreversible - and closed the three gaps the
+answers exposed.
+
+**The guarantees, in one table.** Each row is enforced by tests in
+`tests/test_failure_injection.py`, and each was mutation-checked: the protection
+was deliberately removed and the tests confirmed to fail.
+
+| Failure | Guarantee |
+| --- | --- |
+| crash before the bar claim | the bar may be processed after restart |
+| crash after the bar claim | the bar is **skipped forever** - that trade is missed |
+| crash after the intent commits, before submit | reconciliation confirms broker absence and marks the intent `CONFIRMED_NOT_SUBMITTED`; the stale decision is never sent |
+| submit reply lost - timeout, reset, `408`, `429`, `5xx`, unreadable status | `UNKNOWN` under the **same** `client_order_id`; no retry; trading paused for that process |
+| submit reply unreadable or unstorable | also `UNKNOWN`, for the same reason: a request went out |
+| definitive `4xx` rejection | `REJECTED`, terminal, no retry, and the runtime is **not** paused |
+| broker accepted, process died before the snapshot | reconciliation adopts the existing order; no replacement is placed |
+| partial fill | `filled_quantity`, fill price and broker status are preserved exactly; no remainder order |
+| broker fill, cancel or reject after process death | discovered on restart and recorded; the broker's position is adopted |
+| market-data timeout / `429` / `5xx` | no trade that cycle, no broker call at all, one attempt per symbol, next wake on the next 15-minute boundary |
+| broker read failure before submission | fails closed; no order |
+| SQLite locked before the bar claim | fatal; no signal, no intent, no order |
+| SQLite locked before the intent commit | fatal; `submit_order` is never called |
+| second runtime process | refused by the `fcntl` lock before market data, before the broker, and before startup reconciliation |
+| repeated reconciliation | first pass `REPAIRED`, second `CLEAN`; no extra writes and no extra broker reads for settled orders |
+
+**Three production changes, all narrow.**
+
+*An unreadable or unstorable reply to a submission is ambiguous.* Previously only
+an exception raised *by* `submit_order` produced `UNKNOWN`; a reply that came
+back and could not be parsed or written was an ordinary `ExecutionError`, so the
+runtime carried on and traded the next boundary with an unaccounted order at the
+broker. Once the call has been entered a request has gone out, so both halves of
+the response now mark the intent `UNKNOWN` and pause trading.
+
+*Nothing is submitted against an intent that is not committed.* `NO DURABLE
+INTENT = NO BROKER SUBMISSION` was an arrangement of call sites rather than a
+rule: `record_order_intent` joins an enclosing transaction instead of committing
+inside one, so a caller that wrapped the pipeline would have put a real order at
+the broker under a `client_order_id` no restart could find. `submit_order_intent`
+now refuses when its connection is inside an open transaction.
+
+*Nothing acts on a bar whose claim is not committed*, for the same reason and
+with the same check, in `SqliteCheckpoint.mark_processed`. A claim that can still
+be rolled back cannot stop a restarted process re-deciding the bar - the
+duplicate-trade direction.
+
+**What was deliberately not built.** No chaos mode, no fault-injection endpoint,
+no environment variable that makes the system misbehave, and no third-party
+chaos tooling. Failures are injected through the seams the system already had -
+the trading client, the data client, the market-data source, the clock, and a
+second connection holding a real SQLite write lock. A test asserts no production
+module contains a fault switch.
+
+**The automated matrix is offline, by design.** Reproducing "the reply was lost"
+or "the database was locked at that instant" against a real broker means
+submitting real orders at moments chosen to be unrecoverable, which is the one
+thing this system exists to avoid; and a suite that depended on a broker
+misbehaving on cue would not be reproducible. The whole suite is proven to pass
+with sockets globally disabled. Real-broker validation stays what it has always
+been: a bounded, read-only `reconcile` plus `crypto-run --once --observe-only`.
+
+**No behaviour was relaxed.** Every change above turns a previously
+ordinary failure into a stricter one. Nothing that used to stop now continues.
+
 ### Later phases
 
 **The integrated crypto paper smoke gate.** The integration is code-complete and
@@ -1475,9 +1543,10 @@ green offline, and the runtime has been exercised read-only against the real
 paper account. What has **not** happened is an integrated paper BUY observed end
 to end. That is the next gate, and nothing is deployed before it.
 
-**Failure injection** follows: crash the process at each point in the
-claim/intent/submit chain against the real paper account and confirm the
-documented recovery in every case.
+**Failure injection** is complete and is described in C10 above. It is offline
+rather than against the real paper account, for the reason stated there:
+reproducing a lost reply or a mid-write crash at the broker means placing real
+orders at moments chosen to be unrecoverable.
 
 **Phase 10 - Deployment.** Systemd units, container images, host provisioning,
 and supervision. Deliberately after the integrated paper smoke gate and failure

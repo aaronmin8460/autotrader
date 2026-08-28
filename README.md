@@ -723,6 +723,8 @@ on completed 15-minute bars - is Phase 9's job.
 | Duplicate preflight cannot complete | **Fails closed** - "could not check" is never "no duplicate" |
 | Broker definitively refuses (a 4xx) | Intent `REJECTED`; no order exists |
 | Timeout, reset, 5xx, or unreadable status | Intent `UNKNOWN`; **never retried** |
+| Reply arrives but cannot be read or stored | Intent `UNKNOWN`; **never retried** - a request went out |
+| The order intent is not durably committed | Refused before any broker call |
 
 **An ambiguous outcome is never retried.** A timeout after `submit_order` could
 mean the broker accepted the order or never saw it. Re-sending it risks a
@@ -732,6 +734,19 @@ written, and the attempt stops. The `client_order_id` is kept so
 that exact key. The CLI exits `2` for this case specifically. The SDK's own
 internal retry of `429`/`504` responses is switched off on the trading client
 for the same reason.
+
+**Ambiguity starts at the call, not at the exception.** Once `submit_order` has
+been entered a request has gone out, so a reply that comes back and cannot be
+parsed, or cannot be written to the database, is `UNKNOWN` for exactly the same
+reason a timeout is. Treating either as an ordinary failure would let the caller
+trade on the next boundary over an order it never recorded.
+
+**No durable intent, no broker submission.** The recovery anchor is a
+`client_order_id` on disk *before* the request goes out; an order placed without
+one is an order no restart could find. `submit_order_intent` refuses if its
+connection is inside an open transaction, because a write inside one is
+invisible to every other process and is rolled back by a crash. The bar
+checkpoint is guarded the same way, for the same reason.
 
 ### Accepted is not filled
 
@@ -1120,8 +1135,14 @@ green offline, and has been exercised read-only against the real paper account.
 What has not happened is an integrated paper BUY observed end to end. That is
 next.
 
-**Failure injection** follows: crash the process at each point in the
-claim/intent/submit chain and confirm the documented recovery in every case.
+**Failure injection** is done. `tests/test_failure_injection.py` breaks the
+system at each point in the claim/intent/submit chain - process death, lost
+replies, `408`/`429`/`5xx`, malformed responses, a locked database, a second
+runner - and asserts the documented recovery every time. It is offline: the
+whole suite passes with sockets disabled, because reproducing a lost reply
+against a real broker means placing real orders at moments chosen to be
+unrecoverable. Every protection it covers was mutation-checked by removing the
+protection and confirming the tests fail.
 
-**Phase 10 - Deployment** comes after both. Supervising a process whose first
-integrated paper order has not been observed would be premature.
+**Phase 10 - Deployment** comes after the smoke gate. Supervising a process
+whose first integrated paper order has not been observed would be premature.
