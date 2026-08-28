@@ -1279,9 +1279,100 @@ outside a pass's universe is recorded as observed and never traded out of.
 
 Combined crypto+equity activation, shared account-level risk arithmetic,
 combined exposure limits, per-book allocations (a "crypto 20% / stocks 20%"
-split is a Combined Integration decision and is **not** frozen here), a shared
-API budget, a distributed rate limiter, a dashboard, deployment artefacts, and
-any real equity paper submission.
+split would be a Combined Integration decision and is **not** frozen here), a
+shared API budget, a distributed rate limiter, deployment artefacts, and any
+real equity paper submission. Those seams are wired up in Combined Integration
+below.
+
+## The operations dashboard
+
+A read-only web view of the system: is it healthy, is reconciliation clean, is
+trading allowed, what is held, what happened recently, how much risk is used,
+are the runtimes and checkpoints current, and does anything need a person.
+
+It is **structurally incapable of trading.** There is no `POST`, `PUT`,
+`PATCH`, or `DELETE` route anywhere in `src/autotrader/dashboard`, so there is
+nothing a browser can send that places an order, cancels one, moves a risk
+limit, starts or stops the runtime, edits a row, or triggers a reconciliation
+repair. It opens SQLite with the `mode=ro` URI and `PRAGMA query_only`, so a
+write is refused by the engine rather than avoided by convention. It never
+imports the order-submission entry points, and it does not even name the
+concrete broker client class - the client is typed as a two-method read-only
+protocol. `tests/test_dashboard.py::test_dashboard_has_no_trading_write_surface`
+asserts all of it. Hiding a button would have left the capability; there is no
+capability.
+
+It **owns no state.** No dashboard database, no new table, no migration, no
+cached copy of trading state. Every figure is derived from the existing schema
+v5 tables through `autotrader.state`'s own read helpers, or read live from the
+paper account through `autotrader.execution.paper`'s read-only helpers.
+
+It **does not interfere.** One short deferred read transaction per poll, which
+in WAL mode takes no lock a writer waits on, and no journal-mode pragma is
+issued against a database the trading runtime owns. A busy or missing database
+is reported unreadable within a couple of seconds rather than waited on.
+
+It **invents nothing.** A figure this system cannot truthfully read reaches the
+browser as an explicit unavailable state with a reason - never as `$0.00`, a
+stale carry-over, or an empty table that reads like nothing happened. There is
+no chart, because nothing here persists an equity time series and a graph of
+numbers nobody recorded is a lie with axes on it.
+
+### Running it locally
+
+Two processes. Install the extra first:
+
+```bash
+pip install -e ".[dashboard]"
+```
+
+The API, on loopback:
+
+```bash
+python -m autotrader.dashboard
+```
+
+That binds `127.0.0.1:8000` and serves six GET routes:
+`/api/dashboard/overview` (the whole page in one consistent read), plus
+`positions`, `orders`, `risk`, `system`, and `health`. `--port` moves the port;
+there is deliberately no host flag.
+
+The frontend, in a second terminal:
+
+```bash
+cd dashboard/frontend && npm install && npm run dev
+```
+
+Then open `http://localhost:3000`. The frontend proxies `/api/dashboard/*` to
+the API process, so the browser only ever sees one origin and there is no CORS
+policy to get wrong. It polls `overview` every five seconds - this system
+trades on completed 15-minute bars, and a faster refresh would show motion
+rather than information.
+
+### Environment
+
+`AUTOTRADER_DASHBOARD_DB` overrides the database path; it defaults to
+`data/autotrader.db`. The dashboard needs no variable of its own beyond that.
+
+Account equity, cash, exposure, and live positions come from the paper account,
+so `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` must be exported for those to
+appear - the same credentials the rest of the system uses, read in the same
+place, and never returned from it. Without them the dashboard still runs and
+reports every one of those figures as unavailable rather than as zero. The
+credentials stay server-side: no route can carry one, broker error text is
+discarded rather than forwarded, and a test searches every response body for
+the configured secrets.
+
+`AUTOTRADER_PAPER_TRADING_ENABLED` is only ever *read* here, to report whether
+the submission gate is open. Nothing in the dashboard can change it.
+
+### Not deployment
+
+This is a local development setup. The API has **no authentication**, and
+binding it anywhere but loopback would publish an unauthenticated view of an
+account. Putting it on a VPS needs a reverse proxy and an authentication layer
+in front of it, and that is a deployment concern that comes after Combined
+Integration - it is not implemented here and nothing here implies it.
 
 ## Development
 
@@ -1298,6 +1389,17 @@ return real alpaca-py models so normalization is exercised against real
 response shapes, no real credential is read, and sockets are asserted shut.
 Source-level tests scan *executable* code with docstrings and comments
 stripped, so prose describing a forbidden construct cannot mask its presence.
+
+The dashboard frontend is checked from `dashboard/frontend`:
+
+```bash
+npm ci && npm run lint && npm run typecheck && npm run build && npm test
+```
+
+`npm test` runs the formatting rules that would otherwise misreport a figure -
+an unavailable value rendering as a number, a timestamp rendering in the
+viewer's timezone rather than UTC - on Node's own test runner. No test
+framework is installed for it; lint, typecheck, and build cover the rest.
 
 ## Layout
 
@@ -1330,6 +1432,11 @@ src/autotrader/equity/      the equity product: the ten-symbol universe, the
                             market-session arithmetic, the IEX bar boundary,
                             the batched runtime window, and the
                             regular-session runtime loop
+src/autotrader/dashboard/   the read-only operations API: GET routes only, a
+                            read-only SQLite connection, and a derived read
+                            model that invents no number
+dashboard/frontend/         the dashboard UI (Next.js, TypeScript, Tailwind);
+                            one page, five-second polling, no control
 tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)
 data/processed/             validated market data (git-ignored)

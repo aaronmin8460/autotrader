@@ -18,9 +18,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The read-only operations dashboard (C10). Optional because the trading
+# system itself does not need a web framework to run, and a process that
+# trades should not carry one it never imports.
+dashboard = [
+    "fastapi",
+    "uvicorn[standard]",
+]
 dev = [
     "pytest",
     "ruff",
+    # tests/test_dashboard.py drives the real application through Starlette's
+    # TestClient, which needs both the framework and httpx.
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
 ]
 
 [project.scripts]
