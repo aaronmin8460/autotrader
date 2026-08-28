@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+#
+# Enable - or disable - unattended PAPER order submission on this host.
+#
+#   autotrader-enable-paper-trading
+#   autotrader-enable-paper-trading --disable
+#
+# **This is the second action.** `autotrader-deploy` installs code and leaves
+# the runtimes observing; this opens the gate. They are separate programs, in
+# separate files, run at separate times, because a single command that both
+# shipped a change and authorized it to trade would make "deploy the fix" and
+# "start trading with the fix" the same keystroke, and there is no way to
+# review that decision afterwards.
+#
+# What this actually does is write one file:
+# /etc/autotrader/autotrader.trading.env. The runtime units load it last, so
+# its three variables override the safe defaults. Deleting it puts them back.
+#
+# **It cannot make trading happen by itself.** It opens two of the three gates:
+# the AUTOTRADER_PAPER_TRADING_ENABLED environment gate and the
+# --confirm-paper-runtime PAPER token. The third - startup reconciliation
+# reporting that local state matches the broker - is evaluated inside the
+# runtime on every single start, and nothing written to a file on disk can
+# open it. A runtime that starts unsafe keeps observing and submits nothing.
+#
+# There is no live equivalent of this script, and there is nothing to write
+# that would create one: the trading client is constructed with paper=True
+# hardcoded.
+#
+# Run as root.
+
+set -euo pipefail
+
+CONFIG_DIR="${AUTOTRADER_CONFIG_DIR:-/etc/autotrader}"
+SERVICE_GROUP="${AUTOTRADER_GROUP:-autotrader}"
+ACTIVATION_FILE="${CONFIG_DIR}/autotrader.trading.env"
+SECRETS_FILE="${CONFIG_DIR}/autotrader.secrets.env"
+
+TRADING_UNITS=(autotrader-crypto.service autotrader-equity.service)
+
+#: Typed in full, by a person, every time. The same shape as the CLI's own
+#: `--confirm-paper-runtime PAPER`: a confirmation you can fat-finger is a
+#: confirmation that does nothing.
+CONFIRMATION="ENABLE PAPER TRADING"
+
+DISABLE=0
+DRY_RUN=0
+
+die() { printf 'enable-paper-trading: %s\n' "$*" >&2; exit 1; }
+note() { printf '\n== %s\n' "$*"; }
+run() {
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    printf '  [dry-run] %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: autotrader-enable-paper-trading [--disable] [--dry-run]
+
+  (no options)   Enable unattended PAPER order submission. Prompts for a typed
+                 confirmation, then writes the activation file and restarts the
+                 trading runtimes.
+  --disable      Remove the activation file and restart the runtimes, returning
+                 the host to observe-only. Does not close any position.
+  --dry-run      Print what would happen. Changes nothing.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --disable) DISABLE=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+  shift
+done
+
+restart_runtimes() {
+  command -v systemctl >/dev/null 2>&1 || { printf '  systemctl unavailable - restart the runtimes by hand\n'; return 0; }
+  for unit in "${TRADING_UNITS[@]}"; do
+    if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+      printf '  restarting %s\n' "${unit}"
+      run systemctl restart "${unit}"
+    else
+      printf '  %s is not running - it will pick this up when started\n' "${unit}"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Disable.
+# ---------------------------------------------------------------------------
+
+if [ "${DISABLE}" -eq 1 ]; then
+  note "Disabling paper order submission"
+  if [ -f "${ACTIVATION_FILE}" ]; then
+    run rm -f "${ACTIVATION_FILE}"
+    printf '  removed %s\n' "${ACTIVATION_FILE}"
+  else
+    printf '  %s already absent - the host was already observe-only\n' "${ACTIVATION_FILE}"
+  fi
+  restart_runtimes
+  cat <<'SUMMARY'
+
+  Observe-only. The runtimes fetch, validate, evaluate, record and reconcile,
+  and construct no execution path.
+
+  Nothing was closed and nothing was sold. Any position the paper account
+  holds is still open; this switch stops new autonomous activity, it does not
+  unwind what already happened.
+SUMMARY
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Enable.
+# ---------------------------------------------------------------------------
+
+note "Preflight"
+
+[ -d "${CONFIG_DIR}" ] || die "${CONFIG_DIR} does not exist. Deploy first."
+
+if [ ! -f "${SECRETS_FILE}" ]; then
+  die "${SECRETS_FILE} is absent. Paper submission needs Alpaca paper credentials; create it first (see deploy/env/autotrader.secrets.env.example)."
+fi
+
+# Presence, not value. The credentials are not read, echoed, logged or
+# validated here - an activation script is the last place that should be
+# handling a key. The broker is the thing that decides whether they work.
+if ! grep -qE '^ALPACA_API_KEY=.+' "${SECRETS_FILE}" \
+  || ! grep -qE '^ALPACA_SECRET_KEY=.+' "${SECRETS_FILE}"; then
+  die "${SECRETS_FILE} does not have both ALPACA_API_KEY and ALPACA_SECRET_KEY set to a non-empty value."
+fi
+printf '  credentials present in %s\n' "${SECRETS_FILE}"
+
+if [ -f "${ACTIVATION_FILE}" ]; then
+  printf '  %s already exists - paper trading is already activated\n' "${ACTIVATION_FILE}"
+fi
+
+cat <<'WARNING'
+
+  This authorizes the crypto and equity runtimes to submit MARKET orders to
+  the Alpaca PAPER account, unattended, whenever their strategy produces a
+  signal and their risk engine approves it.
+
+  PAPER only. There is no live path in this system to enable.
+
+  Still not bypassed by this: every start reconciles local state against the
+  account first, and a start that comes back UNRESOLVED or FAILED keeps
+  observing and submits nothing, regardless of this file.
+
+WARNING
+
+if [ "${DRY_RUN}" -eq 0 ]; then
+  printf 'Type exactly "%s" to proceed: ' "${CONFIRMATION}"
+  IFS= read -r reply
+  [ "${reply}" = "${CONFIRMATION}" ] || die "confirmation did not match. Nothing changed."
+fi
+
+note "Writing ${ACTIVATION_FILE}"
+
+if [ "${DRY_RUN}" -eq 0 ]; then
+  # Created empty at the right ownership and mode first, then filled. Writing
+  # the content first and fixing the mode afterwards leaves a window where the
+  # file is world-readable.
+  install -o root -g "${SERVICE_GROUP}" -m 0640 /dev/null "${ACTIVATION_FILE}"
+  cat >"${ACTIVATION_FILE}" <<'ACTIVATION'
+# Written by autotrader-enable-paper-trading. Delete this file, or run
+# `autotrader-enable-paper-trading --disable`, to return to observe-only.
+#
+# The runtime units load this after autotrader.env, so these three values
+# override the safe defaults there.
+AUTOTRADER_PAPER_TRADING_ENABLED=true
+AUTOTRADER_CRYPTO_ARGS=--confirm-paper-runtime PAPER
+AUTOTRADER_EQUITY_ARGS=--confirm-paper-runtime PAPER
+ACTIVATION
+else
+  printf '  [dry-run] would write %s (0640 root:%s)\n' "${ACTIVATION_FILE}" "${SERVICE_GROUP}"
+fi
+
+restart_runtimes
+
+cat <<SUMMARY
+
+  Paper order submission is ENABLED.
+
+  Confirm what the runtimes actually decided at startup - the third gate is
+  theirs, not this script's:
+
+    journalctl -u autotrader-crypto.service -n 50 --no-pager
+    journalctl -u autotrader-equity.service -n 50 --no-pager
+
+  A runtime that printed RECONCILIATION NOT SAFE - TRADING DISABLED is
+  observing despite this file, and that is the system working.
+
+  To stop new autonomous activity at any point:
+    autotrader-emergency-stop
+SUMMARY

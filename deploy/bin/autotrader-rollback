@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+#
+# Roll the deployed AutoTrader code back to an earlier commit.
+#
+#   autotrader-rollback [<git-sha>] [options]
+#
+# With no SHA, the previous entry in the deploy history is proposed and must be
+# confirmed.
+#
+# **Code rolls back. The database does not.** That asymmetry is the whole
+# design. The SQLite file is durable intent and an audit trail of things that
+# actually happened at a broker, and the broker's own record of them does not
+# rewind because this host checked out an older tree. Restoring yesterday's
+# database would produce local state that disagrees with the account - orders
+# the file has never heard of, positions it thinks are still open - which is
+# precisely the situation reconciliation exists to detect and would then
+# "repair" by overwriting the restored rows anyway.
+#
+# So: the database is left exactly where it is, a backup is taken first in case
+# a human later decides otherwise, and the one thing that can genuinely go
+# wrong - old code meeting a schema that moved on without it - is checked
+# BEFORE any service is stopped, and fails closed.
+#
+# Run as root.
+
+set -euo pipefail
+
+APP_DIR="${AUTOTRADER_APP_DIR:-/opt/autotrader/app}"
+VENV_DIR="${AUTOTRADER_VENV_DIR:-/opt/autotrader/venv}"
+STATE_DIR="${AUTOTRADER_STATE_DIR:-/var/lib/autotrader}"
+CONFIG_DIR="${AUTOTRADER_CONFIG_DIR:-/etc/autotrader}"
+DB_PATH="${AUTOTRADER_DB:-${STATE_DIR}/autotrader.db}"
+BACKUP_DIR="${AUTOTRADER_BACKUP_DIR:-${STATE_DIR}/backups}"
+
+TRADING_UNITS=(autotrader-crypto.service autotrader-equity.service)
+DASHBOARD_UNITS=(autotrader-dashboard-api.service autotrader-dashboard-web.service)
+DEPLOY_LOG="${STATE_DIR}/deploy-history.log"
+
+ASSUME_YES=0
+SKIP_BACKUP=0
+DRY_RUN=0
+TARGET=""
+
+die() { printf 'rollback: %s\n' "$*" >&2; exit 1; }
+have_systemctl() { command -v systemctl >/dev/null 2>&1; }
+note() { printf '\n== %s\n' "$*"; }
+run() {
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    printf '  [dry-run] %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: autotrader-rollback [<git-sha>] [options]
+
+  <git-sha>       Commit to roll back to. Defaults to the previous entry in
+                  the deploy history, which must then be confirmed.
+
+Options:
+  --yes           Do not prompt. Still refuses on an incompatible schema.
+  --skip-backup   Do not take a database backup first. Not recommended.
+  --dry-run       Print what would happen. Changes nothing.
+  -h, --help      This text.
+
+Never restores a database. Never re-enables trading.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --yes) ASSUME_YES=1 ;;
+    --skip-backup) SKIP_BACKUP=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *)
+      [ -z "${TARGET}" ] || die "more than one SHA given"
+      TARGET="$1"
+      ;;
+  esac
+  shift
+done
+
+[ -d "${APP_DIR}/.git" ] || die "${APP_DIR} is not a git checkout."
+
+CURRENT_SHA="$(git -C "${APP_DIR}" rev-parse HEAD)"
+
+if [ -z "${TARGET}" ]; then
+  [ -f "${DEPLOY_LOG}" ] || die "no SHA given and no deploy history at ${DEPLOY_LOG}. Pass one explicitly."
+  # The most recent entry that is not what is deployed right now.
+  TARGET="$(awk -v cur="${CURRENT_SHA}" '$2 != cur { last = $2 } END { print last }' "${DEPLOY_LOG}")"
+  [ -n "${TARGET}" ] || die "deploy history has no earlier commit than the current one. Pass a SHA explicitly."
+  printf 'Proposing the previous deployed commit from %s:\n  %s\n' "${DEPLOY_LOG}" "${TARGET}"
+fi
+
+TARGET_SHA="$(git -C "${APP_DIR}" rev-parse --verify --quiet "${TARGET}^{commit}" || true)"
+[ -n "${TARGET_SHA}" ] || die "'${TARGET}' does not name a commit in ${APP_DIR}."
+
+[ "${TARGET_SHA}" != "${CURRENT_SHA}" ] || die "already at ${TARGET_SHA}. Nothing to roll back."
+
+note "Rollback plan"
+printf '  from : %s\n' "${CURRENT_SHA}"
+printf '  to   : %s\n' "${TARGET_SHA}"
+printf '  db   : %s (NOT rolled back)\n' "${DB_PATH}"
+
+# ---------------------------------------------------------------------------
+# The schema gate. Before anything stops.
+# ---------------------------------------------------------------------------
+
+note "Schema compatibility"
+
+if [ ! -f "${DB_PATH}" ]; then
+  printf '  no database at %s - nothing to check\n' "${DB_PATH}"
+else
+  DB_VERSION="$(
+    "${VENV_DIR}/bin/python" - "${DB_PATH}" <<'PY' 2>/dev/null || true
+import sqlite3, sys
+try:
+    connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=10)
+except sqlite3.Error:
+    connection = sqlite3.connect(sys.argv[1], timeout=10)
+    connection.execute("PRAGMA query_only = ON")
+try:
+    row = connection.execute("SELECT schema_version FROM schema_metadata WHERE id = 1").fetchone()
+    print(row[0] if row else "")
+except sqlite3.Error:
+    print("")
+finally:
+    connection.close()
+PY
+  )"
+
+  # The target commit's own view of the schema, read out of that commit rather
+  # than out of the working tree - the working tree is the version being rolled
+  # away from, and asking it would answer the wrong question.
+  read -r TARGET_SCHEMA TARGET_MIN <<EOF
+$(git -C "${APP_DIR}" show "${TARGET_SHA}:src/autotrader/state/sqlite.py" 2>/dev/null \
+  | awk '
+      /^SCHEMA_VERSION *=/ { schema = $3 }
+      /^MIN_MIGRATABLE_SCHEMA_VERSION *=/ { min = $3 }
+      END { print schema, min }
+    ')
+EOF
+
+  printf '  database is at schema v%s\n' "${DB_VERSION:-unknown}"
+  printf '  %s expects v%s (migrates from v%s)\n' \
+    "${TARGET_SHA:0:12}" "${TARGET_SCHEMA:-unknown}" "${TARGET_MIN:-unknown}"
+
+  if [ -z "${DB_VERSION}" ] || [ -z "${TARGET_SCHEMA}" ]; then
+    die "could not determine both schema versions. Refusing to roll back blind; check by hand."
+  fi
+
+  if [ "${DB_VERSION}" -gt "${TARGET_SCHEMA}" ]; then
+    cat >&2 <<FAILCLOSED
+
+  SCHEMA INCOMPATIBLE - ROLLBACK REFUSED
+
+  The database is at v${DB_VERSION}. The commit you asked for only understands
+  v${TARGET_SCHEMA}, and it will refuse to open a newer file rather than
+  downgrade it, because downgrading would discard the data the newer columns
+  hold. Nothing has been stopped or changed.
+
+  This is a decision for a human, not for this script. The options are:
+
+    * roll back to a commit whose schema version is >= v${DB_VERSION}
+    * restore a database backup taken before the migration to v${DB_VERSION},
+      accepting that local rows will then be behind the broker and that
+      reconciliation will rewrite them from the account
+    * fix forward instead
+
+  Backups: ${BACKUP_DIR}
+FAILCLOSED
+    exit 1
+  fi
+
+  if [ -n "${TARGET_MIN}" ] && [ "${DB_VERSION}" -lt "${TARGET_MIN}" ]; then
+    die "database is at v${DB_VERSION} but ${TARGET_SHA:0:12} cannot migrate anything older than v${TARGET_MIN}. Refusing."
+  fi
+
+  printf '  compatible: v%s opens cleanly under v%s code\n' "${DB_VERSION}" "${TARGET_SCHEMA}"
+fi
+
+if [ "${ASSUME_YES}" -eq 0 ] && [ "${DRY_RUN}" -eq 0 ]; then
+  printf '\nRoll back to %s? [y/N] ' "${TARGET_SHA}"
+  read -r reply
+  case "${reply}" in
+    y|Y|yes|YES) ;;
+    *) die "aborted." ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
+# Backup, stop, roll, rebuild.
+# ---------------------------------------------------------------------------
+
+if [ "${SKIP_BACKUP}" -eq 0 ] && [ -f "${DB_PATH}" ]; then
+  note "Backup before rolling back"
+  run "${VENV_DIR}/bin/python" "${APP_DIR}/deploy/bin/autotrader-backup" \
+    --db "${DB_PATH}" --into "${BACKUP_DIR}" --keep 0
+fi
+
+WAS_ACTIVE=()
+if have_systemctl; then
+  note "Stopping services"
+  for unit in "${TRADING_UNITS[@]}" "${DASHBOARD_UNITS[@]}"; do
+    if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+      WAS_ACTIVE+=("${unit}")
+      printf '  stopping %s\n' "${unit}"
+      run systemctl stop "${unit}"
+    fi
+  done
+fi
+
+note "Checking out ${TARGET_SHA}"
+run git -C "${APP_DIR}" checkout --quiet --detach "${TARGET_SHA}"
+
+note "Rebuilding the environment for the older tree"
+run "${VENV_DIR}/bin/python" -m pip install --quiet --upgrade "${APP_DIR}[dashboard]"
+
+FRONTEND_DIR="${APP_DIR}/dashboard/frontend"
+if [ -f "${FRONTEND_DIR}/package.json" ]; then
+  run npm --prefix "${FRONTEND_DIR}" ci
+  run npm --prefix "${FRONTEND_DIR}" run build
+fi
+
+if [ "${DRY_RUN}" -eq 0 ] && [ -d "${STATE_DIR}" ]; then
+  printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${TARGET_SHA}" "rollback-from-${CURRENT_SHA:0:12}" \
+    >>"${DEPLOY_LOG}"
+fi
+
+# The dashboard comes back automatically: it is read-only and an operator
+# mid-rollback wants to see state. The trading runtimes do NOT, whatever they
+# were doing before. Restarting a trading process as the last step of an
+# incident response is a decision that gets made with a human looking at
+# reconciliation output, not by a script that has just finished a git checkout.
+if [ "${#WAS_ACTIVE[@]}" -gt 0 ] && have_systemctl; then
+  note "Restarting the dashboard only"
+  for unit in "${DASHBOARD_UNITS[@]}"; do
+    for was in "${WAS_ACTIVE[@]}"; do
+      if [ "${unit}" = "${was}" ]; then
+        printf '  starting %s\n' "${unit}"
+        run systemctl start "${unit}"
+      fi
+    done
+  done
+fi
+
+note "Rolled back"
+cat <<SUMMARY
+  ${CURRENT_SHA}
+    -> ${TARGET_SHA}
+
+  The database was not modified and the broker was not touched. Any position
+  the account holds is still open, which is deliberate: rolling back code is
+  not a reason to trade.
+
+  The trading runtimes are STOPPED. Bring them back deliberately:
+
+    1. read-only check of local state against the account
+         ${VENV_DIR}/bin/autotrader reconcile --db ${DB_PATH} --dry-run
+
+    2. if that reports CLEAN or REPAIRED, stage observe-only
+         systemctl start autotrader-crypto autotrader-equity
+       (observe-only unless ${CONFIG_DIR}/autotrader.trading.env exists)
+
+    3. ${APP_DIR}/deploy/bin/autotrader-healthcheck
+SUMMARY
