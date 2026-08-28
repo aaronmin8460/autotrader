@@ -78,6 +78,7 @@ from autotrader.execution.paper import (
     ExecutionOutcome,
     MinimumNotionalError,
     MissingCredentialsError,
+    OrderLookupUnavailableError,
     PaperTradingDisabledError,
     QuantityBelowMinimumError,
     ReferencePriceUnavailableError,
@@ -90,6 +91,7 @@ from autotrader.execution.paper import (
     fetch_paper_account_state,
     fetch_paper_positions,
     fetch_reference_price,
+    find_broker_order_by_broker_id,
     find_broker_order_by_client_id,
     is_usd_quoted,
     minimum_quantity_from_notional,
@@ -312,6 +314,7 @@ class FakeTradingClient:
         positions: list[Position] | None = None,
         asset: Asset | BaseException | None = None,
         preflight: object = None,
+        lookup: object = None,
         submit: object = None,
         submit_status: OrderStatus = OrderStatus.ACCEPTED,
         submit_order_id: str | None = None,
@@ -321,11 +324,15 @@ class FakeTradingClient:
         self._asset = asset if asset is not None else make_asset()
         # None means "the broker has no such order", modelled as Alpaca's 404.
         self._preflight = preflight if preflight is not None else api_error(404, "order not found")
+        # The read-only lookup by the broker's own id. Same convention: None
+        # means "the broker has no such order", modelled as Alpaca's 404.
+        self._lookup = lookup if lookup is not None else api_error(404, "order not found")
         self._submit = submit
         self._submit_status = submit_status
         self._submit_order_id = submit_order_id
         self.submit_calls: list[MarketOrderRequest] = []
         self.preflight_calls: list[str] = []
+        self.lookup_calls: list[str] = []
         self.asset_calls: list[str] = []
         self.on_submit = None
 
@@ -346,6 +353,12 @@ class FakeTradingClient:
         if isinstance(self._preflight, BaseException):
             raise self._preflight
         return self._preflight  # type: ignore[return-value]
+
+    def get_order_by_id(self, order_id: str) -> Order:
+        self.lookup_calls.append(str(order_id))
+        if isinstance(self._lookup, BaseException):
+            raise self._lookup
+        return self._lookup  # type: ignore[return-value]
 
     def submit_order(self, order_data: MarketOrderRequest) -> Order:
         self.submit_calls.append(order_data)
@@ -1857,6 +1870,69 @@ def test_a_preflight_not_found_returns_none() -> None:
         )
         is None
     )
+
+
+def test_an_order_can_be_read_back_by_the_brokers_own_id() -> None:
+    """The read-only counterpart to the `client_order_id` lookup.
+
+    Exists for an operator holding only the id the broker printed back, who
+    needs to ask what became of it without knowing which local intent it
+    belongs to. It reads and returns a normalized snapshot; it places nothing.
+    """
+    order = make_order(client_order_id="autotrader-known", status=OrderStatus.FILLED)
+    client = FakeTradingClient(lookup=order)
+
+    snapshot = find_broker_order_by_broker_id(client, f" {BROKER_ORDER_UUID} ")
+
+    assert snapshot is not None
+    assert snapshot.client_order_id == "autotrader-known"
+    assert snapshot.status == "filled"
+    assert client.lookup_calls == [BROKER_ORDER_UUID]
+    assert client.submit_calls == []
+
+
+def test_a_definitive_not_found_by_broker_id_returns_none() -> None:
+    """Only a 404 - the broker's own "no such order" - answers None."""
+    client = FakeTradingClient(lookup=api_error(404))
+    assert find_broker_order_by_broker_id(client, "absent") is None
+
+
+@pytest.mark.parametrize("status", [None, 500, 502, 504, 408, 429])
+def test_an_unanswerable_lookup_by_broker_id_raises_rather_than_reporting_absence(
+    status: int | None,
+) -> None:
+    """A failed check is not a clean one, on this path exactly as on the other.
+
+    Reported through its own error type: `DuplicatePreflightUnavailableError`
+    means "refusing to submit", and this lookup submits nothing, so conflating
+    the two would give a caller a reason that does not describe what happened.
+    """
+    client = FakeTradingClient(lookup=api_error(status))
+
+    with pytest.raises(OrderLookupUnavailableError):
+        find_broker_order_by_broker_id(client, BROKER_ORDER_UUID)
+
+    assert client.submit_calls == []
+
+
+def test_an_unreadable_lookup_response_shape_is_refused() -> None:
+    with pytest.raises(OrderLookupUnavailableError, match="unexpected shape"):
+        find_broker_order_by_broker_id(FakeTradingClient(lookup={"id": "not an order"}), "x")
+
+
+@pytest.mark.parametrize("identifier", ["", "   ", None, 7])
+def test_a_broker_order_id_must_be_a_non_empty_string(identifier: object) -> None:
+    with pytest.raises(ExecutionInputError):
+        find_broker_order_by_broker_id(FakeTradingClient(), identifier)  # type: ignore[arg-type]
+
+
+def test_reading_an_order_back_needs_neither_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No environment gate and no confirmation token: there is nothing to confirm."""
+    monkeypatch.delenv(PAPER_TRADING_ENABLED_ENV, raising=False)
+    client = FakeTradingClient(lookup=make_order(client_order_id="autotrader-known"))
+
+    assert find_broker_order_by_broker_id(client, BROKER_ORDER_UUID) is not None
+    assert client.submit_calls == []
 
 
 # ==========================================================================

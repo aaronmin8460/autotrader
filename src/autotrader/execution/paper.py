@@ -311,6 +311,18 @@ class DuplicatePreflightUnavailableError(ExecutionError):
     """
 
 
+class OrderLookupUnavailableError(ExecutionError):
+    """A read-only order lookup could not be answered.
+
+    Deliberately distinct from "the broker says no such order exists", and
+    deliberately not a subclass of `DuplicatePreflightUnavailableError`: that
+    one is a refusal to *submit*, raised on the path to placing an order. This
+    one is raised by a diagnostic read that places nothing, so a caller
+    catching it must not conclude anything about whether an order exists - only
+    that this system does not currently know.
+    """
+
+
 class BrokerRejectedOrderError(ExecutionError):
     """The broker refused the order outright. No order exists."""
 
@@ -1300,6 +1312,55 @@ def find_broker_order_by_client_id(
     return _to_snapshot(order)
 
 
+def find_broker_order_by_broker_id(
+    client: TradingClient, broker_order_id: str
+) -> BrokerOrderSnapshot | None:
+    """Ask the broker about one of its own order ids. Read-only, always.
+
+    The `client_order_id` counterpart above is the anchor reconciliation uses,
+    because this system mints that key before it submits and therefore always
+    has one. This function exists for the opposite direction: an operator
+    holding only the id the broker printed back, who needs to ask what became
+    of it without knowing which local intent it belongs to.
+
+    Same asymmetry as the duplicate preflight, for the same reason. `None` is
+    returned **only** for a broker that clearly said no such order exists (a
+    `404`); every other failure raises `OrderLookupUnavailableError`, because
+    "the lookup failed" and "there is no such order" are different answers and
+    a caller that conflates them will draw a confident wrong conclusion about
+    an order that may be live.
+
+    Nothing here submits, cancels, or replaces anything, which is why it needs
+    neither the environment gate nor a confirmation token.
+    """
+    if not isinstance(broker_order_id, str) or not broker_order_id.strip():
+        raise ExecutionInputError("broker_order_id must be a non-empty string.")
+    try:
+        order = client.get_order_by_id(broker_order_id.strip())
+    except APIError as error:
+        if _http_status(error) == 404:
+            return None
+        raise OrderLookupUnavailableError(
+            f"Could not read order {broker_order_id} from the broker "
+            f"({_api_error_text(error)}). Nothing is known about it, and nothing "
+            "was submitted."
+        ) from None
+    except Exception as error:  # noqa: BLE001 - any failure here must fail closed
+        raise OrderLookupUnavailableError(
+            f"Could not read order {broker_order_id} from the broker "
+            f"({type(error).__name__}). Nothing is known about it, and nothing "
+            "was submitted."
+        ) from None
+
+    if order is None:
+        return None
+    if not isinstance(order, Order):
+        raise OrderLookupUnavailableError(
+            "The broker returned an order in an unexpected shape; refusing to report it as fact."
+        )
+    return _to_snapshot(order)
+
+
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
@@ -1876,6 +1937,7 @@ __all__ = [
     "MissingCredentialsError",
     "NonDurableIntentError",
     "NotPaperEnvironmentError",
+    "OrderLookupUnavailableError",
     "PaperAccountState",
     "PaperExecutionResult",
     "PaperPosition",
@@ -1896,6 +1958,7 @@ __all__ = [
     "fetch_paper_account_state",
     "fetch_paper_positions",
     "fetch_reference_price",
+    "find_broker_order_by_broker_id",
     "find_broker_order_by_client_id",
     "is_usd_quoted",
     "minimum_quantity_from_notional",

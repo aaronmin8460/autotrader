@@ -27,6 +27,10 @@ logs/
 *.runtime.lock
 *.account.execution.lock
 
+# Local paper-smoke baseline snapshots (autotrader-smoke preflight --write-baseline).
+# Operational scratch describing one account at one moment; never committed.
+.smoke/
+
 # Local operational trading state (SQLite; introduced in a later phase)
 *.db
 *.sqlite
