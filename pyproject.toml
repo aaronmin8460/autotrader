@@ -25,6 +25,7 @@ dev = [
 
 [project.scripts]
 autotrader = "autotrader.cli:main"
+autotrader-smoke = "autotrader.smoke.cli:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "autotrader.__version__" }
