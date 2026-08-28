@@ -95,6 +95,7 @@ from autotrader.reconciliation import (
     ReconciliationStatus,
     reconcile_paper_state,
 )
+from autotrader.research.cli import app as research_app
 from autotrader.runtime.checkpoint import SqliteCheckpoint
 from autotrader.runtime.execution import PaperExecutionGateway
 from autotrader.runtime.lock import RuntimeLock, RuntimeLockError, lock_path_for
@@ -1297,6 +1298,13 @@ def equity_run(
         typer.echo("")
         typer.secho("RUNTIME STOPPED ON A FATAL ERROR", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=EQUITY_RUN_REFUSED_EXIT_CODE)
+
+
+#: The research command group. Registered here rather than defined here: study
+#: tooling lives in `autotrader.research` so it can grow without this module
+#: growing with it, and so nothing under `research` is importable as part of
+#: the trading path. Every command in it is offline and read-only.
+app.add_typer(research_app, name="research")
 
 
 def main() -> None:

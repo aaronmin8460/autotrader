@@ -232,6 +232,7 @@ Equity   Equity V0.2                       <- component-complete (E1)
 C10      Failure injection / hardening     <- done (C10)
 Dash     Read-only operations dashboard    <- done, V0.2 (CI1)
 CI1      Combined integration              <- done, schema v6 (CI1)
+QR1      Quant research infrastructure     <- done, research only (QR1)
 Phase 10 Deployment                        <- after the combined paper smoke
 ```
 
@@ -264,6 +265,14 @@ still submitted no order.
 - **Secrets:** environment variables loaded from a local `.env`, which is
   ignored by git. `.env.example` documents the variable names only and
   contains no values.
+- **Research artifacts (QR1):** experiment records, manifests, split
+  definitions and selection records, written **only** under
+  `AUTOTRADER_QA_REPORTS/research/<study>/<run>/` on external storage. Never
+  inside the repository: `autotrader.research.storage` refuses an unset
+  variable rather than falling back to a local directory, and refuses a path
+  that resolves into the checkout. Research reads datasets from
+  `AUTOTRADER_QA_DATASETS`. None of it is trading state, and deleting a study
+  directory cannot affect the trading system.
 - Data directories and the SQLite file are local artifacts. The repository
   must remain reproducible from source code plus a data re-fetch.
 
@@ -376,8 +385,20 @@ shared API budget, the final reconciliation scope and dashboard V0.2 belong to
 the Combined Integration phase.
 
 **Signal generation:** AI trading agents, LLM-generated trade signals,
-machine-learning trading models, sentiment analysis, additional indicators,
-parameter or walk-forward optimization.
+machine-learning trading models, sentiment analysis, and additional indicators
+**in the trading path**. The production strategy remains the fixed EMA 20 / 50
+crossover of section 3.3.
+
+*Amended by QR1.* Walk-forward validation and bounded parameter sweeps now
+exist, as offline research infrastructure only (section 9, QR1). The
+distinction is exact and is enforced by tests rather than by convention:
+research **evaluates**, and it may not activate. No sweep result changes what
+either runtime does, no parameter set discovered by a study is adopted, and
+`autotrader.research` cannot reach an order path, a broker client, or the
+operational database. Adopting a parameter set that a study selected would be a
+further, separate scope change requiring an edit to this document - the sweep
+producing a winner is not that decision, and the winner is not a
+recommendation.
 
 **Application surface:** web frontend, Next.js, FastAPI, mobile application,
 TradingView integration, strategy marketplace.
@@ -1855,6 +1876,149 @@ partial, and recovery is reconciliation-driven.
 deployment, and any real equity paper order. The combined system has been
 exercised read-only against the real paper account and has submitted **zero**
 orders.
+
+### QR1 - Quant research infrastructure (complete, research only)
+
+Everything above builds a system that trades. This phase builds the apparatus
+that decides whether a future strategy *deserves* to. It exists because
+Decision Engines V2/V3/V4/V5 are coming, and a backtest that has not been
+audited for look-ahead is not evidence about any of them.
+
+**Research only, and structurally so.** `autotrader.research` submits no order,
+constructs no broker client, reads no credential, opens no socket and touches
+no operational SQLite state. Tests in `tests/test_research_engines.py` scan
+every module in the package for the order vocabulary, for a broker SDK import,
+for `autotrader.state`, for `sqlite3` and for a network client, and fail on
+any of them. A study is arithmetic over stored bars.
+
+| | |
+| --- | --- |
+| Universes | BTC/USD, ETH/USD, and the ten Equity V0.2 symbols |
+| Simulator | next-bar fills, long only, one position, fractional `Decimal` |
+| Costs | per-side fee and adverse slippage, named per asset class |
+| Validation | walk-forward, rolling or anchored, with an embargo |
+| Holdout | carved off before any window is generated; never selected against |
+| Sweeps | hard ceiling of 256 experiments; oversized grids refused |
+| Storage | `AUTOTRADER_QA_REPORTS` only; a path inside the repository is refused |
+| Status | Offline, green, and not wired into any runtime |
+
+**The integration contract is the point of the phase.** `DecisionEngine` asks a
+strategy for four things - identity, parameters, warm-up length, and the
+signals it derives from a frame of bars - and nothing else. It is never handed
+cash, a position, an account, or a broker, so sizing and execution stay where
+they belong exactly as docs/SPEC.md section 6A requires. Every other module in
+the package consumes that protocol and **names no strategy**; a test asserts
+that `replay`, `metrics`, `splits`, `walkforward`, `experiments`, `trades` and
+`leakage` contain no reference to the EMA crossover. A future V2 engine becomes
+evaluable by writing an adapter, not by this infrastructure learning about it,
+and its production code is not rewritten to suit research.
+
+`EmaCrossEngine` is the worked example: it adapts the existing C3 crossover by
+calling it, computes no indicator of its own, and would break loudly rather
+than drift quietly if the production strategy changed.
+`ParametricEmaCross` is a research-only generalization over the periods,
+because a sweep needs a parameter to vary and C3's periods are deliberately
+fixed. A test pins the two together - at 20/50 they must emit identical signals
+- so a sweep explores the strategy production actually runs.
+
+**The simulator reproduces the production backtester exactly.** With slippage
+at zero and the C4 taker fee, `autotrader.research.replay` and
+`autotrader.backtest` agree on every fill, every fee, every point of the equity
+curve and the final cash, to the last decimal place, across four independent
+price fixtures. That is a test, not a claim. It is what makes the research
+simulator's extra machinery - the engine seam, slippage, exposure and turnover
+accounting, portfolio aggregation - additions rather than a second, subtly
+different backtester.
+
+**No look-ahead, and it is checked rather than asserted.** Section 6F is
+enforced the same way C4 enforces it: a signal on bar *t* fills at bar *t+1*,
+never on its own bar, and a signal on the final bar is left unexecuted. What is
+new is that the *engine* is audited too, by perturbation. Future bars are
+scaled, the engine is re-asked, and any signal at or before the change is a
+finding. This catches a negative shift, a centered rolling window, a
+normalization fitted over the whole series, a backfill and a forward-looking
+label without knowing which was written - something no static scan can do.
+
+`tests/test_research_leakage.py` injects each of those defects deliberately and
+proves the auditor catches it, and pairs every one with a legitimate construct
+that must *not* be flagged. A detector tested only against leaks can pass by
+rejecting everything.
+
+**What the leakage auditor checks.**
+
+| Code | What it catches |
+| --- | --- |
+| `UNORDERED_TIMESTAMPS` | a shuffled split - contiguous in position, scrambled in time |
+| `DUPLICATE_TIMESTAMP` | one instant able to fall in both train and test |
+| `TEST_BEFORE_TRAIN` | a test window that precedes its training data |
+| `TRAIN_TEST_OVERLAP` | bars both fitted and scored |
+| `EMBARGO_TOO_SHORT` | a lookback at the test window's start still reading training bars |
+| `NO_EMBARGO` | no embargo declared at all - not thought about, rather than justified |
+| `CROSS_WINDOW_TEST_OVERLAP` | a bar scored by more than one window |
+| `HOLDOUT_USED_IN_SELECTION` | a selection window reaching into the final holdout |
+| `HOLDOUT_NOT_LAST` | a holdout that is not the tail of the dataset |
+| `WARMUP_LONGER_THAN_WINDOW` | a window too short to be anything but indicator ramp |
+| `FUTURE_FEATURE_DEPENDENCE` | a feature that changes when the future changes |
+| `FUTURE_SIGNAL_DEPENDENCE` | an engine that changes when the future changes |
+| `INCOMPLETE_FINAL_BAR` | acting on a bar that had not finished forming |
+
+A clean report is strong evidence, not a proof: perturbation samples probe
+points, and `LeakageReport` carries its probe count so a clean result is read
+with the right confidence. A test pins the honest limit - an engine that emits
+no signal at all cannot be shown to leak.
+
+**There is no shuffle parameter anywhere in the split API.** Not defaulted off,
+not present. A knob that must never be turned should not exist, and a test
+greps for it. Test windows do not overlap by default, so an average over
+windows is an average over independent samples. The final holdout is carved off
+*before* any walk-forward window is generated, and it is evaluated once, for
+one already-selected candidate, by a function that has no way to spell
+"evaluate every candidate and keep the best".
+
+**Metrics, and the `None` discipline.** Total return, annualized return with
+its sample length beside it, realized and unrealized PnL kept apart, Sharpe,
+Sortino, annualized volatility, max drawdown and its duration, win rate, trade
+count, turnover, exposure, average trade, profit factor, and cost drag. An
+undefined metric is `None` and never `0.0` - a Sharpe ratio over a flat curve,
+a win rate over zero trades, a profit factor with no loss. Zero would survive
+into a leaderboard and get a parameter set selected. The CLI prints `n/a`.
+
+Annualization is tied to an explicit `BarClock`, because a 15-minute crypto bar
+arrives 35,040 times a year and a 15-minute equity bar about 6,552 - annualizing
+one with the other's constant overstates everything by a factor of five.
+
+**Sweeps are bounded and recorded.** 256 experiments is a hard ceiling and an
+oversized grid is refused rather than truncated; the bound is checked before
+any constraint, so a filter cannot smuggle a wide search past it. Every
+experiment writes a record carrying its parameter set, code version, dataset
+digest and interval, train/test interval, cost model, seed and metrics.
+Selection names every window that informed it and how many candidates were
+compared, because a best-of-200 score is a different claim from a best-of-3.
+The default objective refuses to rank a candidate that traded too little to
+measure or was profitable in half its windows or fewer.
+
+**Storage is external, and refuses to be otherwise.** Artifacts go under
+`AUTOTRADER_QA_REPORTS/research/<study>/<run>/`. An unset variable is an error
+rather than a fallback to a local directory, and a path resolving inside the
+repository is refused - the repository root is derived from the package's own
+location, so the check cannot be defeated by running from elsewhere.
+
+**Portfolio replay allocates sleeves; it does not model shared cash.** Capital
+is partitioned across symbols and each is replayed independently, then the
+equity curves are aggregated on a union timestamp index with each sleeve
+forward-filled. Two symbols never compete for the same dollar. This is stated
+rather than hidden: modelling the production runtime's sequential sizing
+against one shared account means modelling the account execution lock and the
+combined exposure ceiling, which are runtime properties, and a research replay
+that pretended to would produce a number that looks like a paper-trading
+forecast and is not.
+
+**Deliberately not done here.** No strategy is activated, no engine is
+recommended, no parameter set is adopted, and no result in this phase is a
+profitability claim. Nothing is wired into either runtime. The research CLI
+group is offline and read-only, and no command in it accepts a confirmation
+token - a research command that had one would be a research command that could
+do something.
 
 ### Later phases
 
