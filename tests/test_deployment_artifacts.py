@@ -542,6 +542,20 @@ def test_the_publish_script_cannot_touch_a_trading_runtime() -> None:
     assert "autotrader.secrets.env" not in code
 
 
+def test_no_package_install_may_restart_a_service_behind_the_operator() -> None:
+    """Ubuntu's needrestart hook restarts whatever links an upgraded library.
+
+    On this host that list includes the crypto runtime, so an unguarded
+    `apt-get install` inside a script about web publishing bounces the trading
+    process. Every apt call carries the environment that turns that off.
+    """
+    code = script_code("autotrader-publish-web")
+    assert "NEEDRESTART_MODE=l" in code
+    for number, line in enumerate(code.splitlines(), start=1):
+        if "apt-get" in line:
+            assert "APT_ENVIRONMENT" in line, f"line {number}: unguarded apt call: {line!r}"
+
+
 def test_the_publish_script_does_not_restart_the_dashboard() -> None:
     """Publishing is additive: something new connects to a port already open."""
     code = script_code("autotrader-publish-web")

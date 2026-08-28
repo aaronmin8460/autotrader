@@ -58,6 +58,25 @@ CADDY_MINIMUM_MINOR=8
 #: forever would turn a misconfiguration into a hung terminal.
 CERTIFICATE_TIMEOUT_SECONDS=180
 
+#: The environment every apt call in this script runs under.
+#:
+#: `NEEDRESTART_MODE=l` is the load-bearing one. Ubuntu's needrestart hook runs
+#: after each apt transaction, decides which services link a library that was
+#: just replaced, and restarts them - and on this host that list includes
+#: `autotrader-crypto.service`. A script whose job is to change who can LOOK at
+#: the dashboard must not bounce the trading runtime as a side effect of
+#: installing a web server. `l` lists what it would have restarted and
+#: restarts nothing; the operator decides when a runtime goes down.
+#:
+#: The runtime survives it - SIGTERM finishes the cycle, and startup
+#: reconciliation runs again on the way back up - so this is not a correctness
+#: fix. It is a fix for an unannounced trading-process restart, which is not
+#: this script's to perform.
+APT_ENVIRONMENT=(
+  DEBIAN_FRONTEND=noninteractive
+  NEEDRESTART_MODE=l
+)
+
 DOMAIN=""
 USERNAME="${AUTOTRADER_DASHBOARD_USER:-autotrader}"
 DRY_RUN=0
@@ -232,7 +251,7 @@ if caddy_is_new_enough; then
   step "$(caddy version | head -n 1) is already installed"
 else
   step "installing caddy from ${CADDY_LIST_URL}"
-  run apt-get install -y --no-install-recommends debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+  run env "${APT_ENVIRONMENT[@]}" apt-get install -y --no-install-recommends debian-keyring debian-archive-keyring apt-transport-https curl gnupg
   if [ "${DRY_RUN}" -eq 1 ]; then
     printf '  [dry-run] fetch %s -> %s\n' "${CADDY_GPG_URL}" "${CADDY_KEYRING}"
     printf '  [dry-run] fetch %s -> %s\n' "${CADDY_LIST_URL}" "${CADDY_APT_LIST}"
@@ -242,8 +261,8 @@ else
     curl -1sSLf "${CADDY_LIST_URL}" > "${CADDY_APT_LIST}"
     chmod 0644 "${CADDY_APT_LIST}"
   fi
-  run apt-get update
-  run apt-get install -y caddy
+  run env "${APT_ENVIRONMENT[@]}" apt-get update
+  run env "${APT_ENVIRONMENT[@]}" apt-get install -y caddy
   if [ "${DRY_RUN}" -eq 0 ]; then
     caddy_is_new_enough || die "installed caddy is older than ${CADDY_MINIMUM_MAJOR}.${CADDY_MINIMUM_MINOR}; the configuration needs basic_auth."
     step "installed $(caddy version | head -n 1)"
@@ -286,7 +305,11 @@ if [ "${ROTATE}" -eq 1 ] || [ -z "${STORED_HASH}" ]; then
     [ "${#NEW_PASSWORD}" -ge 24 ] || die "could not generate a password of usable length."
     # Through stdin, never argv: an argument is visible in `ps` to every
     # local account for as long as the process lives.
-    HASH="$(printf '%s' "${NEW_PASSWORD}" | caddy hash-password)"
+    #
+    # Newline-terminated, because `caddy hash-password` reads a LINE and
+    # returns `Error: EOF` on input that never ends one. The terminator is
+    # stripped before hashing and is not part of the password.
+    HASH="$(printf '%s\n' "${NEW_PASSWORD}" | caddy hash-password)"
     case "${HASH}" in
       '$2a$'*|'$2b$'*|'$2y$'*) : ;;
       *) die "caddy hash-password did not return a bcrypt hash." ;;
