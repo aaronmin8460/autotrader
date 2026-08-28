@@ -19,7 +19,7 @@
 # is not copied, moved, recreated or migrated by anything here. Schema
 # migration is the application's job and happens when a runtime opens the file.
 #
-# Run as root: it writes /opt, /etc/systemd/system, and calls systemctl.
+# Run as root: it writes /opt, /usr/lib/systemd/system, and calls systemctl.
 
 set -euo pipefail
 
@@ -30,7 +30,19 @@ APP_DIR="${AUTOTRADER_APP_DIR:-/opt/autotrader/app}"
 VENV_DIR="${AUTOTRADER_VENV_DIR:-/opt/autotrader/venv}"
 STATE_DIR="${AUTOTRADER_STATE_DIR:-/var/lib/autotrader}"
 CONFIG_DIR="${AUTOTRADER_CONFIG_DIR:-/etc/autotrader}"
-SYSTEMD_DIR="${AUTOTRADER_SYSTEMD_DIR:-/etc/systemd/system}"
+# Units are installed into the VENDOR directory, not /etc/systemd/system, and
+# the reason is masking. `systemctl mask` disables a unit by symlinking it to
+# /dev/null in the ADMIN directory, which outranks the vendor one - and it
+# refuses to do that at all if a regular file is already sitting at that path.
+# Installing units into /etc therefore makes a trading runtime unmaskable,
+# and installing them there *around* an existing mask is worse: `install`
+# replaces the symlink with a regular file, silently re-arming a service an
+# operator deliberately switched off. Vendor for what the deploy ships, admin
+# for what the operator decides; the two layers never write to each other.
+SYSTEMD_DIR="${AUTOTRADER_SYSTEMD_DIR:-/usr/lib/systemd/system}"
+
+#: Where systemd looks first, and where a mask lives. Never written here.
+ADMIN_SYSTEMD_DIR="${AUTOTRADER_ADMIN_SYSTEMD_DIR:-/etc/systemd/system}"
 SERVICE_USER="${AUTOTRADER_USER:-autotrader}"
 
 TRADING_UNITS=(autotrader-crypto.service autotrader-equity.service)
@@ -239,12 +251,32 @@ if [ -d "${APP_DIR}/deploy/systemd" ]; then
     [ -f "${unit_file}" ] || continue
     unit_name="$(basename "${unit_file}")"
     installed="${SYSTEMD_DIR}/${unit_name}"
+
+    # A mask is a standing operator decision that this service must not run.
+    # Deploying into the vendor directory does not reach it, but SYSTEMD_DIR
+    # is overridable, so check rather than assume: writing here would replace
+    # the symlink with a regular file and quietly re-arm the service.
+    if [ -L "${installed}" ] && [ "$(readlink "${installed}")" = "/dev/null" ]; then
+      printf '  %s is MASKED at %s - left alone\n' "${unit_name}" "${installed}"
+      continue
+    fi
+
     if [ -f "${installed}" ] && cmp -s "${unit_file}" "${installed}"; then
       continue
     fi
     printf '  updating %s\n' "${unit_name}"
     run install -o root -g root -m 0644 "${unit_file}" "${installed}"
     UNITS_CHANGED=1
+
+    # A regular file in the admin directory outranks what was just installed.
+    # Left unreported, the host would keep running the old unit while
+    # `git rev-parse` truthfully reported the new SHA - the kind of
+    # disagreement that costs an hour at exactly the wrong moment.
+    shadow="${ADMIN_SYSTEMD_DIR}/${unit_name}"
+    if [ "${SYSTEMD_DIR}" != "${ADMIN_SYSTEMD_DIR}" ] && [ -f "${shadow}" ] && [ ! -L "${shadow}" ]; then
+      printf '  WARNING: %s shadows it and takes precedence. Remove it, or this deploy did nothing for %s.\n' \
+        "${shadow}" "${unit_name}"
+    fi
   done
 fi
 if [ "${UNITS_CHANGED}" -eq 0 ]; then

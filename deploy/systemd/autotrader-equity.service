@@ -1,6 +1,6 @@
 # AutoTrader equity runtime - Alpaca PAPER only, ten-symbol universe.
 #
-# Install to /etc/systemd/system/autotrader-equity.service.
+# Install to /usr/lib/systemd/system/autotrader-equity.service.
 #
 # Requires the `equity-run` command, which arrives with Equity V0.2. Until the
 # combined branch is merged, `systemctl start autotrader-equity` fails on an

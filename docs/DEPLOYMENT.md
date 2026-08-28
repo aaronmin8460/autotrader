@@ -105,7 +105,8 @@ Four concerns, four locations, deliberately not overlapping.
     autotrader.secrets.env   Alpaca paper credentials        0640 root:autotrader
     autotrader.trading.env   ACTIVATION - absent by default  0640 root:autotrader
 
-/etc/systemd/system/         the units
+/usr/lib/systemd/system/     the units, as deployed
+/etc/systemd/system/         operator overrides only - this is where a mask lives
 ```
 
 Logs are not in this list because there are no log files: everything goes to
@@ -392,8 +393,16 @@ useradd --system --home-dir /opt/autotrader --shell /usr/sbin/nologin autotrader
 apt-get install -y git python3 python3-venv nodejs npm
 install -d -o root -g root -m 0755 /opt/autotrader /etc/autotrader
 git clone <repository-url> /opt/autotrader/app
-chown -R autotrader:autotrader /opt/autotrader/app
+chown -R root:autotrader /opt/autotrader/app
 ```
+
+The checkout is owned by **root**, group `autotrader`, not by the service user.
+The runtimes only ever read their own code, and the deploy script runs as root:
+making the service user the owner would let a trading process rewrite the
+program it is executing, and would make every root `git` command in the deploy
+script trip over `detected dubious ownership`. The one exception is the
+frontend build directory, which Next.js writes at runtime — see
+[The services](#the-services).
 
 `/var/lib/autotrader` is not created here; systemd creates it on first start.
 
@@ -664,12 +673,24 @@ closed", and it is the posture this deployment supports first:
 systemctl mask autotrader-equity.service
 ```
 
-`mask` symlinks the unit to `/dev/null`. `systemctl start` on it fails, a
-dependency cannot pull it up, and a reboot cannot resume it. It is reversible
-with `systemctl unmask`, and it survives `autotrader-deploy`: that script
-installs unit *files* into `/etc/systemd/system` and the mask is a symlink at
-that same path, so a deploy that would rewrite the unit is refused rather than
-silently unmasking it.
+`mask` symlinks the unit to `/dev/null` in `/etc/systemd/system`.
+`systemctl start` on it fails, a dependency cannot pull it up, and a reboot
+cannot resume it. It is reversible with `systemctl unmask`.
+
+**This is why the units are deployed to `/usr/lib/systemd/system`.** systemd
+reads the admin directory first and the vendor directory last, so a mask in
+`/etc` outranks the unit in `/usr/lib` — and `systemctl mask` refuses to run at
+all when a regular file already occupies the path it wants to symlink. A
+deployment that installed its units into `/etc` would therefore make a trading
+runtime *unmaskable*; worse, deploying into a path where a mask already exists
+replaces the symlink with a regular file, silently re-arming a service an
+operator deliberately switched off. `install` does not preserve a symlink.
+
+So the two layers are kept apart: `autotrader-deploy` writes only the vendor
+directory, and it additionally refuses any unit whose target path is a mask
+symlink, reporting it as left alone. It also warns when a regular file in
+`/etc` shadows a unit it just installed, because that host would keep running
+the old unit while `git rev-parse` truthfully reported the new SHA.
 
 Verify the posture, rather than assuming it:
 

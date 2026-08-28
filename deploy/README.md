@@ -8,7 +8,7 @@ file is the index.
 
 ```
 deploy/
-  systemd/    unit templates -> /etc/systemd/system
+  systemd/    unit templates -> /usr/lib/systemd/system (masks live in /etc)
   env/        environment file templates -> /etc/autotrader
   bin/        operational scripts
   caddy/      optional reverse proxy, not installed by anything

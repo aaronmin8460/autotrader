@@ -1,6 +1,6 @@
 # Daily SQLite backup.
 #
-# Install to /etc/systemd/system/autotrader-backup.timer, then:
+# Install to /usr/lib/systemd/system/autotrader-backup.timer, then:
 #   systemctl enable --now autotrader-backup.timer
 #
 # Daily is deliberate rather than aspirational. The database is durable intent

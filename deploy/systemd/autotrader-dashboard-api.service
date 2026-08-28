@@ -1,6 +1,6 @@
 # AutoTrader dashboard API - read-only FastAPI backend, loopback only.
 #
-# Install to /etc/systemd/system/autotrader-dashboard-api.service.
+# Install to /usr/lib/systemd/system/autotrader-dashboard-api.service.
 #
 # Requires the `autotrader.dashboard` package and the `dashboard` extra
 # (fastapi, uvicorn), which arrive with Dashboard V0.1.

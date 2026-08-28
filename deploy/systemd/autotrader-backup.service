@@ -1,6 +1,6 @@
 # AutoTrader SQLite backup - consistent, timestamped, non-destructive.
 #
-# Install to /etc/systemd/system/autotrader-backup.service, alongside
+# Install to /usr/lib/systemd/system/autotrader-backup.service, alongside
 # autotrader-backup.timer. Started by the timer; `systemctl start
 # autotrader-backup` runs one on demand.
 #

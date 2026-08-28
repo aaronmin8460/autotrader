@@ -1,6 +1,6 @@
 # AutoTrader dashboard frontend - production Next.js server, loopback only.
 #
-# Install to /etc/systemd/system/autotrader-dashboard-web.service.
+# Install to /usr/lib/systemd/system/autotrader-dashboard-web.service.
 #
 # Serves the built Next.js application from /opt/autotrader/app/dashboard/
 # frontend/.next, which `autotrader-deploy` produces with `npm run build`. It

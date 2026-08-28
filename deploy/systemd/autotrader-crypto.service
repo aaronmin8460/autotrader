@@ -1,6 +1,6 @@
 # AutoTrader crypto runtime - Alpaca PAPER only, BTC/USD + ETH/USD, 24/7.
 #
-# Install to /etc/systemd/system/autotrader-crypto.service.
+# Install to /usr/lib/systemd/system/autotrader-crypto.service.
 #
 # This unit starts a process that CAN submit paper orders, but only when three
 # independent gates are all open (docs/SPEC.md section 8, C7/C9):

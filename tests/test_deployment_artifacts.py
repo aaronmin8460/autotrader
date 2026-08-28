@@ -755,3 +755,61 @@ def test_a_stopped_but_startable_runtime_is_still_reported(monkeypatch) -> None:
     report = healthcheck.Report()
     healthcheck.check_units(report, ("autotrader-crypto.service",), required=True)
     assert report.rows[0][0] == "WARN", report.render()
+
+
+# ---------------------------------------------------------------------------
+# Masking
+#
+# `systemctl mask` is the strong, reversible barrier an operator uses to say a
+# service must not run - the crypto-only posture masks the equity runtime with
+# it. It works by symlinking the unit to /dev/null in the ADMIN directory, and
+# it has two sharp edges that a deployment can walk straight into: it refuses
+# to run when a regular file already occupies that path, and `install` will
+# happily replace an existing mask symlink with a regular file. Either one
+# turns a deliberate safety decision into a running trading process.
+# ---------------------------------------------------------------------------
+
+ADMIN_SYSTEMD_DIR = "/etc/systemd/system"
+VENDOR_SYSTEMD_DIR = "/usr/lib/systemd/system"
+
+
+def test_units_are_deployed_to_the_vendor_directory_so_they_stay_maskable() -> None:
+    """Installing into /etc would make a trading runtime impossible to mask."""
+    text = script_code("autotrader-deploy")
+    assert f'SYSTEMD_DIR="${{AUTOTRADER_SYSTEMD_DIR:-{VENDOR_SYSTEMD_DIR}}}"' in text
+    assert f'SYSTEMD_DIR="${{AUTOTRADER_SYSTEMD_DIR:-{ADMIN_SYSTEMD_DIR}}}"' not in text
+
+
+def test_the_deploy_script_refuses_to_write_over_a_mask() -> None:
+    """`install` replaces a symlink with a regular file. That would re-arm the
+    service silently, which is the one outcome a mask exists to prevent."""
+    text = script_code("autotrader-deploy")
+    assert 'readlink "${installed}"' in text
+    assert '= "/dev/null"' in text
+    # The check has to come before the install, and skip it.
+    guard = text.index('readlink "${installed}"')
+    install_call = text.index('install -o root -g root -m 0644 "${unit_file}"')
+    assert guard < install_call, "the mask guard must precede the install"
+    assert "continue" in text[guard:install_call]
+
+
+@pytest.mark.parametrize("name", TRADING_UNITS)
+def test_a_trading_unit_documents_the_vendor_install_path(name: str) -> None:
+    text = (SYSTEMD_ROOT / name).read_text()
+    assert f"{VENDOR_SYSTEMD_DIR}/{name}" in text
+    assert f"{ADMIN_SYSTEMD_DIR}/{name}" not in text
+
+
+def test_the_runbook_explains_why_masking_needs_the_vendor_directory() -> None:
+    text = (REPOSITORY_ROOT / "docs" / "DEPLOYMENT.md").read_text()
+    assert "Crypto-only posture" in text
+    assert VENDOR_SYSTEMD_DIR in text
+    assert "unmaskable" in text
+
+
+def test_the_deploy_script_warns_when_an_admin_unit_shadows_a_deployed_one() -> None:
+    """A leftover file in /etc outranks what was just installed, so the host
+    runs old code while `git rev-parse` reports the new SHA."""
+    text = script_code("autotrader-deploy")
+    assert "ADMIN_SYSTEMD_DIR" in text
+    assert "shadows" in text
