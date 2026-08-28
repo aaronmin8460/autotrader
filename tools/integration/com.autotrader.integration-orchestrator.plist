@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.autotrader.integration-orchestrator</string>
+
+    <!-- The bootstrap lives on the internal disk so launchd always has a
+         program to start; it declines to do anything while the external
+         workspace is unmounted. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>__BOOTSTRAP__</string>
+    </array>
+
+    <!-- Poll every five minutes. Each run is a fetch and three blob reads
+         unless all three branches are ready, and a no-op once the integration
+         has been published. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Background priority: this must never compete with an interactive
+         session or with a running trading process for CPU or disk. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <!-- Only the bootstrap's own diagnostics land here; the orchestrator
+         writes its logs to the external workspace. -->
+    <key>StandardOutPath</key>
+    <string>__LAUNCHD_LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LAUNCHD_LOG__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>AUTOTRADER_QA</key>
+        <string>__QA_ROOT__</string>
+    </dict>
+</dict>
+</plist>
