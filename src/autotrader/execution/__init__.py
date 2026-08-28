@@ -1,4 +1,16 @@
-"""Alpaca **paper** crypto order execution. There is no live mode, and never will be here.
+"""Alpaca **paper** order execution. There is no live mode, and never will be here.
+
+Two boundaries live here, one per product, and they are the only files in the
+repository that submit an order:
+
+- `paper` is C7, the crypto boundary: fractional quantities, MARKET, GTC, no
+  market session. It is also the single place a trading client is *constructed*,
+  with ``paper=True`` hardcoded, so both products reach the broker through one
+  factory.
+- `equity` is the Equity V0.2 boundary: whole shares, MARKET, `DAY`, regular
+  US market hours, and the broker's session calendar. It constructs no client
+  of its own and re-uses C7's account read, position read, duplicate preflight,
+  one-attempt submission and snapshot persistence rather than copying them.
 
 C7 turns a risk-approved decision into one paper order, and stops there. The
 public surface is deliberately small and deliberately one-directional:
@@ -27,8 +39,10 @@ function here accepts one. Submission additionally requires the
 `AUTOTRADER_PAPER_TRADING_ENABLED` environment gate *and* an explicit CLI
 confirmation, both of which default to closed.
 
-**No market clock.** Crypto trades continuously, so nothing here reads an
-equity session's open/closed state or gates on one.
+**No market clock in the crypto path.** Crypto trades continuously, so `paper`
+reads no session state and gates on none. The equity boundary does the
+opposite, deliberately: it refuses to submit unless the broker's own clock says
+the regular session is open.
 
 **No reconciliation here.** C7 creates the durable anchors crash recovery
 needs - the persisted intent, its `client_order_id`, and the broker snapshot -

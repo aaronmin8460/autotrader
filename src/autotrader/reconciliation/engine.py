@@ -59,8 +59,18 @@ seconds ago, whose order has not yet reached the broker, would be confirmed
 absent. Nothing in this repository runs concurrently, and the bounded re-check
 below gives an in-flight request time to land.
 
-Scope: Alpaca paper, BTC/USD and ETH/USD. There is no multi-broker abstraction
-and no live path - see docs/SPEC.md section 8, "C8".
+**The universe a pass reconciles is a parameter; the account is not.** Order
+intents are always reconciled in full, because one Alpaca account has one
+`client_order_id` namespace and an ambiguous order is ambiguous no matter which
+product created it. *Positions* are reconciled per universe, because a pass
+started by the crypto runner has no local snapshot to repair for an equity it
+does not manage - and it says so, recording that holding as observed rather
+than silently ignoring it. `symbols` therefore defaults to the crypto pairs,
+which is exactly what every existing caller already got, and the equity runtime
+passes its own ten.
+
+Scope: Alpaca paper. There is no multi-broker abstraction and no live path -
+see docs/SPEC.md section 8, "C8".
 """
 
 from __future__ import annotations
@@ -791,6 +801,7 @@ def reconcile_paper_state(
     trading_client: TradingClient | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
+    symbols: tuple[str, ...] = SUPPORTED_SYMBOLS,
     confirmations: int = NOT_FOUND_CONFIRMATIONS,
     recheck_delay_seconds: float = NOT_FOUND_RECHECK_DELAY_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
@@ -823,6 +834,13 @@ def reconcile_paper_state(
     repair, no run row, no event, no system event. It is the audit mode: run it
     to see what a real pass would change.
 
+    `symbols` is the position universe this pass owns. It defaults to the
+    crypto pairs, so an existing caller's behaviour is unchanged. Step 4 -
+    order intents - is deliberately **not** filtered by it: a `client_order_id`
+    whose outcome is unknown blocks trading for the whole account, which is the
+    only correct answer when the account is shared. A position held outside
+    `symbols` is recorded as observed and never traded out of.
+
     `confirmations`, `recheck_delay_seconds`, and `sleep` control the bounded
     re-read that a not-found answer has to survive. They are parameters so a
     test can run the same logic without waiting; the defaults are what an
@@ -839,6 +857,13 @@ def reconcile_paper_state(
     if recheck_delay_seconds < 0:
         raise ReconciliationInputError(
             f"recheck_delay_seconds must not be negative, got {recheck_delay_seconds}."
+        )
+    universe = tuple(symbols)
+    if not universe:
+        raise ReconciliationInputError(
+            "symbols must name at least one instrument. A pass that reconciles no "
+            "position could only ever report that nothing was checked, which is not "
+            "the same answer as everything matching."
         )
 
     issues: list[ReconciliationIssue] = []
@@ -939,7 +964,7 @@ def reconcile_paper_state(
             ),
         )
 
-    for symbol in SUPPORTED_SYMBOLS:
+    for symbol in universe:
         try:
             local_position = state.get_position(connection, symbol)
         except state.StateError as error:
@@ -964,7 +989,7 @@ def reconcile_paper_state(
             ),
         )
 
-    active_keys = {broker_symbol_key(symbol) for symbol in SUPPORTED_SYMBOLS}
+    active_keys = {broker_symbol_key(symbol) for symbol in universe}
     for key, position in sorted(broker_positions.items()):
         if key in active_keys:
             continue
@@ -989,7 +1014,7 @@ def reconcile_paper_state(
         completed_at=_moment(now, started_at),
         issues=issues,
         orders_checked=orders_checked,
-        positions_checked=len(SUPPORTED_SYMBOLS),
+        positions_checked=len(universe),
         dry_run=dry_run,
     )
 

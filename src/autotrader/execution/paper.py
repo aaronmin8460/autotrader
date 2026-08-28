@@ -96,6 +96,7 @@ from __future__ import annotations
 import math
 import os
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation, localcontext
@@ -127,6 +128,7 @@ from autotrader.execution.models import (
     format_quantity,
     normalize_side,
     normalize_symbol,
+    normalize_tradable_symbol,
     require_quantity,
     require_reference_price,
 )
@@ -1130,8 +1132,16 @@ def build_risk_context(
     the submission gate, and a second env-driven switch would make it ambiguous
     which one stopped a trade. Turning it off blocks new entries while still
     permitting a risk-reducing exit.
+
+    The symbol is checked against the whole tradable universe rather than the
+    crypto pairs alone, because this mapping is the same arithmetic for either
+    product: one account, one equity figure, one cash figure, and one total
+    exposure summed over every position the account actually holds. Narrowing
+    to a product happens at the execution boundary that owns it, not here - and
+    an equity book that this function refused to look at would be an equity
+    book the total-exposure cap silently ignored.
     """
-    ticker = normalize_symbol(symbol)
+    ticker = normalize_tradable_symbol(symbol)
     total_exposure = sum(
         position.market_value for position in positions.values() if position.market_value > 0
     )
@@ -1373,6 +1383,7 @@ def submit_order_intent(
     order_intent_id: int,
     *,
     now: datetime,
+    build_request: Callable[[OrderIntent], MarketOrderRequest] | None = None,
 ) -> SubmissionResult:
     """Submit one already-persisted intent, exactly once.
 
@@ -1406,6 +1417,13 @@ def submit_order_intent(
 
     The `client_order_id` is never regenerated, so every ambiguous case stays
     resolvable by asking the broker about that exact key.
+
+    `build_request` translates the intent into the broker payload and defaults
+    to this module's crypto form - MARKET, GTC, no extended-hours flag. It is a
+    parameter so that the equity boundary can supply its own translation
+    (MARKET, DAY, regular hours) without a second copy of the ordering,
+    duplicate-preflight, one-attempt and never-retry logic below, which is
+    where every safety property of a submission actually lives.
     """
     if connection.in_transaction:
         raise NonDurableIntentError(
@@ -1416,6 +1434,7 @@ def submit_order_intent(
             "Nothing was submitted."
         )
 
+    translate = build_request if build_request is not None else build_market_order_request
     existing = find_broker_order_by_client_id(client, intent.client_order_id)
     if existing is not None:
         _persist_broker_snapshot(
@@ -1443,7 +1462,7 @@ def submit_order_intent(
         updated_at=now,
     )
 
-    request = build_market_order_request(intent)
+    request = translate(intent)
     try:
         order = client.submit_order(request)
     except APIError as error:

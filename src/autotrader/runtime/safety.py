@@ -190,6 +190,7 @@ def startup_safety_from_reconciliation_result(
 def startup_safety_from_reconciliation(
     connection: sqlite3.Connection,
     *,
+    symbols: tuple[str, ...] | None = None,
     now: datetime | None = None,
 ) -> StartupSafetyCheck:
     """Build the startup check that runs the real C8 pass against Alpaca paper.
@@ -197,6 +198,13 @@ def startup_safety_from_reconciliation(
     Returns the zero-argument callable the runtime asks once at start. Calling
     it runs `reconcile_paper_state` against the paper broker and reports what
     that pass concluded.
+
+    **`symbols` is the position universe the caller manages.** Omitted, the
+    pass reconciles what it always did, so the existing runner is unchanged. A
+    runner that manages a different set passes it, and gets an answer about the
+    positions it is actually responsible for. Order intents are reconciled in
+    full either way - one account, one `client_order_id` namespace, and an
+    ambiguous order anywhere in it blocks trading everywhere.
 
     **Not `dry_run`.** Startup is exactly when a repairable difference should
     be repaired: a runtime that observed a stale local snapshot, declined to
@@ -216,9 +224,14 @@ def startup_safety_from_reconciliation(
     allowed.
     """
 
+    # An absent universe is passed as an absent *argument*, not as a default
+    # restated here: the one place that decides what an unscoped pass covers
+    # stays `reconcile_paper_state`'s own signature.
+    scope: dict[str, tuple[str, ...]] = {} if symbols is None else {"symbols": symbols}
+
     def check() -> StartupSafetyResult:
         try:
-            result = reconcile_paper_state(connection, now=now)
+            result = reconcile_paper_state(connection, now=now, **scope)
         except ReconciliationError as error:
             return StartupSafetyResult(
                 safe_to_trade=False,

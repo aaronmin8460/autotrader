@@ -41,6 +41,36 @@ from enum import Enum
 #: equal, so the duplication cannot silently drift.
 SUPPORTED_SYMBOLS: tuple[str, ...] = ("BTC/USD", "ETH/USD")
 
+#: The frozen Equity V0.2 universe (docs/SPEC.md section 3.1E).
+#:
+#: Duplicated from `autotrader.equity` for exactly the same reason, and covered
+#: by exactly the same kind of drift test. It is listed separately from the
+#: pairs rather than merged into them, because the two are traded by different
+#: boundaries under different rules - fractional GTC crypto against a 24/7
+#: market, whole-share DAY equities against a session - and a single blended
+#: tuple would let either boundary accept a symbol it cannot correctly size.
+EQUITY_SYMBOLS: tuple[str, ...] = (
+    "SPY",
+    "QQQ",
+    "IWM",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA",
+)
+
+#: Every symbol this system may hold an order intent for, across both products.
+#:
+#: One Alpaca account holds both books, so `order_intents` is one table and
+#: reconciliation resolves a `client_order_id` without caring which product
+#: created it. This tuple is what an `OrderIntent` is checked against; it is
+#: deliberately *not* what either execution boundary accepts, and each of those
+#: still narrows to its own universe at its own door.
+TRADABLE_SYMBOLS: tuple[str, ...] = SUPPORTED_SYMBOLS + EQUITY_SYMBOLS
+
 #: Every `client_order_id` this system generates starts with this. It makes an
 #: order recognisably ours in the broker's UI and in Phase 8 reconciliation.
 CLIENT_ORDER_ID_PREFIX = "autotrader-"
@@ -118,6 +148,26 @@ def normalize_symbol(symbol: str) -> str:
         raise ExecutionInputError(
             f"Unsupported symbol: {symbol!r}. Supported symbols are: "
             f"{', '.join(SUPPORTED_SYMBOLS)}."
+        )
+    return normalized
+
+
+def normalize_tradable_symbol(symbol: str) -> str:
+    """Uppercase `symbol` and confirm this system may record an intent for it.
+
+    The union of both products, because an `OrderIntent` is a row in the one
+    audit trail a single Alpaca account has. Narrowing to one product happens
+    at the execution boundary that owns that product - `normalize_symbol` here
+    for crypto, `autotrader.equity.normalize_symbol` for equities - so a crypto
+    submission still cannot be asked for `SPY`, and an equity submission still
+    cannot be asked for `BTC/USD`.
+    """
+    if not isinstance(symbol, str):
+        raise ExecutionInputError(f"symbol must be a string, got {type(symbol).__name__}.")
+    normalized = symbol.strip().upper()
+    if normalized not in TRADABLE_SYMBOLS:
+        raise ExecutionInputError(
+            f"Unsupported symbol: {symbol!r}. Supported symbols are: {', '.join(TRADABLE_SYMBOLS)}."
         )
     return normalized
 
@@ -241,7 +291,7 @@ class OrderIntent:
 
     def __post_init__(self) -> None:
         """Validate on construction, so a malformed intent cannot exist."""
-        object.__setattr__(self, "symbol", normalize_symbol(self.symbol))
+        object.__setattr__(self, "symbol", normalize_tradable_symbol(self.symbol))
         object.__setattr__(self, "side", normalize_side(self.side))
         object.__setattr__(
             self,
@@ -273,8 +323,10 @@ class OrderIntent:
 
 __all__ = [
     "CLIENT_ORDER_ID_PREFIX",
+    "EQUITY_SYMBOLS",
     "MAX_CLIENT_ORDER_ID_LENGTH",
     "SUPPORTED_SYMBOLS",
+    "TRADABLE_SYMBOLS",
     "ExecutionError",
     "ExecutionInputError",
     "OrderIntent",
@@ -283,6 +335,7 @@ __all__ = [
     "new_client_order_id",
     "normalize_side",
     "normalize_symbol",
+    "normalize_tradable_symbol",
     "parse_quantity",
     "require_quantity",
     "require_reference_price",

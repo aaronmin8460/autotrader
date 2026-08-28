@@ -51,7 +51,12 @@ from enum import Enum
 
 import pandas as pd
 
-from autotrader.data.validation import ValidationResult, validate_frame
+from autotrader.data.validation import (
+    CRYPTO_UNIVERSE_LABEL,
+    SUPPORTED_SYMBOLS,
+    ValidationResult,
+    validate_frame,
+)
 from autotrader.strategies.ema_cross import (
     FAST_PERIOD,
     SLOW_PERIOD,
@@ -236,13 +241,22 @@ def _require_usable_initial_cash(initial_cash: object) -> Decimal:
     return value
 
 
-def _require_valid_bars(bars: pd.DataFrame) -> ValidationResult:
+def _require_valid_bars(
+    bars: pd.DataFrame,
+    *,
+    supported_symbols: tuple[str, ...],
+    universe_label: str,
+) -> ValidationResult:
     """Run the C2 validator and abort on any finding.
 
     Validation rules are not duplicated here, and a failing dataset is never
-    repaired - no re-sorting, no column patching, no dropped rows.
+    repaired - no re-sorting, no column patching, no dropped rows. The symbol
+    universe is passed through rather than assumed, so the same simulation runs
+    over a stored equity dataset without a second backtester existing.
     """
-    result = validate_frame(bars)
+    result = validate_frame(
+        bars, supported_symbols=supported_symbols, universe_label=universe_label
+    )
     if result.valid:
         return result
     findings = "\n".join(f"- {issue}" for issue in result.errors)
@@ -321,7 +335,11 @@ def _max_drawdown(equity_curve: Sequence[Decimal]) -> float:
 
 
 def run_backtest(
-    bars: pd.DataFrame, initial_cash: Decimal | float | int | str = DEFAULT_INITIAL_CASH
+    bars: pd.DataFrame,
+    initial_cash: Decimal | float | int | str = DEFAULT_INITIAL_CASH,
+    *,
+    supported_symbols: tuple[str, ...] = SUPPORTED_SYMBOLS,
+    universe_label: str = CRYPTO_UNIVERSE_LABEL,
 ) -> BacktestResult:
     """Simulate the EMA crossover strategy over `bars`.
 
@@ -339,11 +357,20 @@ def run_backtest(
     The supplied frame is never modified. The same frame always produces the
     same result.
 
+    `supported_symbols` is the universe the dataset's symbol is checked
+    against, and defaults to the crypto pairs so every existing caller is
+    unchanged. It is the *only* asset-class-aware thing in this engine: the
+    fills, the fees, the fractional quantities and the equity curve are all the
+    same arithmetic whichever market produced the bars, so an equity dataset is
+    simulated by the same code rather than by a copy of it.
+
     Raises `BacktestInputError` when `initial_cash` is not positive and finite
     or when the dataset fails validation.
     """
     starting_cash = _require_usable_initial_cash(initial_cash)
-    validation = _require_valid_bars(bars)
+    validation = _require_valid_bars(
+        bars, supported_symbols=supported_symbols, universe_label=universe_label
+    )
     # Validation passed, so the dataset resolves to exactly one symbol.
     symbol = str(validation.symbol)
 

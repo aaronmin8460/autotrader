@@ -1,12 +1,23 @@
 # autotrader
 
-A personal, single-user automated trading system for **crypto spot**, built to
-run as a local Python CLI process against an Alpaca **paper** account.
+A personal, single-user automated trading system built to run as a local Python
+CLI process against an Alpaca **paper** account. It operates two products on
+that one account: **crypto spot**, 24/7, and **US equities**, regular market
+hours only.
 
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Crypto V0.2 with Phase 8 and Phase 9 integrated. Next: the integrated paper smoke gate
+## Status: Crypto V0.2 integrated; Equity V0.2 component-complete and not activated
+
+**Crypto V0.2** trades BTC/USD and ETH/USD on 15-minute bars, 24/7, with Phase
+8 and Phase 9 integrated. Its next gate is the integrated paper smoke.
+
+**Equity V0.2** is component-complete: ten symbols, 15-minute bars, regular US
+market hours only, whole shares, Alpaca paper. It has been exercised read-only
+against the real paper account and has submitted **no** stock order. Combined
+crypto+equity activation is a separate phase and is **not** enabled - see
+[Equity V0.2](#equity-v02) below.
 
 **Current active version: Crypto V0.2.** The system trades BTC/USD and ETH/USD
 only, on 15-minute bars, 24 hours a day and 7 days a week.
@@ -96,10 +107,11 @@ on a runtime `PAPER` confirmation - all three, on every start. See
 | Safety preference | At-most-once: miss a trade rather than duplicate one |
 | Interface | Python CLI, local process - no web frontend |
 
-Out of scope: live trading, US equities, options, futures, forex, perpetual
-futures, non-USD quote currencies, shorting, leverage, margin, multiple
-brokers, ML/LLM signal generation, web or mobile frontends, and cloud
-deployment.
+Out of scope: live trading, options, futures, forex, perpetual futures, non-USD
+quote currencies, equities outside the ten named below, shorting, leverage,
+margin, multiple brokers, ML/LLM signal generation, web or mobile frontends,
+cloud deployment - and simultaneous autonomous crypto+equity execution, which
+is a Combined Integration decision this milestone deliberately does not make.
 
 **[docs/SPEC.md](docs/SPEC.md) is the authoritative scope document.** Read it
 before extending this project; it takes precedence over any chat history.
@@ -113,10 +125,19 @@ DAY market orders - is tagged:
 git show equity-v0.1-phase7
 ```
 
-Nothing in the active tree depends on it. There is no equity symbol, no
-`StockHistoricalDataClient`, no IEX feed, no whole-share rule, no
-`TimeInForce.DAY`, and no market clock in production code; a test suite asserts
-each of those absences against the executable source rather than the prose.
+It is a **read-only reference**. Equity V0.2 was not reset to it, not developed
+from it, and not cherry-picked out of it: current main is authoritative, and
+the new product is built on the current Decimal quantities, schema, risk
+engine, execution ordering and reconciliation. What was reused is semantics
+that were already right - whole shares, `TimeInForce.DAY`, regular hours, the
+IEX feed, and reading the broker's clock rather than assuming a session.
+
+The absence rules now scope to the **crypto** product and are still enforced:
+no crypto runtime module names an equity symbol,
+`StockHistoricalDataClient`, `StockLatestTradeRequest`, `StockBarsRequest`,
+`TimeInForce.DAY`, `get_clock`, or `America/New_York`, and the test suite
+asserts each absence against executable source with docstrings and comments
+stripped.
 
 ## Setup
 
@@ -1084,6 +1105,184 @@ non-zero before it fetches a bar. `SIGINT` and `SIGTERM` stop the process
 cleanly: no new cycle, no new submission, the strategy run closed, the lock
 released.
 
+## Equity V0.2
+
+A second product on the same Alpaca paper account, developed on the same
+architecture and gated the same way. It is not a mode of the crypto system, and
+the crypto system is not a mode of it.
+
+| | |
+| --- | --- |
+| Asset class | US equities (cash) |
+| Universe | SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA |
+| Timeframe | 15-minute bars |
+| Market data | Alpaca stock, **IEX** feed |
+| Session | **US regular market hours only** |
+| Direction | Long only, no shorting, no leverage |
+| Quantities | **Whole shares**, floored, never rounded up |
+| Order type | MARKET, `TimeInForce.DAY`, no extended hours |
+| Strategy | The same EMA 20 / EMA 50 crossover, same parameters |
+| Execution | Alpaca paper only - live is unreachable |
+| Status | Component-complete; **no stock paper order has been submitted** |
+
+### The ten symbols, and only the ten
+
+The universe is exactly ten, and the tuple order is the processing order: SPY,
+QQQ, IWM, AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA. One symbol is finished -
+risk sized against the account as it stands, order submitted or refused -
+before the next is looked at, so ten signals landing on the same bar can never
+size themselves against the same stale cash and exposure figures. Adding an
+eleventh is a scope change requiring an edit to `docs/SPEC.md`; it is not a
+configuration value.
+
+### The market session is read, never assumed
+
+`Mon-Fri 09:30-16:00` is wrong on roughly a dozen days a year, so it appears
+nowhere in the code. Session times come from Alpaca's own calendar endpoint:
+holidays are simply absent from it, and a half day reports its real 13:00
+close.
+
+Alpaca returns those times as **naive Eastern wall-clock** strings.
+`America/New_York` is attached in exactly one function, which converts to UTC
+immediately; everything after that point - every comparison, bar start, wake
+time and checkpoint - is UTC.
+
+A **regular-session bar** is a 15-minute boundary whose whole interval lies
+inside the session. An ordinary day has twenty-six (09:30 through 15:45); a
+13:00 early close has fourteen (09:30 through 12:45). The IEX feed serves
+pre-market and post-market candles in the same response, and they are filtered
+out before the strategy sees anything.
+
+**A cycle outside the session does nothing at all** - no fetch, no strategy, no
+checkpoint, no order, no provider call. One consequence is worth stating
+plainly: the bar that closes *at* the bell is never acted on, because its cycle
+would fall outside the session. On an ordinary day the actionable bars are
+09:30 through 15:30, acted on at 09:45 through 15:45.
+
+### Whole shares, rounded down
+
+Alpaca reports these symbols as fractionable and Equity V0.2 does not use it. A
+whole-share order needs no notional handling, no fractional-order restriction,
+and no per-symbol increment metadata - Alpaca reports `min_order_size` and
+`min_trade_increment` as `null` for equities anyway.
+
+The risk engine's approved quantity is floored to an integer number of shares
+at the execution boundary, so the broker is never asked for more than risk
+approved, and a quantity that floors below one share is refused rather than
+rounded up to one. The limitation that follows is stated rather than hidden: a
+whole-share exit cannot fully close a *fractional* position. Nothing in this
+branch can create one, and reconciliation reports the remainder rather than
+trading it away.
+
+### Four gates, all closed by default
+
+Unattended equity paper execution requires **all** of:
+
+1. `AUTOTRADER_PAPER_TRADING_ENABLED=true` in the environment
+2. `--confirm-paper-runtime PAPER` on the command line
+3. startup reconciliation reporting that trading is safe
+4. the regular market session being open at the moment of submission
+
+None substitutes for another, and the fourth is checked twice: the runtime
+refuses to run a cycle outside the session, and the execution boundary refuses
+again against the **broker's own clock** immediately before submitting. The
+second check catches a cycle that started inside the session and ran past the
+close.
+
+There is no live mode. `--observe-only` goes further than the gates and
+constructs no execution path at all.
+
+### Usage
+
+Download historical equity bars:
+
+```bash
+python -m autotrader.cli equity-download --symbol SPY --timeframe 15m --start 2026-01-02 --end 2026-08-27
+```
+
+`--start` and `--end` are **US market calendar dates**, not UTC dates, and
+`--end` is inclusive. Stored timestamps are UTC; the metadata sidecar records
+both facts so a dataset can be reproduced without guessing which was meant.
+Stock market data requires credentials - unlike crypto, Alpaca does not serve
+it unauthenticated.
+
+Validate and backtest a stored equity dataset with the same commands the crypto
+path uses; `--equity` switches the symbol universe and nothing else:
+
+```bash
+python -m autotrader.cli validate --equity data/raw/SPY_15m_2026-01-02_2026-08-27.parquet
+python -m autotrader.cli backtest --equity data/raw/SPY_15m_2026-01-02_2026-08-27.parquet
+```
+
+One caveat worth stating: the backtester is the existing engineering-validation
+simulator and is **not** the live execution model. It fills at the next bar's
+open with *fractional* quantities and a flat conservative taker fee, which is
+neither the whole-share policy nor the fee structure a real equity order would
+meet. It was never connected to the risk engine either. It is a
+data-to-signal-to-fill pipeline check, and its numbers are not a profitability
+claim for either product.
+
+Run one observation-only cycle - this can never submit anything:
+
+```bash
+python -m autotrader.cli equity-run --once --observe-only
+```
+
+And, once startup safety is genuinely satisfied, the gated runtime:
+
+```bash
+python -m autotrader.cli equity-run --confirm-paper-runtime PAPER
+```
+
+### One request per cycle
+
+The whole universe is fetched in a **single batched market-data call** per
+cycle - Alpaca's stock bars endpoint takes a list - so ten symbols cost one
+request rather than ten. Batching bars is not batching orders: symbols are
+still processed strictly in order and there is never more than one broker
+submission in flight. The lookback window is anchored on real sessions read
+from the cached calendar rather than on calendar days, so a holiday week does
+not silently shorten the strategy's history.
+
+Provider call counts are exposed on the market-data source, the calendar and
+the execution gateway, and summed into the heartbeat, so the later shared
+crypto+equity API budget has real numbers to start from. No rate limiter is
+introduced here.
+
+### Two services, one account
+
+Later deployment will conceptually run `autotrader-crypto.service` and
+`autotrader-equity.service` as separate processes against the same account. The
+lock naming already supports that: the equity runner holds
+`<database>.equity.runtime.lock` and the crypto runner holds
+`<database>.runtime.lock`, so the two never block each other - while two
+runners of the *same* product still collide, which is the property that
+actually prevents duplicate trading. Nothing about account-level order safety
+is weakened by that: the duplicate preflight, the durable per-symbol
+checkpoint, and the `client_order_id` are all unchanged.
+
+The per-symbol checkpoint lives in the same `runtime_checkpoints` table the
+crypto runner uses. `SPY` is not `BTC/USD`, so the two products share a table
+without sharing a row, and a restarted equity runner skips exactly the bars its
+predecessor claimed.
+
+### Reconciliation across two books
+
+`reconcile_paper_state` gained one parameter: the **position universe**,
+defaulting to the crypto pairs so every existing caller is unchanged. Order
+intents are deliberately *not* filtered by it - one account has one
+`client_order_id` namespace, so an ambiguous equity order blocks the crypto
+runner and an ambiguous crypto order blocks the equity runner. A position held
+outside a pass's universe is recorded as observed and never traded out of.
+
+### What Equity V0.2 deliberately does not do
+
+Combined crypto+equity activation, shared account-level risk arithmetic,
+combined exposure limits, per-book allocations (a "crypto 20% / stocks 20%"
+split is a Combined Integration decision and is **not** frozen here), a shared
+API budget, a distributed rate limiter, a dashboard, deployment artefacts, and
+any real equity paper submission.
+
 ## Development
 
 ```bash
@@ -1104,23 +1303,33 @@ stripped, so prose describing a forbidden construct cannot mask its presence.
 
 ```
 src/autotrader/data/        Alpaca crypto bars -> canonical Parquet, and
-                            stored-dataset validation
+                            stored-dataset validation (shared by both products)
 src/autotrader/cli/         Typer CLI (version, download, validate, backtest,
-                            paper-submit, reconcile, crypto-run)
-src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals
+                            paper-submit, reconcile, crypto-run,
+                            equity-download, equity-run)
+src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals - one strategy,
+                            both products, no per-symbol parameters
 src/autotrader/backtest/    deterministic next-bar-open backtester, fractional
                             quantities, modelled taker fee
 src/autotrader/risk/        deterministic risk decisions and sizing
 src/autotrader/state/       local SQLite operational state, schema v5
-src/autotrader/execution/   Alpaca PAPER crypto execution - the only place a
-                            trading client exists or an order is sent
+src/autotrader/execution/   Alpaca PAPER execution - the only place a trading
+                            client exists or an order is sent. `paper.py` is
+                            crypto (fractional, GTC); `equity.py` is equities
+                            (whole shares, DAY, regular hours) and holds the
+                            broker session calendar
 src/autotrader/reconciliation/
                             crash recovery: broker truth -> local state, and
-                            the safe_to_trade startup answer
-src/autotrader/runtime/     the 24/7 loop: UTC boundary scheduling, bounded
-                            bar fetching, startup reconciliation, durable
-                            per-symbol bar checkpoints, heartbeat, process
-                            lock
+                            the safe_to_trade startup answer, scoped by
+                            position universe
+src/autotrader/runtime/     shared runtime machinery - durable per-symbol bar
+                            checkpoints, the process lock, startup safety, the
+                            heartbeat - plus the 24/7 crypto loop and its UTC
+                            boundary scheduling
+src/autotrader/equity/      the equity product: the ten-symbol universe, the
+                            market-session arithmetic, the IEX bar boundary,
+                            the batched runtime window, and the
+                            regular-session runtime loop
 tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)
 data/processed/             validated market data (git-ignored)
@@ -1130,10 +1339,10 @@ docs/SPEC.md                authoritative scope specification
 
 ## What comes next
 
-**The integrated crypto paper smoke gate.** The integration is code-complete,
-green offline, and has been exercised read-only against the real paper account.
-What has not happened is an integrated paper BUY observed end to end. That is
-next.
+**The integrated crypto paper smoke gate.** The crypto integration is
+code-complete, green offline, and has been exercised read-only against the real
+paper account. What has not happened is an integrated paper BUY observed end to
+end. That is next.
 
 **Failure injection** is done. `tests/test_failure_injection.py` breaks the
 system at each point in the claim/intent/submit chain - process death, lost
@@ -1144,5 +1353,12 @@ against a real broker means placing real orders at moments chosen to be
 unrecoverable. Every protection it covers was mutation-checked by removing the
 protection and confirming the tests fail.
 
-**Phase 10 - Deployment** comes after the smoke gate. Supervising a process
-whose first integrated paper order has not been observed would be premature.
+**Combined Integration** connects the two products on the one account: shared
+account-level safety and combined exposure, account execution serialization, a
+shared API budget, the full-universe reconciliation scope, and dashboard V0.2.
+Equity V0.2 provides the seams and does not turn any of it on. Its own first
+real paper order has not been submitted either, and that gate belongs to that
+phase.
+
+**Phase 10 - Deployment** comes after those. Supervising a process whose first
+integrated paper order has not been observed would be premature.
