@@ -6,9 +6,11 @@ backtest of the EMA crossover strategy over a stored dataset, a single,
 deliberately awkward **paper** order submission, and a crash-recovery
 reconciliation of local state against the paper broker.
 
-Everything here is crypto spot: BTC/USD and ETH/USD, 15-minute bars, UTC
-dates, 24/7. There is no asset-class selector and no equity command; the
-completed equity milestone is archived at the Git tag `equity-v0.1-phase7`.
+Two products share this CLI and one Alpaca paper account. The crypto commands
+are BTC/USD and ETH/USD, 15-minute bars, UTC dates, 24/7. The `equity-`
+commands are the ten Equity V0.2 symbols, 15-minute bars, US market calendar
+dates, and **regular market hours only**. Neither activates the other: there is
+no combined runtime here, and each runtime processes its own universe.
 
 `paper-submit` and `crypto-run` are the only commands that can **submit** an
 order, and they can only ever reach Alpaca paper. Both require an environment
@@ -25,6 +27,12 @@ boundaries, every day of the week, and additionally refuses to submit until
 startup reconciliation reports that trading is safe - which is now the real
 Phase 8 pass (`reconcile_paper_state`) rather than a placeholder, so a
 `crypto-run` start reconciles against the paper broker on its own.
+
+`equity-run` is its regular-session counterpart. It is gated identically -
+`AUTOTRADER_PAPER_TRADING_ENABLED`, `--confirm-paper-runtime PAPER`, and a safe
+startup reconciliation - and adds one gate of its own: the US regular market
+session has to be open, read from the broker's calendar and confirmed against
+the broker's clock. A cycle outside the session does nothing at all.
 """
 
 import logging
@@ -53,12 +61,27 @@ from autotrader.data.historical import (
     download_bars,
 )
 from autotrader.data.validation import (
+    CRYPTO_UNIVERSE_LABEL,
+    EQUITY_UNIVERSE_LABEL,
     ValidationInputError,
     ValidationResult,
     read_bars,
     validate_parquet_file,
 )
+from autotrader.equity import EQUITY_SYMBOLS, EQUITY_TIMEFRAME, EquityError
+from autotrader.equity.data import FEED as EQUITY_FEED
+from autotrader.equity.data import download_bars as download_equity_bars
+from autotrader.equity.market_data import AlpacaEquityBars
+from autotrader.equity.runtime import (
+    EQUITY_LOCK_SCOPE,
+    EquityRuntime,
+    EquityRuntimeConfig,
+    PaperEquityExecutionGateway,
+)
+from autotrader.equity.runtime import PROCESSING_ORDER as EQUITY_PROCESSING_ORDER
+from autotrader.equity.session import SessionError, is_market_open
 from autotrader.execution import paper as paper_execution
+from autotrader.execution.equity import AlpacaMarketCalendar
 from autotrader.execution.models import ExecutionError, format_quantity, parse_quantity
 from autotrader.execution.paper import (
     AmbiguousSubmissionError,
@@ -140,6 +163,14 @@ RECONCILE_UNRESOLVED_EXIT_CODE = 2
 #:    exist at the broker and must be reconciled before anything else is sent.
 CRYPTO_RUN_REFUSED_EXIT_CODE = 1
 CRYPTO_RUN_PAUSED_EXIT_CODE = 2
+
+#: `equity-run` exit codes, deliberately the same shape and the same meanings
+#: as `crypto-run`'s. A closed market is **not** one of them: an equity runtime
+#: that woke while the session was shut, observed nothing and stopped cleanly
+#: did exactly its job, and exiting non-zero for that would make every weekend
+#: look like a failure to whatever supervises it.
+EQUITY_RUN_REFUSED_EXIT_CODE = 1
+EQUITY_RUN_PAUSED_EXIT_CODE = 2
 
 #: Width of the label column in the backtest report.
 _LABEL_WIDTH = 23
@@ -231,6 +262,17 @@ def download(
     typer.echo(f"Metadata:  {result.metadata_path}")
 
 
+def _validation_universe(equity: bool) -> tuple[tuple[str, ...], str]:
+    """The symbol universe and its label for a `--equity` flag.
+
+    One place, so `validate` and `backtest` cannot disagree about what the flag
+    means.
+    """
+    if equity:
+        return EQUITY_SYMBOLS, EQUITY_UNIVERSE_LABEL
+    return SUPPORTED_SYMBOLS, CRYPTO_UNIVERSE_LABEL
+
+
 def _echo_report(path: Path, result: ValidationResult) -> None:
     """Print the shared VALID/INVALID report body."""
     typer.echo("")
@@ -247,15 +289,29 @@ def validate(
         Path,
         typer.Argument(help="Path to a Parquet bar dataset written by `download`."),
     ],
+    equity: bool = typer.Option(
+        False,
+        "--equity",
+        help=(
+            "Check the symbol against the ten Equity V0.2 symbols instead of the "
+            "crypto pairs. Every other check is identical."
+        ),
+    ),
 ) -> None:
     """Validate a stored Parquet bar dataset against the canonical schema.
 
     Reads the file only. Nothing is downloaded, modified, or repaired. Exits 0
     when the dataset is valid, 1 when it has validation errors, and 2 when the
     file cannot be read at all.
+
+    Only the symbol universe differs between the two asset classes, so
+    `--equity` switches that one check rather than selecting a second
+    validator: the schema, the timestamps, the OHLC relationships and the
+    numeric columns are the same contract either way.
     """
+    universe, label = _validation_universe(equity)
     try:
-        result = validate_parquet_file(path)
+        result = validate_parquet_file(path, supported_symbols=universe, universe_label=label)
     except ValidationInputError as error:
         typer.secho(str(error), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=UNREADABLE_INPUT_EXIT_CODE) from None
@@ -335,6 +391,11 @@ def backtest(
         float,
         typer.Option("--initial-cash", help="Starting simulated cash, in USD."),
     ] = DEFAULT_INITIAL_CASH,
+    equity: bool = typer.Option(
+        False,
+        "--equity",
+        help="Accept a stored Equity V0.2 dataset instead of a crypto one.",
+    ),
 ) -> None:
     """Backtest the EMA 20 / EMA 50 crossover over a stored Parquet dataset.
 
@@ -353,8 +414,14 @@ def backtest(
         typer.secho(str(error), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=UNREADABLE_INPUT_EXIT_CODE) from None
 
+    universe, label = _validation_universe(equity)
     try:
-        result = run_backtest(bars, initial_cash=initial_cash)
+        result = run_backtest(
+            bars,
+            initial_cash=initial_cash,
+            supported_symbols=universe,
+            universe_label=label,
+        )
     except BacktestInputError as error:
         typer.secho(str(error), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=BACKTEST_INPUT_EXIT_CODE) from None
@@ -898,6 +965,312 @@ def crypto_run(
         typer.echo("")
         typer.secho("RUNTIME STOPPED ON A FATAL ERROR", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=CRYPTO_RUN_REFUSED_EXIT_CODE)
+
+
+@app.command(name="equity-download")
+def equity_download(
+    symbol: str = typer.Option(
+        ...,
+        "--symbol",
+        help=f"Equity to download. One of: {', '.join(EQUITY_SYMBOLS)}.",
+    ),
+    start: str = typer.Option(
+        ...,
+        "--start",
+        help="First US market calendar date to include, YYYY-MM-DD.",
+    ),
+    end: str = typer.Option(
+        ...,
+        "--end",
+        help="Last US market calendar date to include, YYYY-MM-DD. Inclusive.",
+    ),
+    timeframe: str = typer.Option(
+        EQUITY_TIMEFRAME,
+        "--timeframe",
+        help=f"Bar timeframe. Only {EQUITY_TIMEFRAME!r} is supported.",
+    ),
+) -> None:
+    """Download historical equity bars from Alpaca and store them as Parquet.
+
+    Stock market data requires credentials - unlike crypto, Alpaca does not
+    serve it unauthenticated - so ALPACA_API_KEY and ALPACA_SECRET_KEY must
+    both be set. The feed is IEX, which is what an Alpaca Basic account is
+    entitled to.
+
+    `--start` and `--end` are **US market calendar dates**, not UTC dates. The
+    stored timestamps are UTC either way; the sidecar records both facts so a
+    dataset can be reproduced without guessing which one was meant.
+
+    Downloaded files stay local and are git-ignored. Extended-hours bars are
+    included as the provider published them; the runtime is what decides which
+    candles belong to a regular session.
+    """
+    try:
+        result = download_equity_bars(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            output_dir=DEFAULT_OUTPUT_DIR,
+        )
+    except EquityError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from None
+
+    typer.echo("Downloaded historical equity bars")
+    typer.echo("")
+    typer.echo(f"Symbol:    {result.symbol}")
+    typer.echo(f"Timeframe: {result.timeframe}")
+    typer.echo(f"Start:     {result.start.isoformat()} (US market date)")
+    typer.echo(f"End:       {result.end.isoformat()} (US market date)")
+    typer.echo(f"Rows:      {result.row_count}")
+    typer.echo(f"Feed:      alpaca stock ({result.feed})")
+    typer.echo(f"Saved:     {result.parquet_path}")
+    typer.echo(f"Metadata:  {result.metadata_path}")
+
+
+def _describe_equity_session(calendar: AlpacaMarketCalendar) -> str:
+    """One line describing where `now` sits in the US market calendar.
+
+    Read from the broker rather than computed from a weekday rule, so a
+    holiday and an early close both show up as what they are.
+    """
+    try:
+        open_now, session = is_market_open(calendar, now=datetime.now(UTC))
+    except (SessionError, ExecutionError) as error:
+        # A missing credential, an unreachable broker, or an unreadable
+        # calendar all leave the session unknown. That is a status line, not a
+        # reason to abandon a start that was only ever going to observe.
+        return f"UNKNOWN ({error})"
+    if session is None:
+        return "CLOSED - no session on this US market date (weekend or holiday)"
+    window = (
+        f"{session.open_utc.isoformat()} to {session.close_utc.isoformat()} "
+        f"({session.session_date.isoformat()})"
+    )
+    return f"{'OPEN' if open_now else 'CLOSED'} - regular session {window}"
+
+
+def _echo_equity_runtime_banner(
+    runtime: EquityRuntime,
+    *,
+    once: bool,
+    lock: Path,
+    calendar: AlpacaMarketCalendar,
+) -> None:
+    """Print what this process is and is not allowed to do, before it does it."""
+    authorization = runtime.authorization
+    heartbeat = runtime.heartbeat
+    typer.echo("AUTO TRADER - EQUITY RUNTIME")
+    typer.echo("")
+    typer.echo(_field("Environment", "PAPER ONLY"))
+    typer.echo(_field("Trading", "US EQUITY, REGULAR HOURS"))
+    typer.echo(_field("Symbols", ", ".join(EQUITY_PROCESSING_ORDER)))
+    typer.echo(_field("Mode", "ONCE" if once else "RUN"))
+    typer.echo(_field("Bar Interval", "15m, completed regular-session bars only"))
+    typer.echo(_field("Data Feed", f"alpaca stock ({EQUITY_FEED.value})"))
+    typer.echo(_field("Market Session", _describe_equity_session(calendar)))
+    typer.echo(_field("Reconciliation", heartbeat.reconciliation_status or "NOT RUN"))
+    typer.echo(_field("Startup Safety", heartbeat.startup_safety_code))
+    typer.echo(_field("Lock File", str(lock)))
+    typer.echo("")
+    if heartbeat.startup_safety_code != STARTUP_SAFETY_SAFE:
+        typer.secho(RECONCILIATION_NOT_SAFE_BANNER, fg=typer.colors.RED)
+        typer.echo(runtime.startup_safety_message)
+        typer.echo("")
+    if authorization.enabled:
+        typer.secho("PAPER EXECUTION ENABLED", fg=typer.colors.YELLOW)
+        typer.echo(
+            "Signals on completed regular-session bars may be submitted to the PAPER "
+            "account, and only while the session is open."
+        )
+    else:
+        typer.secho("OBSERVATION ONLY - NO ORDER WILL BE SUBMITTED", fg=typer.colors.GREEN)
+        typer.echo(f"Reason: {authorization.reason}")
+    typer.echo("")
+
+
+def _echo_equity_runtime_summary(runtime: EquityRuntime) -> None:
+    """Print the final heartbeat as an operator-readable block."""
+    heartbeat = runtime.heartbeat
+    typer.echo("")
+    typer.echo(_field("Final State", heartbeat.state.value))
+    typer.echo(_field("Cycles Started", str(heartbeat.cycles_started)))
+    typer.echo(_field("Cycles Completed", str(heartbeat.cycles_completed)))
+    for symbol, timestamp in heartbeat.last_processed_bars.items():
+        typer.echo(_field(f"Last {symbol} Bar", timestamp.isoformat() if timestamp else "none"))
+    for symbol, timestamp in runtime.checkpoints.items():
+        typer.echo(_field(f"Checkpoint {symbol}", timestamp.isoformat()))
+    typer.echo(_field("Orders Submitted", str(heartbeat.orders_submitted)))
+    typer.echo(_field("Provider Calls", str(heartbeat.api_calls_total)))
+    if heartbeat.last_error is not None:
+        typer.echo(_field("Last Error", heartbeat.last_error))
+
+
+@app.command(name="equity-run")
+def equity_run(
+    once: bool = typer.Option(
+        False,
+        "--once",
+        help="Process the current cycle once and exit, without waiting.",
+    ),
+    confirm_paper_runtime: str = typer.Option(
+        "",
+        "--confirm-paper-runtime",
+        help=(
+            f"Type {RUNTIME_CONFIRMATION_TOKEN} exactly to authorize THIS process to use "
+            "the paper execution path for its lifetime. Without it the runtime only "
+            "observes."
+        ),
+    ),
+    observe_only: bool = typer.Option(
+        False,
+        "--observe-only",
+        help=(
+            "Run without an execution path at all: bars, validation, strategy and "
+            "signals only. Submission is not refused, it is unavailable."
+        ),
+    ),
+    safety_delay: float = typer.Option(
+        DEFAULT_SAFETY_DELAY.total_seconds(),
+        "--safety-delay",
+        help=(
+            "Seconds to wait after a 15-minute boundary before treating the bar that "
+            "just closed as fetchable. Covers provider publication lag."
+        ),
+    ),
+    database: Annotated[
+        Path,
+        typer.Option("--db", help="Local operational-state database."),
+    ] = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Run the equity runtime on completed 15-minute regular-session bars.
+
+    Processes SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, GOOGL, META and TSLA in
+    that fixed order: fetch one bounded window of recent completed bars for the
+    whole universe in a single request, validate it per symbol, evaluate
+    EMA 20 / EMA 50 on the newest completed regular-session bar only, record
+    any signal, and - if and only if every gate is open - hand that signal to
+    the equity paper execution path.
+
+    \b
+    The session rules, which are the whole point of a separate runtime:
+      * session times come from the broker's calendar - holidays and early
+        closes are read, never assumed
+      * a cycle outside the regular session does nothing at all: no fetch, no
+        strategy, no checkpoint, no order, no provider call
+      * a submission is refused again at the boundary unless the broker's own
+        clock says the session is open
+      * the bar that closes *at* the bell is observed by no cycle, because
+        acting on it would mean submitting after the close
+
+    An in-progress candle is never processed, and a completed bar is never
+    processed twice - not within one process, and not across a restart: the
+    per-symbol bar checkpoint is committed to SQLite before the bar can reach
+    the strategy. The preference is deliberate and one-sided: miss a trade
+    rather than duplicate a trade.
+
+    \b
+    Every start reconciles first, in this order:
+      1. acquire the equity runtime lock - a different file from the crypto
+         runner's, so the two services never block each other, while a second
+         equity runner is still refused
+      2. open the database and apply any pending migration
+      3. run reconciliation against the Alpaca PAPER account, over the ten
+         equity positions and every order intent the account holds
+      4. CLEAN or REPAIRED -> safe to trade; UNRESOLVED or FAILED -> not
+
+    \b
+    Unattended paper execution requires ALL of:
+      1. AUTOTRADER_PAPER_TRADING_ENABLED=true in the environment
+      2. --confirm-paper-runtime PAPER on the command line
+      3. startup reconciliation reporting that trading is safe
+      4. the regular market session being open at the moment of submission
+
+    No environment variable and no flag combination bypasses the last two.
+    There is no live mode. `--observe-only` goes further than the gates and
+    constructs no execution path at all.
+
+    Exits 0 on a clean stop including SIGINT/SIGTERM - a run that found the
+    market shut and observed nothing is a clean stop - 1 on a controlled
+    refusal or a fatal cycle failure, and 2 when trading was paused by an
+    UNKNOWN submission outcome that must be reconciled.
+    """
+    _configure_runtime_logging(verbose=False)
+
+    try:
+        config = EquityRuntimeConfig(
+            safety_delay=timedelta(seconds=safety_delay),
+            lookback_bars=DEFAULT_LOOKBACK_BARS,
+            observe_only=observe_only,
+            runtime_confirmation=confirm_paper_runtime or None,
+        )
+    except ScheduleError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_RUN_REFUSED_EXIT_CODE) from None
+
+    try:
+        initialize_database(database)
+    except StateError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_RUN_REFUSED_EXIT_CODE) from None
+
+    lock = RuntimeLock(lock_path_for(database, scope=EQUITY_LOCK_SCOPE))
+    try:
+        lock.acquire()
+    except RuntimeLockError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_RUN_REFUSED_EXIT_CODE) from None
+
+    shutdown = ShutdownRequest()
+    shutdown.install()
+    try:
+        with connect(database) as connection:
+            calendar = AlpacaMarketCalendar()
+            runtime = EquityRuntime(
+                connection,
+                market_data=AlpacaEquityBars(calendar),
+                calendar=calendar,
+                execution=None if observe_only else PaperEquityExecutionGateway(),
+                # The startup trading authority, scoped to the ten equity
+                # positions this process manages. Order intents are reconciled
+                # in full regardless: one account, one client_order_id space.
+                startup_safety=startup_safety_from_reconciliation(
+                    connection, symbols=EQUITY_PROCESSING_ORDER
+                ),
+                checkpoint=SqliteCheckpoint(connection),
+                config=config,
+                shutdown=shutdown,
+            )
+            runtime.start()
+            _echo_equity_runtime_banner(runtime, once=once, lock=lock.path, calendar=calendar)
+            try:
+                if once:
+                    runtime.run_cycle()
+                else:
+                    runtime.run_forever()
+            finally:
+                runtime.stop()
+            _echo_equity_runtime_summary(runtime)
+            state = runtime.heartbeat.state
+    finally:
+        shutdown.restore()
+        lock.release()
+
+    if state is RuntimeState.TRADING_PAUSED:
+        typer.echo("")
+        typer.secho("TRADING PAUSED - SUBMISSION OUTCOME UNKNOWN", fg=typer.colors.YELLOW, err=True)
+        typer.echo(
+            "An order may exist at the broker. Nothing further was submitted, and "
+            "nothing here resolves it: reconcile against the broker before starting "
+            "the runtime again.",
+            err=True,
+        )
+        raise typer.Exit(code=EQUITY_RUN_PAUSED_EXIT_CODE)
+    if state is RuntimeState.FAILED:
+        typer.echo("")
+        typer.secho("RUNTIME STOPPED ON A FATAL ERROR", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_RUN_REFUSED_EXIT_CODE)
 
 
 def main() -> None:

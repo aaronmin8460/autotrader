@@ -32,6 +32,15 @@ from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
 
 from autotrader.data.historical import CANONICAL_COLUMNS, SUPPORTED_SYMBOLS
 
+#: How the symbol universe is described in an `INVALID_SYMBOL` message.
+#:
+#: A parameter rather than a constant in the message because the same
+#: structural validator now serves two universes: crypto *pairs* and equity
+#: *symbols*. Calling an equity ticker a pair in an error message would be a
+#: small lie in the one place an operator reads when something is wrong.
+CRYPTO_UNIVERSE_LABEL = "pair universe"
+EQUITY_UNIVERSE_LABEL = "equity universe"
+
 #: Stable, machine-readable issue codes. Messages may be reworded; codes may not.
 EMPTY_DATASET = "EMPTY_DATASET"
 MISSING_COLUMN = "MISSING_COLUMN"
@@ -219,7 +228,13 @@ def _check_timestamp(frame: pd.DataFrame, errors: list[ValidationIssue]) -> None
         errors.append(ValidationIssue(UNSORTED_TIMESTAMP, "timestamps are not in ascending order."))
 
 
-def _check_symbol(frame: pd.DataFrame, errors: list[ValidationIssue]) -> None:
+def _check_symbol(
+    frame: pd.DataFrame,
+    errors: list[ValidationIssue],
+    *,
+    supported_symbols: tuple[str, ...],
+    universe_label: str,
+) -> None:
     series = frame["symbol"]
 
     null_count = int(series.isna().sum())
@@ -262,13 +277,13 @@ def _check_symbol(frame: pd.DataFrame, errors: list[ValidationIssue]) -> None:
             )
         )
 
-    unsupported = sorted(value for value in strings if value.upper() not in SUPPORTED_SYMBOLS)
+    unsupported = sorted(value for value in strings if value.upper() not in supported_symbols)
     if unsupported:
-        supported = ", ".join(SUPPORTED_SYMBOLS)
+        supported = ", ".join(supported_symbols)
         errors.append(
             ValidationIssue(
                 INVALID_SYMBOL,
-                f"Symbol outside the supported pair universe: {', '.join(unsupported)}. "
+                f"Symbol outside the supported {universe_label}: {', '.join(unsupported)}. "
                 f"Supported symbols are: {supported}.",
             )
         )
@@ -394,8 +409,22 @@ def _resolve_symbol(frame: pd.DataFrame) -> str | None:
 # --------------------------------------------------------------------------
 
 
-def validate_frame(frame: pd.DataFrame) -> ValidationResult:
-    """Validate an in-memory canonical bar frame. `frame` is never modified."""
+def validate_frame(
+    frame: pd.DataFrame,
+    *,
+    supported_symbols: tuple[str, ...] = SUPPORTED_SYMBOLS,
+    universe_label: str = CRYPTO_UNIVERSE_LABEL,
+) -> ValidationResult:
+    """Validate an in-memory canonical bar frame. `frame` is never modified.
+
+    Every check except one is universe-independent: schema, timestamps, OHLC
+    relationships, volume, trade count and vwap say nothing about which market
+    produced the rows. The exception is the symbol check, so the universe it is
+    measured against is a parameter with the crypto pairs as its default -
+    which keeps every existing caller's behaviour exactly as it was, and lets
+    the equity boundary validate its ten symbols through the same code rather
+    than through a second copy of it.
+    """
     errors: list[ValidationIssue] = []
     row_checks_possible = _check_columns(frame, errors)
 
@@ -411,7 +440,12 @@ def validate_frame(frame: pd.DataFrame) -> ValidationResult:
     if "timestamp" in frame.columns:
         _check_timestamp(frame, errors)
     if "symbol" in frame.columns:
-        _check_symbol(frame, errors)
+        _check_symbol(
+            frame,
+            errors,
+            supported_symbols=supported_symbols,
+            universe_label=universe_label,
+        )
 
     _check_ohlc(frame, errors)
 
@@ -459,14 +493,25 @@ def read_bars(path: Path) -> pd.DataFrame:
         raise ValidationInputError(f"Could not read {dataset_path} as Parquet: {exc}") from exc
 
 
-def validate_parquet_file(path: Path) -> ValidationResult:
+def validate_parquet_file(
+    path: Path,
+    *,
+    supported_symbols: tuple[str, ...] = SUPPORTED_SYMBOLS,
+    universe_label: str = CRYPTO_UNIVERSE_LABEL,
+) -> ValidationResult:
     """Read a stored Parquet bar dataset and validate it."""
-    return validate_frame(read_bars(path))
+    return validate_frame(
+        read_bars(path),
+        supported_symbols=supported_symbols,
+        universe_label=universe_label,
+    )
 
 
 __all__ = [
+    "CRYPTO_UNIVERSE_LABEL",
     "DUPLICATE_TIMESTAMP",
     "EMPTY_DATASET",
+    "EQUITY_UNIVERSE_LABEL",
     "INVALID_OHLC",
     "INVALID_SYMBOL",
     "INVALID_TIMESTAMP",

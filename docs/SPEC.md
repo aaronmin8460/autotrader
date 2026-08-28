@@ -80,6 +80,49 @@ Symbols use the provider's canonical pair form, slash included. `BTCUSD` is
 of one market is how stored datasets stop reconciling. A filesystem-safe slug
 (`BTC_USD`) exists for filenames only.
 
+### 3.1E Equity V0.2 market and universe
+
+Equity V0.2 is a **second product on the same account**, developed on the same
+architecture and gated the same way. It is not a mode of the crypto product and
+the crypto product is not a mode of it.
+
+| Dimension | Decision |
+| --- | --- |
+| Asset class | US equities (cash) |
+| Broker | Alpaca only |
+| Execution environment | Paper trading only |
+| Market data feed | Alpaca stock, **IEX** |
+| Universe | SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA |
+| Primary timeframe | 15-minute bars |
+| Operation | **US regular market hours only** |
+| Direction | Long only |
+| Leverage / shorting | None |
+| Quantity representation | **Whole shares**, integral `decimal.Decimal` |
+| Order type | MARKET, `TimeInForce.DAY`, regular hours |
+| Research strategy | The same EMA 20 / EMA 50 crossover |
+
+Exactly **ten** symbols, and the tuple order is the processing order. Adding an
+eleventh is a scope change requiring an edit to this document; it is not a
+configuration value. An unbounded universe would make the per-cycle API cost,
+the risk arithmetic and the reconciliation scope all depend on something nobody
+wrote down.
+
+The feed is IEX because that is what an Alpaca Basic subscription serves; `sip`
+returns a 403 without a paid data plan. IEX is a single-venue feed, so a symbol
+with no IEX prints in an interval simply has no bar for it. That is visible in
+the data and is not corrected for.
+
+**The quantity policy is whole shares, rounded down.** Alpaca reports these
+symbols as fractionable, and Equity V0.2 does not use it: a whole-share order
+needs no notional handling, no fractional-order time-in-force restriction, and
+no per-symbol increment metadata - Alpaca reports `min_order_size` and
+`min_trade_increment` as `null` for equities. The risk engine's approved
+quantity is floored to an integer number of shares at the execution boundary,
+so the broker is never asked for more than risk approved, and a quantity that
+floors below one share is refused rather than rounded up. One consequence is
+stated rather than hidden: a whole-share exit cannot fully close a *fractional*
+position, and nothing in this branch can create one.
+
 ### 3.2 Data frequency
 
 **15-minute bars** are the primary timeframe. Daily bars may be derived from
@@ -103,9 +146,36 @@ system: no market open, no close, no holiday calendar, and no
 `America/New_York`. A **day** means a **UTC calendar day**, 00:00 UTC to the
 next 00:00 UTC, and that is the only day boundary the system recognises.
 
+### 3.5 Equity time
+
+Equities do **not** trade continuously, so Equity V0.2 does not schedule on UTC
+boundaries alone. The rules, in full:
+
+- Session times come from **the broker's own calendar endpoint**. Holidays,
+  weekends and early closes are read, never assumed. `Mon-Fri 09:30-16:00` is
+  wrong on roughly a dozen days a year and appears nowhere in the code.
+- Alpaca reports each session's open and close as **naive Eastern wall-clock**
+  times. `America/New_York` is attached in exactly one function, which converts
+  to UTC immediately. Everything after that point - every comparison, bar
+  start, wake time and checkpoint - is UTC.
+- A **regular-session bar** is a 15-minute boundary whose *whole interval* lies
+  inside the session. An ordinary day has twenty-six (09:30 through 15:45); a
+  13:00 early close has fourteen (09:30 through 12:45). Pre-market and
+  post-market candles, which the IEX feed does serve, are not regular-session
+  bars and are filtered out before the strategy sees anything.
+- A cycle outside the regular session does **nothing at all**: no fetch, no
+  strategy, no checkpoint, no order, and no provider call.
+- The bar that closes *at* the bell is therefore never acted on: its cycle
+  would fall outside the session. On an ordinary day the actionable bars are
+  09:30 through 15:30, acted on at 09:45 through 15:45. That is a named
+  consequence of trading regular hours only, not an oversight.
+- The **risk day remains a UTC calendar day**, shared with the crypto book.
+  There is one account, so there is one answer to "how much has it lost today",
+  and a second equity-only baseline would create a second one.
+
 ---
 
-## 4. The archived equity milestone
+## 4. The archived equity milestone, and Equity V0.2
 
 Equity V0.1 - SPY, QQQ, AAPL, MSFT, NVDA on Alpaca's IEX feed, whole shares,
 `TimeInForce.DAY`, an equity market clock - was a complete, working system
@@ -121,12 +191,25 @@ system nobody runs is a liability, and `if asset_class == "stock"` scattered
 through the application would have been a permanent tax on every later change.
 Git history and that tag are how it stays recoverable.
 
-No active production code may depend on an equity symbol,
-`StockHistoricalDataClient`, `StockLatestTradeRequest`, the IEX feed,
-`TimeInForce.DAY`, a whole-share rule, or an equity market clock. Documentation
-may describe the archived milestone historically; executable code may not
-contain it, and the test suite asserts each absence against source with
-docstrings and comments stripped.
+**Equity V0.2 is not that milestone restored.** The tag is a read-only
+reference. Nothing was reset to it, nothing was cherry-picked from it, and no
+part of its architecture was carried over wholesale: the current main is
+authoritative, and the equity product is built on the current Decimal
+quantities, the current SQLite schema, the current risk engine, the current
+execution ordering, and the current reconciliation. What was reused from it is
+*semantics* that were already proven right - whole shares, `TimeInForce.DAY`,
+regular hours, the IEX feed, and reading the broker's clock rather than
+assuming a session.
+
+**The absence rules now scope to the crypto product, and are still enforced.**
+No crypto runtime module - the schedule, the bounded fetch, the runner - may
+name an equity symbol, `StockHistoricalDataClient`, `StockLatestTradeRequest`,
+`StockBarsRequest`, `TimeInForce.DAY`, `get_clock`, or `America/New_York`, and
+the test suite asserts each absence against source with docstrings and comments
+stripped. The two products share the account, the risk engine, the strategy,
+the storage layer, the checkpoint table, the lock mechanism and the
+reconciliation pass; they share no scheduler, no market-data client, no order
+translation, and no runtime object.
 
 ---
 
@@ -145,8 +228,15 @@ Phase 7  Alpaca Paper Trading              <- done, migrated to crypto (C7)
 Phase 8  Reconciliation / Crash Recovery   <- done (C8)
 Phase 9  24/7 Runtime / Monitoring         <- done (C9)
 --- Phase 8 + Phase 9 integrated (schema v5) ---
+Equity   Equity V0.2                       <- component-complete (E1)
 Phase 10 Deployment                        <- after the integrated paper smoke
 ```
+
+Equity V0.2 is a parallel product rather than a later phase of the crypto one.
+It is **component-complete and integration-ready**, and it is deliberately not
+activated alongside crypto: shared account-level risk, combined exposure, a
+shared API budget, the final reconciliation scope and the V0.2 dashboard belong
+to a separate Combined Integration phase (section 9, E1).
 
 ---
 
@@ -264,14 +354,22 @@ exists. See section 8, "C7".
 The following are **out of scope** and must not be introduced without an
 explicit, documented scope change.
 
-**Trading scope:** live trading, real-money order submission, US equities,
-options, futures, forex, perpetual futures, non-USD quote currencies, pairs
-outside BTC/USD and ETH/USD, short selling, leverage, margin strategies,
-multiple brokers, multiple users.
+**Trading scope:** live trading, real-money order submission, options, futures,
+forex, perpetual futures, non-USD quote currencies, pairs outside BTC/USD and
+ETH/USD, equities outside the ten named in section 3.1E, short selling,
+leverage, margin strategies, multiple brokers, multiple users.
 
-**Order types:** anything other than MARKET with GTC time in force. No limit,
-stop, stop-limit, trailing-stop, bracket, or OCO orders; no notional orders;
-no `DAY` and no `IOC`.
+**Order types:** MARKET only, in both products. Crypto sends GTC; Equity V0.2
+sends `DAY` with no extended-hours flag, which is the right lifetime for a
+regular-hours-only system. No limit, stop, stop-limit, trailing-stop, bracket,
+or OCO orders; no notional orders; no `IOC`; no fractional equity orders; no
+extended-hours trading.
+
+**Combined activation:** simultaneous autonomous crypto **and** equity
+execution against the shared account. Equity V0.2 provides the seams for it and
+does not turn it on. Shared account-level risk, combined exposure limits, a
+shared API budget, the final reconciliation scope and dashboard V0.2 belong to
+the Combined Integration phase.
 
 **Signal generation:** AI trading agents, LLM-generated trade signals,
 machine-learning trading models, sentiment analysis, additional indicators,
@@ -290,9 +388,11 @@ service, and no `asyncio`.
 and hosted metrics. C8's whole monitoring surface is a heartbeat object and
 standard-library structured logging to stdout.
 
-**Process:** dual-market abstractions, asset-class switches, speculative
+**Process:** asset-class switches inside a shared code path, speculative
 refactors, abstractions built for hypothetical future requirements, complex
-abstract base classes.
+abstract base classes. Two products on one account is not a "dual-market
+abstraction": they share concrete, already-existing components by calling them,
+and each owns its own scheduler and its own broker translation outright.
 
 ---
 
@@ -1467,6 +1567,76 @@ no Kafka. One SQLite file and one `fcntl` lock.
 
 **Still pending after this gate:** no integrated paper BUY has been observed end
 to end. That smoke gate comes first, then failure injection, then Phase 10.
+
+### E1 - Equity V0.2 (component-complete, not activated)
+
+The ten-symbol US equity product, on the current architecture, gated the same
+way as the crypto one and scheduled entirely differently.
+
+**Universe and timeframe.** SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, GOOGL, META,
+TSLA - exactly ten, in that order, which is the processing order. 15-minute
+bars, Alpaca stock market data on the IEX feed (section 3.1E).
+
+**Session contract.** Regular US market hours only, read from the broker's
+calendar. Holidays are absent from that calendar and are therefore absent here;
+early closes report their real 13:00 close and produce a genuinely shorter bar
+grid. Timezone semantics are explicit in both directions: naive Eastern in, UTC
+everywhere after (section 3.5).
+
+**Completed bars.** The shared `is_bar_complete` rule is reused rather than
+re-implemented, with one equity condition added on top - the bar must also be a
+regular-session bar of *today's* session. Only the newest completed bar may
+cause an action; the lookback exists to give the recursive EMA its state and is
+never replayed.
+
+**Strategy.** The existing EMA 20 / EMA 50 crossover, unchanged, unoptimized,
+with identical parameters across all ten symbols. No EMA arithmetic was
+duplicated and no per-symbol parameter exists.
+
+**Quantities.** Whole shares, floored from the risk engine's approved quantity,
+refused below one share, never rounded up (section 3.1E).
+
+**Execution.** The C7 pipeline, called rather than copied: environment gate,
+confirmation token, account read, position read with the short refusal, risk
+sizing, risk decision persisted, intent and `client_order_id` committed
+**before** the broker is called, duplicate preflight failing closed, exactly one
+submission attempt, no retry of an ambiguous outcome, broker snapshot
+persisted. Two things are added - whole-share normalization, and a
+regular-hours gate checked against the broker's **own clock** immediately
+before submitting, positioned *before* the intent is written so a closed market
+leaves nothing for reconciliation to chase.
+
+**Runtime.** `autotrader.equity.runtime.EquityRuntime`, driven by
+`equity-run`. Fixed processing order, one symbol finished before the next is
+looked at, never more than one broker submission in flight. Market data for all
+ten symbols is fetched in **one batched request per cycle**. The durable
+per-symbol checkpoint is the same `runtime_checkpoints` table the crypto runner
+uses - `SPY` and `BTC/USD` cannot collide - and the claim commits before the
+bar can reach the strategy. The lock is
+`<database>.equity.runtime.lock`, a different file from the crypto runner's, so
+two services can share an account without blocking each other while two runners
+of the *same* product still collide.
+
+**Reconciliation.** `reconcile_paper_state` gained one parameter: the position
+universe, defaulting to the crypto pairs so every existing caller is unchanged.
+Order intents are deliberately **not** filtered by it - one account has one
+`client_order_id` namespace, so an ambiguous equity order blocks the crypto
+runner and an ambiguous crypto order blocks the equity runner. A position held
+outside the pass's universe is recorded as observed and never traded out of.
+
+**Gates.** Unattended equity paper execution requires all four of:
+`AUTOTRADER_PAPER_TRADING_ENABLED=true`, `--confirm-paper-runtime PAPER`,
+startup reconciliation reporting safe, and the regular session being open at
+the moment of submission. Every one defaults to closed and none can satisfy
+another.
+
+**Deliberately not done here.** Combined crypto+equity activation, shared
+account-level risk arithmetic, combined exposure limits, per-book allocations
+(a "crypto 20% / stocks 20%" split is a Combined Integration decision and is
+*not* frozen here), a shared API budget, a distributed rate limiter, a
+dashboard, deployment artefacts, and any real equity paper submission. Equity
+V0.2 has been exercised read-only against the real paper account and has
+submitted **no** stock order.
 
 ### Later phases
 

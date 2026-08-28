@@ -279,19 +279,23 @@ def fetch_bars(
 # --------------------------------------------------------------------------
 
 
-def bars_to_dataframe(bars: Iterable[Bar], symbol: str) -> pd.DataFrame:
-    """Convert Alpaca bars to the canonical DataFrame.
+def to_canonical_frame(bars: Iterable[Bar], symbol: str) -> pd.DataFrame:
+    """Convert Alpaca bars to the canonical DataFrame under an **already
+    validated** symbol.
 
-    Timestamps become timezone-aware UTC, rows are ordered ascending, and the
-    columns are exactly `CANONICAL_COLUMNS` in that order. The stored `symbol`
-    is the canonical pair form, slash included. `trade_count` and `vwap` stay
-    nullable because Alpaca does not always provide them.
+    The canonical bar contract itself - column set, column order, UTC-aware
+    timestamps, ascending rows, float64 numerics, nullable `trade_count` and
+    `vwap` - is one thing, and which symbols a caller may ask for is another.
+    This function owns the first and deliberately knows nothing about the
+    second, so the equity boundary can produce the same canonical frame under
+    its own universe without a second copy of the conversion drifting away from
+    this one. Callers validate the symbol first; `bars_to_dataframe` is the
+    crypto-universe form that does.
     """
-    normalized_symbol = normalize_symbol(symbol)
     records = [
         {
             "timestamp": bar.timestamp,
-            "symbol": normalized_symbol,
+            "symbol": symbol,
             "open": bar.open,
             "high": bar.high,
             "low": bar.low,
@@ -308,6 +312,17 @@ def bars_to_dataframe(bars: Iterable[Bar], symbol: str) -> pd.DataFrame:
     for column in _NUMERIC_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("float64")
     return frame.sort_values("timestamp", kind="stable", ignore_index=True)
+
+
+def bars_to_dataframe(bars: Iterable[Bar], symbol: str) -> pd.DataFrame:
+    """Convert Alpaca bars to the canonical DataFrame.
+
+    Timestamps become timezone-aware UTC, rows are ordered ascending, and the
+    columns are exactly `CANONICAL_COLUMNS` in that order. The stored `symbol`
+    is the canonical pair form, slash included. `trade_count` and `vwap` stay
+    nullable because Alpaca does not always provide them.
+    """
+    return to_canonical_frame(bars, normalize_symbol(symbol))
 
 
 # --------------------------------------------------------------------------
@@ -329,8 +344,13 @@ def output_paths(
     return directory / f"{stem}.parquet", directory / f"{stem}.metadata.json"
 
 
-def _atomic_write(path: Path, write: Callable[[Path], None]) -> None:
-    """Write via a sibling temporary file and rename, so a crash cannot truncate `path`."""
+def atomic_write(path: Path, write: Callable[[Path], None]) -> None:
+    """Write via a sibling temporary file and rename, so a crash cannot truncate `path`.
+
+    Public because the equity market-data boundary writes its Parquet and its
+    metadata sidecar the same way, and a second copy of a crash-safety helper
+    is a second thing that can be subtly wrong.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     os.close(handle)
@@ -345,7 +365,7 @@ def _atomic_write(path: Path, write: Callable[[Path], None]) -> None:
 
 def write_parquet(frame: pd.DataFrame, path: Path) -> None:
     """Persist the canonical frame to Parquet atomically."""
-    _atomic_write(path, lambda target: frame.to_parquet(target, engine="pyarrow", index=False))
+    atomic_write(path, lambda target: frame.to_parquet(target, engine="pyarrow", index=False))
 
 
 def build_metadata(
@@ -380,7 +400,7 @@ def build_metadata(
 def write_metadata(metadata: dict[str, object], path: Path) -> None:
     """Persist the sidecar metadata atomically."""
     payload = json.dumps(metadata, indent=2, sort_keys=True) + "\n"
-    _atomic_write(path, lambda target: target.write_text(payload, encoding="utf-8"))
+    atomic_write(path, lambda target: target.write_text(payload, encoding="utf-8"))
 
 
 # --------------------------------------------------------------------------
@@ -450,6 +470,7 @@ __all__ = [
     "SYMBOL_SEPARATOR",
     "DownloadResult",
     "HistoricalDataError",
+    "atomic_write",
     "bars_to_dataframe",
     "build_bars_request",
     "build_metadata",
@@ -464,6 +485,7 @@ __all__ = [
     "output_stem",
     "parse_utc_date",
     "resolve_date_range",
+    "to_canonical_frame",
     "to_request_window",
     "write_metadata",
     "write_parquet",
