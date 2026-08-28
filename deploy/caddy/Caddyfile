@@ -90,9 +90,44 @@
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		Referrer-Policy "no-referrer"
-		# The dashboard is first-party and self-contained; it loads nothing
-		# from anywhere else.
-		Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+
+		# The dashboard is first-party and self-contained: it loads no script,
+		# style, font or image from anywhere but this origin, and it opens no
+		# socket to anywhere else. Every directive below is therefore 'self'
+		# or 'none' - except one.
+		#
+		# `script-src 'unsafe-inline'` is required, and it was measured rather
+		# than assumed. Next.js App Router bootstraps by emitting the React
+		# Server Component payload as a series of inline `<script>` blocks
+		# (`self.__next_f.push(...)`) with no nonce attribute. Under a policy
+		# without it, Chromium blocks all seven, hydration never starts, and
+		# the page is blank - while curl still reports HTTP 200, which is how
+		# this shipped.
+		#
+		# The two ways to keep inline scripts out of the policy do not apply:
+		#
+		#   * Hashes would have to be regenerated on every frontend build, and
+		#     the payload embeds the build ID, so a stale Caddyfile would blank
+		#     the page again at the next deploy - the same failure, on a delay.
+		#   * A nonce means `middleware.ts` in the frontend, which moves this
+		#     header out of the proxy and into the process that deliberately
+		#     holds no credentials, makes every route dynamic, and requires
+		#     rebuilding the frontend on a host where the npm build is already
+		#     known to be fragile. Trading the dashboard's availability for a
+		#     directive is the wrong trade.
+		#
+		# What the allowance actually costs here is small and worth stating:
+		# the page renders no user-supplied content - every value on it comes
+		# from this operator's own database and broker - it is behind
+		# basic_auth, and it is GET-only at the edge. `unsafe-inline` widens
+		# script injection, and there is no injection vector on this page to
+		# widen. If one is ever added, that is the moment for the nonce.
+		#
+		# Measured, not copied. `'unsafe-eval'` and `style-src 'unsafe-inline'`
+		# were both tested against the real build in Chromium and neither is
+		# needed, so neither is here; `img-src` is 'self' with no `data:`
+		# because the dashboard serves no image at all.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
 		-Server
 	}
 

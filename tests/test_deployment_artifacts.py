@@ -479,6 +479,72 @@ def test_the_proxy_rejects_write_methods_at_the_edge() -> None:
     assert "405" in code
 
 
+def content_security_policy() -> dict[str, str]:
+    """The Caddyfile's CSP, parsed into {directive: value}."""
+    match = re.search(r'Content-Security-Policy\s+"([^"]+)"', caddyfile_code())
+    assert match, "the proxy sets no Content-Security-Policy"
+    policy: dict[str, str] = {}
+    for part in match.group(1).split(";"):
+        fields = part.split()
+        if fields:
+            policy[fields[0]] = " ".join(fields[1:])
+    return policy
+
+
+def test_the_policy_names_every_directive_rather_than_falling_back() -> None:
+    """`default-src` as a silent fallback is exactly how the page shipped blank.
+
+    The first publish set `default-src 'self'` and no `script-src`, so scripts
+    fell back to it, Next.js's inline bootstrap was blocked, and the dashboard
+    rendered nothing - while curl reported 200 and a full HTML body. A policy
+    that has to be reasoned about through fallbacks is a policy nobody checks.
+    """
+    policy = content_security_policy()
+    for name in (
+        "default-src",
+        "script-src",
+        "style-src",
+        "img-src",
+        "font-src",
+        "connect-src",
+        "object-src",
+        "base-uri",
+        "form-action",
+        "frame-ancestors",
+    ):
+        assert name in policy, f"{name} is not stated; something falls back to default-src"
+
+
+def test_the_policy_lets_the_frontend_bootstrap() -> None:
+    """Next.js emits its RSC payload as inline <script> blocks carrying no nonce.
+
+    Without this the page is blank in every browser, and green in curl.
+    """
+    script = content_security_policy()["script-src"]
+    assert "'self'" in script, script
+    assert "'unsafe-inline'" in script, (
+        "Next.js App Router cannot hydrate without it - see the Caddyfile for "
+        "why a hash or a nonce is not the cheaper option here"
+    )
+
+
+def test_the_policy_grants_nothing_it_was_not_measured_to_need() -> None:
+    """Both were tested against the real build in Chromium and neither is needed."""
+    policy = content_security_policy()
+    granted = " ".join(policy.values())
+    assert "'unsafe-eval'" not in granted, "the production build does not need eval"
+    assert "'unsafe-inline'" not in policy["style-src"], "the stylesheet is a same-origin link"
+    assert policy["object-src"] == "'none'", policy["object-src"]
+    assert policy["frame-ancestors"] == "'none'", policy["frame-ancestors"]
+
+
+def test_the_policy_opens_nothing_to_the_network() -> None:
+    """A wildcard or an external origin would make the rest of it decoration."""
+    granted = " ".join(content_security_policy().values())
+    assert "*" not in granted, granted
+    assert "http://" not in granted and "https://" not in granted, granted
+
+
 def test_the_proxy_admin_api_stays_on_loopback() -> None:
     """It can rewrite the running configuration. It is a control plane."""
     code = caddyfile_code()
