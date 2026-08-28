@@ -24,6 +24,7 @@ import re
 import sqlite3
 import stat
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -115,8 +116,20 @@ def script_code(name: str) -> str:
 
 
 def deploy_text_files() -> list[Path]:
-    """Every artifact under deploy/, for the whole-directory scans."""
-    return sorted(p for p in DEPLOY_ROOT.rglob("*") if p.is_file())
+    """Every artifact under deploy/, for the whole-directory scans.
+
+    `__pycache__` is excluded. Bytecode is generated, not an artifact: it is
+    derived from a source file that these scans already read, it is not in
+    version control, and it is not even text - reading it raises
+    `UnicodeDecodeError` and takes three unrelated scans down with it. A
+    deployed checkout grows one as soon as anything imports a script from
+    `deploy/bin`, so this is the normal state of a real host, not an edge case.
+    """
+    return sorted(
+        path
+        for path in DEPLOY_ROOT.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +674,16 @@ def load_healthcheck():
     spec = importlib.util.spec_from_loader(loader.name, loader)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
+    # A test that audits a directory must not write into it. Importing an
+    # extensionless script leaves a `__pycache__` beside it on some versions,
+    # which is both litter in a deployed checkout and something the scans
+    # above would then have to read.
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 
 
