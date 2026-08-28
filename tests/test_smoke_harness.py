@@ -46,6 +46,7 @@ from alpaca.trading.models import Order, Position, TradeAccount
 from typer.testing import CliRunner
 
 from autotrader import smoke
+from autotrader.execution.models import TRADABLE_SYMBOLS
 from autotrader.execution.paper import CryptoAssetSpec
 from autotrader.smoke import audit as audit_module
 from autotrader.smoke import baseline as baseline_module
@@ -78,16 +79,21 @@ from autotrader.smoke.models import (
 )
 from autotrader.smoke.readonly import open_readonly
 from autotrader.state.sqlite import (
+    ACCOUNT_SAFETY_SAFE,
+    ACCOUNT_SAFETY_UNSAFE_RECONCILIATION,
+    ACCOUNT_SAFETY_UNSAFE_UNKNOWN,
     INTENT_STATUS_CONFIRMED_NOT_SUBMITTED,
     INTENT_STATUS_SUBMITTED,
     INTENT_STATUS_UNKNOWN,
     RECONCILIATION_STATUS_CLEAN,
     RECONCILIATION_STATUS_REPAIRED,
     RECONCILIATION_STATUS_UNRESOLVED,
+    SCHEMA_VERSION,
     connect,
     initialize_database,
     record_order_intent,
     record_reconciliation_run,
+    set_account_safety_state,
     upsert_broker_order,
     upsert_runtime_checkpoint,
 )
@@ -406,15 +412,47 @@ def crypto_asset(
     )
 
 
+def seed_account_safety(
+    connection: sqlite3.Connection,
+    *,
+    safe: bool = True,
+    client_order_id: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Set the shared account halt the way the system itself would."""
+    set_account_safety_state(
+        connection,
+        account_state=ACCOUNT_SAFETY_SAFE if safe else ACCOUNT_SAFETY_UNSAFE_UNKNOWN,
+        reason="seeded by the test suite",
+        source="reconciliation" if safe else "crypto-runtime",
+        client_order_id=client_order_id,
+        updated_at=now or datetime.now(UTC),
+    )
+
+
 def seed_reconciliation(
     connection: sqlite3.Connection,
     *,
     status: str = RECONCILIATION_STATUS_CLEAN,
     safe: bool = True,
     completed_at: datetime | None = None,
+    account_safe: bool | None = None,
 ) -> int:
+    """Record a finished pass, and move the shared halt the way it would.
+
+    The two are coupled here because they are coupled in the system:
+    `account.safety.apply_reconciliation_result` is the one place a completed
+    full-universe pass moves the account-wide gate. A fixture that recorded a
+    green pass while leaving the account halted would be describing a state the
+    runtime cannot actually produce, and every preflight built on it would be
+    testing against fiction.
+
+    `account_safe` decouples them for the tests that need the pass and the gate
+    to disagree - which is a real state: a green pass narrower than the tracked
+    universe reports honestly and leaves an existing halt exactly where it was.
+    """
     moment = completed_at or datetime.now(UTC)
-    return record_reconciliation_run(
+    run_id = record_reconciliation_run(
         connection,
         started_at=moment - timedelta(seconds=2),
         completed_at=moment,
@@ -425,6 +463,8 @@ def seed_reconciliation(
         issues_count=0 if safe else 1,
         unresolved_count=0 if safe else 1,
     )
+    seed_account_safety(connection, safe=safe if account_safe is None else account_safe, now=moment)
+    return run_id
 
 
 def seed_intent(
@@ -719,7 +759,7 @@ def test_reading_state_does_not_migrate_or_change_journal_mode(
     """An audit must not alter the database it audits."""
     before = database_path.read_bytes()
     assert readonly_module.journal_mode(reader) == "wal"
-    assert readonly_module.schema_version(reader) == 5
+    assert readonly_module.schema_version(reader) == SCHEMA_VERSION
     assert len(readonly_module.table_names(reader)) >= 12
     assert database_path.read_bytes() == before
 
@@ -741,7 +781,7 @@ def test_reading_a_wal_database_leaves_its_rows_byte_identical(
     wal_before = write_ahead_log.stat().st_size if write_ahead_log.exists() else 0
 
     with open_readonly(database_path) as reader:
-        assert readonly_module.schema_version(reader) == 5
+        assert readonly_module.schema_version(reader) == SCHEMA_VERSION
         assert len(tracking_module.intents_for_symbol(reader, BTC)) == 1
         assert tracking_module.latest_reconciliation(reader) is not None
 
@@ -766,10 +806,21 @@ def test_the_harness_never_calls_the_writing_connection_helper() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_the_universe_falls_back_to_this_builds_frozen_pairs() -> None:
-    """With nothing published and nothing supplied, degrade to what main knows."""
-    assert readonly_module.resolve_universe() == (BTC, ETH)
-    assert "SUPPORTED_SYMBOLS" in readonly_module.universe_source()
+def test_the_universe_is_the_combined_twelve_symbol_book() -> None:
+    """Discovered from the integrated build, never copied into this package.
+
+    Combined Integration publishes the union of both books as
+    `execution.models.TRADABLE_SYMBOLS` - the same tuple an `OrderIntent` is
+    validated against, and the same one a full-universe reconciliation has to
+    cover before it may clear the shared account halt. The harness finds it
+    through the documented probe list, so widening or narrowing the traded
+    universe moves every preflight, audit and checkpoint report with it and
+    needs no edit here.
+    """
+    assert readonly_module.resolve_universe() == TRADABLE_SYMBOLS
+    assert len(TRADABLE_SYMBOLS) == 12
+    assert set(TRADABLE_SYMBOLS) >= {BTC, ETH, SPY}
+    assert readonly_module.universe_source() == "autotrader.execution.models.TRADABLE_SYMBOLS"
 
 
 def test_an_explicit_universe_wins_over_everything(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1060,6 +1111,8 @@ def sample_baseline() -> Baseline:
         reconciliation_run_id=7,
         reconciliation_status=RECONCILIATION_STATUS_CLEAN,
         reconciliation_safe_to_trade=True,
+        account_safety_state=ACCOUNT_SAFETY_SAFE,
+        account_safety_safe_to_trade=True,
     )
 
 
@@ -1136,6 +1189,7 @@ def test_the_snapshot_payload_is_an_allowlist_not_an_object_dump() -> None:
     payload = sample_baseline().to_payload()
     assert set(payload) == {
         "account",
+        "account_safety",
         "baseline_schema",
         "captured_at",
         "database",
@@ -1178,6 +1232,93 @@ def check_named(report: object, name: str):
     found = [check for check in gate.checks if check.name == name]
     assert found, f"no check named {name} in {[c.name for c in gate.checks]}"
     return found[0]
+
+
+def test_preflight_blocks_on_a_shared_account_halt(
+    writer: sqlite3.Connection, database_path: Path, credentials: None
+) -> None:
+    """One account, both books: a halt from either side stops the smoke.
+
+    The halt is what the execution boundary itself checks, so a preflight that
+    ignored it would clear a smoke the very next step refuses - and would do so
+    while an order of ours may be live at the broker under the recorded key.
+    """
+    seed_reconciliation(writer)
+    seed_account_safety(writer, safe=False, client_order_id="autotrader-unknown-1")
+
+    with open_readonly(database_path) as reader:
+        report = run_preflight(reader)
+
+    safety = check_named(report, "account.safety")
+    assert safety.verdict is SmokeVerdict.FAIL
+    assert ACCOUNT_SAFETY_UNSAFE_UNKNOWN in safety.detail
+    assert "autotrader-unknown-1" in safety.detail
+    assert report.ready is False
+
+
+def test_a_green_pass_does_not_override_a_standing_account_halt(
+    writer: sqlite3.Connection, database_path: Path, credentials: None
+) -> None:
+    """The two checks answer different questions, and both must be asked.
+
+    A reconciliation pass narrower than the tracked universe can be entirely
+    CLEAN and still leave a halt standing, because it has not established that
+    the rest of the account is understood. Reading only the pass would call
+    that ready.
+    """
+    seed_reconciliation(writer, status=RECONCILIATION_STATUS_CLEAN, account_safe=False)
+
+    with open_readonly(database_path) as reader:
+        report = run_preflight(reader)
+
+    assert check_named(report, "reconciliation").verdict is SmokeVerdict.PASS
+    assert check_named(report, "account.safety").verdict is SmokeVerdict.FAIL
+    assert report.ready is False
+
+
+def test_preflight_blocks_when_account_safety_was_never_established(
+    writer: sqlite3.Connection, database_path: Path, credentials: None
+) -> None:
+    """ "Nobody has ever checked" is not "checked and fine"."""
+    seed_reconciliation(writer, account_safe=None)
+    writer.execute("DELETE FROM account_safety_state")
+    writer.commit()
+
+    with open_readonly(database_path) as reader:
+        report = run_preflight(reader)
+
+    safety = check_named(report, "account.safety")
+    assert safety.verdict is SmokeVerdict.FAIL
+    assert "has ever established" in safety.detail
+    assert ACCOUNT_SAFETY_UNSAFE_RECONCILIATION in safety.detail
+    assert report.ready is False
+
+
+def test_the_preflight_reports_the_account_safety_state_it_read(
+    writer: sqlite3.Connection, database_path: Path, credentials: None
+) -> None:
+    """It is carried on the report, so the baseline records the same answer."""
+    seed_reconciliation(writer)
+
+    with open_readonly(database_path) as reader:
+        report = run_preflight(reader)
+
+    assert report.account_safety is not None
+    assert report.account_safety.state == ACCOUNT_SAFETY_SAFE
+    assert report.account_safety.safe_to_trade is True
+
+    baseline = report.to_baseline(database_path="state.db", schema=None)
+    assert baseline.account_safety_state == ACCOUNT_SAFETY_SAFE
+    assert baseline.account_safety_safe_to_trade is True
+
+
+def test_the_baseline_round_trips_the_account_safety_state(tmp_path: Path) -> None:
+    """It survives JSON, so "before" and "after" are compared on one answer."""
+    before = sample_baseline()
+    path = write_baseline(before, tmp_path / "baseline.json")
+    after = read_baseline(path)
+    assert after.account_safety_state == before.account_safety_state
+    assert after.account_safety_safe_to_trade == before.account_safety_safe_to_trade
 
 
 def test_a_clean_system_is_ready_for_a_paper_smoke(
@@ -1706,6 +1847,43 @@ def flat_baseline() -> Baseline:
         universe=(BTC, ETH),
         positions={BTC: Decimal(0), ETH: Decimal(0)},
     )
+
+
+def test_final_audit_detects_a_shared_account_halt(
+    writer: sqlite3.Connection, database_path: Path
+) -> None:
+    """A smoke that left the account halted did not leave it restored.
+
+    The dangerous shape this catches: a CLEAN pass recorded *before* an
+    ambiguous submission, and the halt that submission raised still standing
+    afterwards. The pass check alone would call that a finished smoke.
+    """
+    seed_reconciliation(writer, status=RECONCILIATION_STATUS_CLEAN, account_safe=False)
+
+    with open_readonly(database_path) as reader:
+        result = run_audit(reader, baseline=flat_baseline(), baseline_path="baseline.json")
+
+    assert check_named(result, "reconciliation").verdict is SmokeVerdict.PASS
+    safety = check_named(result, "account.safety")
+    assert safety.verdict is SmokeVerdict.FAIL
+    assert ACCOUNT_SAFETY_UNSAFE_UNKNOWN in safety.detail
+    assert result.complete is False
+    assert result.verdict_text() == SMOKE_INCOMPLETE
+
+
+def test_a_finished_smoke_leaves_the_account_open_for_business(
+    writer: sqlite3.Connection, database_path: Path
+) -> None:
+    """The condition the final report has to be able to state as proven."""
+    seed_reconciliation(writer, status=RECONCILIATION_STATUS_CLEAN)
+
+    with open_readonly(database_path) as reader:
+        result = run_audit(reader, baseline=flat_baseline(), baseline_path="baseline.json")
+
+    safety = check_named(result, "account.safety")
+    assert safety.verdict is SmokeVerdict.PASS
+    assert ACCOUNT_SAFETY_SAFE in safety.detail
+    assert result.complete is True
 
 
 def test_a_finished_smoke_is_complete_and_exposure_is_restored(

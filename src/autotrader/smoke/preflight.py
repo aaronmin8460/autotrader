@@ -82,6 +82,7 @@ class PreflightReport:
     runtime: tuple[RuntimeHealth, ...]
     dashboard: DashboardHealth
     latest_reconciliation: state.ReconciliationRun | None
+    account_safety: state.AccountSafetyState | None
     open_intents: tuple[state.StoredOrderIntent, ...]
     unknown_intents: tuple[state.StoredOrderIntent, ...]
     paper_gate_open: bool
@@ -129,6 +130,10 @@ class PreflightReport:
             ),
             reconciliation_safe_to_trade=(
                 self.latest_reconciliation.safe_to_trade if self.latest_reconciliation else None
+            ),
+            account_safety_state=(self.account_safety.state if self.account_safety else None),
+            account_safety_safe_to_trade=(
+                self.account_safety.safe_to_trade if self.account_safety else None
             ),
         )
 
@@ -178,6 +183,9 @@ def run_preflight(
     latest = tracking.latest_reconciliation(connection)
     checks.append(_reconciliation_check(latest, database, moment, reconciliation_max_age))
 
+    safety, safety_check = _account_safety_check(connection, database)
+    checks.append(safety_check)
+
     runtime = health.runtime_health(connection, universe, now=moment, stale_after=stale_after)
     checks.append(_runtime_check(runtime))
 
@@ -198,6 +206,7 @@ def run_preflight(
         runtime=runtime,
         dashboard=dashboard,
         latest_reconciliation=latest,
+        account_safety=safety,
         open_intents=open_rows,
         unknown_intents=unknown_rows,
         paper_gate_open=paper_gate,
@@ -493,6 +502,71 @@ def _reconciliation_check(
         f"Run #{latest.id} concluded {latest.status}, safe_to_trade=True, "
         f"{_describe_age(age)} ago ({latest.orders_checked} order(s), "
         f"{latest.positions_checked} position(s) checked).",
+    )
+
+
+def _account_safety_check(
+    connection: sqlite3.Connection, database: Path
+) -> tuple[state.AccountSafetyState | None, CheckResult]:
+    """The shared account halt: the gate both runtimes actually pass through.
+
+    Distinct from the reconciliation check above, and both are kept. That one
+    asks whether the last pass concluded something green and recently enough to
+    be evidence; this one asks whether the account is *currently* open for
+    business. They can disagree in the direction that matters: a green pass
+    narrower than the tracked universe leaves an existing halt standing, so a
+    preflight that read only the pass would report ready for a smoke that the
+    execution boundary would then refuse.
+
+    A halt is a `FAIL`, never a warning, and the harness will not lift one -
+    only a full-universe reconciliation does that. The recorded
+    `client_order_id` is surfaced when there is one, because it is the exact
+    key an operator has to ask the broker about.
+    """
+    try:
+        safety = tracking.account_safety(connection)
+    except sqlite3.Error as error:
+        return None, CheckResult(
+            "account.safety",
+            SmokeVerdict.FAIL,
+            f"The shared account safety state could not be read from {database} "
+            f"({error}). It is the gate every submission passes through, so an "
+            "unreadable one is treated as unsafe rather than assumed open.",
+        )
+
+    if not safety.established:
+        return safety, CheckResult(
+            "account.safety",
+            SmokeVerdict.FAIL,
+            "No reconciliation has ever established that this account is safe to "
+            f"trade, so the shared safety state is {safety.state}. 'Nobody has "
+            "checked' is not 'checked and fine'. Run: "
+            f"{RECONCILE_COMMAND.format(database=database)}",
+        )
+
+    if not safety.safe_to_trade:
+        anchor_text = (
+            ""
+            if safety.client_order_id is None
+            else f" The unresolved client_order_id is {safety.client_order_id}."
+        )
+        return safety, CheckResult(
+            "account.safety",
+            SmokeVerdict.FAIL,
+            f"The shared account safety state is {safety.state}, set by "
+            f"{safety.source}: {safety.reason}{anchor_text} No order from either "
+            "asset class may be submitted while this stands, and it is cleared "
+            "only by a full-universe reconciliation that resolves it - never by "
+            f"waiting and never by retrying. Run: "
+            f"{RECONCILE_COMMAND.format(database=database)}",
+        )
+
+    updated = "never" if safety.updated_at is None else safety.updated_at.isoformat()
+    return safety, CheckResult(
+        "account.safety",
+        SmokeVerdict.PASS,
+        f"The shared account safety state is {safety.state}, safe_to_trade=True "
+        f"(set by {safety.source}, updated {updated}). Both books are open.",
     )
 
 

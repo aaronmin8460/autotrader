@@ -263,6 +263,17 @@ def _echo_preflight(report: preflight_module.PreflightReport) -> None:
             "OPEN" if report.paper_gate_open else "CLOSED (needed for the BUY you run)",
         )
     )
+    # The shared halt is a gate, not a detail, so it is named in the header as
+    # well as in the checks below. One account, both books, one answer.
+    safety = report.account_safety
+    typer.echo(
+        _field(
+            "Account safety",
+            "UNREADABLE"
+            if safety is None
+            else f"{safety.state} (safe_to_trade={safety.safe_to_trade})",
+        )
+    )
 
     _heading("CHECKS")
     _echo_checks(report.gate.checks)

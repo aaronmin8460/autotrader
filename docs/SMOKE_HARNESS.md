@@ -162,6 +162,33 @@ Each of these is a test, not a promise.
 The harness was built against `main` and degrades gracefully. When
 `feat/combined-integration` lands, these are the only places to look.
 
+> **Status: adapted.** The harness has been merged into
+> `feat/combined-integration`. Points 1 and 3 below were applied; the rest
+> needed no code change and the reasons are recorded under each. What was
+> actually done:
+>
+> * **Universe (1).** `("autotrader.execution.models", "TRADABLE_SYMBOLS")` was
+>   appended to `UNIVERSE_SOURCES`. `resolve_universe()` now returns all twelve
+>   tracked symbols and `universe_source()` names that module. The list is
+>   still discovered by import, never copied.
+> * **Global account safety (3).** `tracking.account_safety` reads the
+>   `account_safety_state` row, and both `preflight` and `audit` gained an
+>   `account.safety` check beside the existing reconciliation one. The two are
+>   kept separate on purpose: a pass narrower than the tracked universe can be
+>   CLEAN while a halt still stands, so reading only the pass would clear a
+>   smoke the execution boundary would then refuse. The state is carried on
+>   `PreflightReport` and recorded in the baseline snapshot, which took
+>   `BASELINE_SCHEMA` to 2.
+> * **Schema (4).** No source change: `preflight` already read
+>   `state.SCHEMA_VERSION`. Two tests pinned the literal `5` and now assert
+>   against the constant, so the next migration cannot break them.
+> * **Equity metadata (2), dashboard (5), checkpoints (6), correlation (7).**
+>   Unchanged, and each still behaves as documented below. The whole-share
+>   equity policy in `cleanup.policy_for` already matches what the equity
+>   boundary enforces (`normalize_share_quantity`, a one-share floor, no USD
+>   notional rule), so it is assumed-but-correct rather than wrong; making it
+>   read broker metadata remains a worthwhile follow-up, not a blocker.
+
 ### 1. Tracked universe — usually no change needed
 
 `smoke/readonly.py` resolves the universe in this order: an explicit
@@ -181,6 +208,17 @@ harness widens on its own. If it publishes elsewhere, add the `(module,
 attribute)` pair to `UNIVERSE_SOURCES` — that is the whole change. Do **not**
 copy the symbol list into this package; a second frozen universe is exactly what
 this design avoids.
+
+It published elsewhere, so the pair was added:
+
+```
+autotrader.execution.models.TRADABLE_SYMBOLS
+```
+
+That tuple is the union of both books — the same one an `OrderIntent` is
+validated against, and the same one a full-universe reconciliation must cover
+before it may clear the shared account halt. The crypto-only
+`SUPPORTED_SYMBOLS` remains the last-resort fallback for an older build.
 
 ### 2. Equity asset metadata
 
@@ -204,11 +242,22 @@ account-safety table, read it in `tracking.py` and add one `CheckResult` to
 existing run check: a per-pass conclusion and a global flag answer different
 questions.
 
+Integration added `account_safety_state`, so this was done:
+`tracking.account_safety` reads the row, and `preflight._account_safety_check`
+and `audit._account_safety_check` each contribute one `account.safety`
+`CheckResult`. The run check was kept, and the advice about the two answering
+different questions turned out to be the point — the case that motivates the
+separate check is a CLEAN pass recorded *before* an ambiguous submission, with
+the halt that submission raised still standing afterwards. An unreadable row is
+treated as unsafe, and a row that no reconciliation has ever established is
+`FAIL` rather than a silent pass. The harness never clears a halt; only a
+full-universe reconciliation does.
+
 ### 4. Schema version
 
 `preflight._database_checks` blocks unless the database's `schema_metadata`
-version equals `state.SCHEMA_VERSION` (currently 5). It reads the constant, so a
-schema bump needs no edit here — but the harness will (correctly) refuse a
+version equals `state.SCHEMA_VERSION` (6 after Combined Integration). It reads
+the constant, so a schema bump needs no edit here — but the harness will (correctly) refuse a
 database that has not been migrated yet, and will not migrate it. Run any writing
 `autotrader` command first.
 

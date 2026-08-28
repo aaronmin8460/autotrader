@@ -39,7 +39,11 @@ from autotrader.smoke.models import SmokeError, SmokeInputError
 
 #: Bumped when the payload shape changes. `read_baseline` refuses a version it
 #: does not know rather than guessing at a field that moved.
-BASELINE_SCHEMA = 1
+#:
+#: 2 adds the shared account safety state, which Combined Integration made a
+#: durable row: one paper account carries both books, so "may anything trade"
+#: is part of what "before" looked like.
+BASELINE_SCHEMA = 2
 
 #: Default location. Gitignored, alongside the repository, so a snapshot sits
 #: next to the smoke it describes and never reaches a commit.
@@ -88,6 +92,8 @@ class Baseline:
     reconciliation_run_id: int | None = None
     reconciliation_status: str | None = None
     reconciliation_safe_to_trade: bool | None = None
+    account_safety_state: str | None = None
+    account_safety_safe_to_trade: bool | None = None
 
     def to_payload(self) -> dict[str, object]:
         """The JSON document, field by named field.
@@ -123,6 +129,13 @@ class Baseline:
                 "run_id": self.reconciliation_run_id,
                 "status": self.reconciliation_status,
                 "safe_to_trade": self.reconciliation_safe_to_trade,
+            },
+            # The shared halt, recorded separately from the pass above: a
+            # per-pass conclusion and the account-wide gate answer different
+            # questions, and a smoke needs the "before" answer to both.
+            "account_safety": {
+                "state": self.account_safety_state,
+                "safe_to_trade": self.account_safety_safe_to_trade,
             },
         }
 
@@ -207,6 +220,7 @@ def read_baseline(path: Path | str) -> Baseline:
     account = _section(payload, "account")
     database = _section(payload, "database")
     reconciliation = _section(payload, "reconciliation")
+    account_safety = _section(payload, "account_safety")
     return Baseline(
         captured_at=_parse_time(payload.get("captured_at"), source),
         universe=_string_tuple(payload.get("universe")),
@@ -232,6 +246,12 @@ def read_baseline(path: Path | str) -> Baseline:
         reconciliation_safe_to_trade=(
             reconciliation.get("safe_to_trade")
             if isinstance(reconciliation.get("safe_to_trade"), bool)
+            else None
+        ),
+        account_safety_state=_optional_str(account_safety.get("state")),
+        account_safety_safe_to_trade=(
+            account_safety.get("safe_to_trade")
+            if isinstance(account_safety.get("safe_to_trade"), bool)
             else None
         ),
     )

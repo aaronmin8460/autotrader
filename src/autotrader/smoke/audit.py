@@ -147,6 +147,7 @@ def run_audit(
 
     latest = tracking.latest_reconciliation(connection)
     checks.append(_reconciliation_check(latest, database_path))
+    checks.append(_account_safety_check(connection, database_path))
 
     runtime = health.runtime_health(connection, universe, now=moment, stale_after=stale_after)
     checks.append(_runtime_readable_check(runtime))
@@ -485,6 +486,57 @@ def _reconciliation_check(
         SmokeVerdict.PASS,
         f"Run #{latest.id} concluded {REQUIRED_RECONCILIATION_STATUS}, "
         f"safe_to_trade=True, {latest.issues_count} issue(s) recorded.",
+    )
+
+
+def _account_safety_check(connection: sqlite3.Connection, database: Path | str) -> CheckResult:
+    """A finished smoke leaves the account open for business, not halted.
+
+    The end-state counterpart of the preflight's gate, and the reason it is
+    checked separately from the reconciliation run: a smoke that ended with an
+    ambiguous submission can leave a `CLEAN` pass on record from *before* the
+    ambiguity while the shared halt raised by it still stands. Reading only the
+    pass would call that a restored account. Reading this row cannot.
+    """
+    command = f"autotrader reconcile --db {database}"
+    try:
+        safety = tracking.account_safety(connection)
+    except sqlite3.Error as error:
+        return CheckResult(
+            "account.safety",
+            SmokeVerdict.FAIL,
+            f"The shared account safety state could not be read from {database} "
+            f"({error}). An unreadable gate is treated as unsafe.",
+        )
+
+    if not safety.established:
+        return CheckResult(
+            "account.safety",
+            SmokeVerdict.FAIL,
+            f"The shared account safety state is {safety.state}: no reconciliation "
+            f"has ever established that this account is safe to trade. {command}",
+        )
+
+    if not safety.safe_to_trade:
+        anchor_text = (
+            ""
+            if safety.client_order_id is None
+            else f" The unresolved client_order_id is {safety.client_order_id}."
+        )
+        return CheckResult(
+            "account.safety",
+            SmokeVerdict.FAIL,
+            f"The shared account safety state is {safety.state}, set by "
+            f"{safety.source}: {safety.reason}{anchor_text} The smoke did not leave "
+            f"the account open for business. Resolve it with a full-universe "
+            f"pass: {command}",
+        )
+
+    return CheckResult(
+        "account.safety",
+        SmokeVerdict.PASS,
+        f"The shared account safety state is {safety.state}, safe_to_trade=True "
+        f"(set by {safety.source}). Both books are open.",
     )
 
 

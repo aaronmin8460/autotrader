@@ -136,6 +136,27 @@ def latest_reconciliation(connection: sqlite3.Connection) -> state.Reconciliatio
     return state.latest_reconciliation_run(connection)
 
 
+def account_safety(connection: sqlite3.Connection) -> state.AccountSafetyState:
+    """The durable account-wide answer to "may anything submit an order?".
+
+    Combined Integration made this a row rather than an in-process flag,
+    because one paper account carries both books and an ambiguous order raised
+    by either runtime is an uncertainty about the *account*. The harness reads
+    it for the same reason it reads everything else here: to report what the
+    system already decided, never to decide anything itself.
+
+    Deliberately separate from `latest_reconciliation`. A pass conclusion is
+    "what did the last check find"; this is "may anything trade right now".
+    They usually agree and they answer different questions - a green pass that
+    covered fewer than every tracked symbol leaves this row untouched - so the
+    harness reports both rather than inferring one from the other.
+
+    Never optimistic: a database in which nothing has ever established safety
+    reports an unsafe state with `established` False, not `SAFE`.
+    """
+    return state.read_account_safety_state(connection)
+
+
 def local_positions(connection: sqlite3.Connection) -> dict[str, state.Position]:
     """The local position snapshot table, keyed by symbol.
 
@@ -151,6 +172,7 @@ def local_positions(connection: sqlite3.Connection) -> dict[str, state.Position]
 
 __all__ = [
     "UNSETTLED_INTENT_STATUSES",
+    "account_safety",
     "find_broker_snapshot",
     "find_intent",
     "intents_by_side",

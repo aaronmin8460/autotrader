@@ -13,12 +13,14 @@ readers. They are plain `SELECT`s, they already know the decimal-text and
 UTC-text conventions, and duplicating them here would be a second decoder that
 could disagree with the one the runtime uses.
 
-**The universe is resolved, never frozen.** Current `main` tracks the two
-crypto pairs in `execution.models.SUPPORTED_SYMBOLS`. Combined Integration is
-expected to publish a larger tracked universe including equities; this module
-looks for one at a small set of documented locations and falls back to the
-crypto pairs when none exists, so the harness degrades to what `main` knows
-rather than inventing a second, conflicting list.
+**The universe is resolved, never frozen.** Combined Integration publishes the
+twelve tracked symbols - both crypto pairs and the ten equities - as
+`execution.models.TRADABLE_SYMBOLS`, and that is what this module now finds.
+It is discovered through the same documented probe list as any other location
+rather than copied here, so the harness widens and narrows with the system it
+audits; the crypto-only `SUPPORTED_SYMBOLS` remains the last-resort fallback,
+so an older build still resolves to what it actually knows rather than to a
+second, conflicting list.
 """
 
 from __future__ import annotations
@@ -47,6 +49,12 @@ UNIVERSE_SOURCES: tuple[tuple[str, str], ...] = (
     ("autotrader.universe", "TRACKED_UNIVERSE"),
     ("autotrader.universe", "SUPPORTED_SYMBOLS"),
     ("autotrader.config", "TRACKED_UNIVERSE"),
+    # Where Combined Integration actually publishes it: the union of both
+    # books, which is the same tuple an `OrderIntent` is validated against and
+    # the same one a full-universe reconciliation must cover to clear the
+    # shared account halt. Probed rather than copied, so the harness cannot
+    # hold a stale twelfth symbol the system has stopped trading.
+    ("autotrader.execution.models", "TRADABLE_SYMBOLS"),
 )
 
 #: Characters a symbol may contain. Permissive on purpose: `BTC/USD` today,
