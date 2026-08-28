@@ -8,32 +8,35 @@ hours only.
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Crypto V0.2 integrated; Equity V0.2 component-complete and not activated
+## Status: combined integration complete, awaiting the combined paper smoke
 
-**Crypto V0.2** trades BTC/USD and ETH/USD on 15-minute bars, 24/7, with Phase
-8 and Phase 9 integrated. Its next gate is the integrated paper smoke.
+**Two products, two runtimes, one Alpaca paper account.** Crypto (BTC/USD,
+ETH/USD, 24/7) and equities (ten symbols, regular US market hours) run as two
+separate processes against one account and one SQLite database. They keep their
+own schedules, their own order semantics and their own process locks, and they
+share the things that belong to the account rather than to either of them:
 
-**Equity V0.2** is component-complete: ten symbols, 15-minute bars, regular US
-market hours only, whole shares, Alpaca paper. It has been exercised read-only
-against the real paper account and has submitted **no** stock order. Combined
-crypto+equity activation is a separate phase and is **not** enabled - see
-[Equity V0.2](#equity-v02) below.
+| Shared | Not shared |
+| --- | --- |
+| Account safety - one halt, either service can raise it | Runtime process lock - one per service, so both run at once |
+| Total exposure under the one 30% account cap | Order semantics - fractional GTC crypto, whole-share DAY equity |
+| The order-decision path, serialized by an account execution lock | Schedule - 24/7 UTC boundaries against regular-session bars |
+| The UTC-day risk baseline | Bar checkpoints - per symbol, restart safety stays independent |
+| The API budget, across both processes | Market data - crypto feed against IEX |
+| Reconciliation, over all twelve tracked symbols | |
 
-**Current active version: Crypto V0.2.** The system trades BTC/USD and ETH/USD
-only, on 15-minute bars, 24 hours a day and 7 days a week.
+**The rule that makes them one system:** `UNKNOWN FROM ANY ASSET = NO NEW
+ORDERS FROM ANY ASSET`. An ambiguous submission raised by the equity service
+halts the crypto service too - durably, across processes and across restarts -
+and only a full-universe reconciliation can clear it. Not time passing, not a
+restart, and not either runtime deciding locally that it feels fine.
 
-**Phase 8 and Phase 9 are integrated.** The runtime wakes on completed
-15-minute UTC boundaries, fetches, validates, evaluates the strategy, records
-signals and logs a heartbeat - and before any of that, it reconciles local
-state against the paper broker and refuses to submit unless that pass reports
-`safe_to_trade`. A process that assumed its local view survived the last
-shutdown is how a duplicate position gets created, so the runtime asks the
-broker instead of assuming.
-
-**No integrated paper BUY has been observed end to end yet.** The integration
-is green offline and has been exercised read-only against the real paper
-account; the smoke gate that actually places one order is the next step, and
-nothing is deployed before it.
+**No paper order has been observed end to end, and the equity book has never
+submitted one at all.** The combined system is green offline and has been
+exercised read-only against the real paper account - reconciliation, both
+runtimes with `--once --observe-only`, and the dashboard against real data -
+with **zero** orders submitted. The combined paper smoke gate is the next step,
+and nothing is deployed before it.
 
 **Archived milestone: Equity V0.1** is preserved at the Git tag
 [`equity-v0.1-phase7`](#the-archived-equity-milestone). It was a complete,
@@ -47,9 +50,10 @@ What exists today: downloading historical 15-minute crypto bars from Alpaca's
 US crypto feed as Parquet, validating a stored dataset, the EMA 20 / EMA 50
 signal generator, a deterministic backtester with fractional positions and a
 modelled taker fee, a deterministic risk engine, a local SQLite
-operational-state database at schema v5, a single deliberately awkward
-paper-order command, a crash-recovery reconciliation command, and the 24/7
-runtime that drives all of it on a schedule. Validation never downloads or
+operational-state database at schema v6, a single deliberately awkward
+paper-order command, a full-universe crash-recovery reconciliation command, the
+24/7 crypto runtime and the regular-session equity runtime that drive it on a
+schedule, and a read-only operations dashboard. Validation never downloads or
 repairs data; the strategy emits signals only; the backtester is local
 arithmetic; the risk engine is a pure calculator that persists nothing; and the
 database stores records without deciding anything.
@@ -89,29 +93,31 @@ on a runtime `PAPER` confirmation - all three, on every start. See
 
 | | |
 | --- | --- |
-| Asset class | Crypto spot only |
-| Broker | Alpaca only |
+| Asset classes | Crypto spot, and US equities (cash) |
+| Broker | Alpaca only - **one** paper account for both books |
 | Execution | Alpaca paper trading only - live is unreachable |
-| Universe | BTC/USD, ETH/USD |
+| Crypto universe | BTC/USD, ETH/USD - 24/7, GTC market, fractional |
+| Equity universe | SPY QQQ IWM AAPL MSFT NVDA AMZN GOOGL META TSLA - regular session, DAY market, whole shares |
 | Quote currency | USD only |
-| Timeframe | 15-minute bars |
-| Operation | 24 hours / 7 days |
+| Timeframe | 15-minute bars, both products |
+| Processes | Two runtimes, two runtime locks, one shared account execution lock |
 | Direction | Long only |
 | Leverage / shorting | None |
-| Research strategy | EMA 20 / EMA 50 crossover (engineering validation only) |
+| Research strategy | EMA 20 / EMA 50 crossover, identical parameters across all twelve symbols (engineering validation only) |
+| Risk | 5% per symbol, 30% total account exposure, 2% UTC daily loss. **No per-book cap.** |
 | Historical storage | Parquet |
-| Operational state | SQLite, local file, schema v5 |
-| Quantities | Fractional, `decimal.Decimal` |
-| Startup authority | Reconciliation `safe_to_trade` - no green result, no order |
-| Duplicate protection | OS process lock + durable per-symbol bar checkpoints |
+| Operational state | SQLite, local file, schema v6 |
+| Startup authority | Full-universe reconciliation `safe_to_trade` - no green result, no order |
+| Account authority | One durable halt: UNKNOWN from any asset stops every asset |
+| Duplicate protection | OS process locks + durable per-symbol bar checkpoints |
 | Safety preference | At-most-once: miss a trade rather than duplicate one |
-| Interface | Python CLI, local process - no web frontend |
+| Interface | Python CLI, local processes, plus a read-only local dashboard |
 
 Out of scope: live trading, options, futures, forex, perpetual futures, non-USD
-quote currencies, equities outside the ten named below, shorting, leverage,
-margin, multiple brokers, ML/LLM signal generation, web or mobile frontends,
-cloud deployment - and simultaneous autonomous crypto+equity execution, which
-is a Combined Integration decision this milestone deliberately does not make.
+quote currencies, equities outside the ten named above, shorting, leverage,
+margin, multiple brokers, ML/LLM signal generation, mobile frontends, cloud
+deployment - and **per-book allocation limits**, which have not been approved
+and are not implemented.
 
 **[docs/SPEC.md](docs/SPEC.md) is the authoritative scope document.** Read it
 before extending this project; it takes precedence over any chat history.
@@ -184,6 +190,33 @@ Show CLI help:
 ```bash
 python -m autotrader.cli --help
 ```
+
+### Running the combined system
+
+Two processes against one account and one database. Reconcile first, then start
+each service; the order between the two services does not matter, because they
+take different runtime locks and serialize only where they must.
+
+```bash
+python -m autotrader.cli reconcile
+```
+
+```bash
+python -m autotrader.cli crypto-run --confirm-paper-runtime PAPER
+```
+
+```bash
+python -m autotrader.cli equity-run --confirm-paper-runtime PAPER
+```
+
+Each runtime reconciles the whole account itself at startup, so the standalone
+`reconcile` above is diagnostics rather than a prerequisite. Drop
+`--confirm-paper-runtime` - or add `--observe-only` - and the process runs the
+full loop and submits nothing.
+
+If either service records an ambiguous submission, **both stop submitting.**
+The halt is durable, so restarting does not clear it; a full-universe
+`reconcile` that resolves the ambiguity does.
 
 Download historical crypto bars:
 
@@ -1284,11 +1317,168 @@ shared API budget, a distributed rate limiter, deployment artefacts, and any
 real equity paper submission. Those seams are wired up in Combined Integration
 below.
 
-## The operations dashboard
+## Combined integration
+
+Everything above describes two products. This section is about the one account
+they share, and it exists because **crypto safety and equity safety cannot be
+independent when a single brokerage account holds both books.**
+
+### The shared account layer
+
+`src/autotrader/account/` holds exactly what the two products cannot own
+separately, and nothing else. No module in it submits, cancels, or replaces an
+order, and none of them contacts a broker at all - they are the constraints an
+order passes through, not a path an order travels down.
+
+### One halt, either service can raise it
+
+An ambiguous submission - a lost reply, a `504`, a response that cannot be read
+or stored - has always marked the intent `UNKNOWN` and paused the runtime that
+hit it. On one account that is no longer enough. While an order of unknown
+status exists, the account's true position and true exposure are both unknown,
+and *every* number the other runtime would size against is derived from them.
+
+So the halt is durable and account-wide. It is written to
+`account_safety_state` in the same transaction that marks the intent `UNKNOWN`,
+which means an ambiguous intent without a halt beside it is not a state that
+can exist. It carries the `client_order_id` an operator needs to ask the broker
+what actually happened.
+
+**Only a full-universe reconciliation clears it.** A pass that is not
+`safe_to_trade` halts the account whatever it covered. A safe pass over all
+twelve tracked symbols clears it. A safe pass over *fewer* symbols leaves the
+state exactly as it found it - it can neither vouch for a book it did not read
+nor report a problem it did not find. A database whose safety row has never
+been written reports `UNSAFE_RECONCILIATION`, because "nobody has checked" is
+not "we checked and it is fine".
+
+Observation is never gated. A dry run and `--observe-only` keep working while
+the account is halted, which is precisely when an operator needs them.
+
+### One exposure figure, and no per-book cap
+
+The risk engine is unchanged: **5% per symbol, 30% total, 2% UTC daily loss.**
+`RiskContext.total_exposure` was already summed over every position the account
+holds, so the arithmetic was right before this phase; what it needed was
+serialization.
+
+Crypto 18% plus equity 9% is 27% of one 30% budget, with 3% left. It is **not**
+12% for crypto and 21% for equity. There is **no per-book allocation**, none
+was invented here, and a "crypto 20% / equity 20%" split would be a *loosening*
+of the account cap rather than a tightening of it. The dashboard shows the
+crypto/equity split as a display breakdown and labels it as one.
+
+### The account execution lock
+
+The two runtime locks stay separate files, so the services run simultaneously -
+that is unchanged and is the point. What is added is a third, account-scoped
+`fcntl` lock, held across the order-decision path only:
+
+```
+acquire the shared account execution lock
+  -> verify the durable account safety state
+  -> charge the API budget for this section's calls
+  -> read the broker account, read every position
+  -> build the GLOBAL RiskContext, evaluate risk, persist the decision
+  -> persist the durable OrderIntent and its client_order_id
+  -> duplicate preflight
+  -> submit exactly once
+  -> persist the broker snapshot
+release
+```
+
+It is **not** held across the fifteen-minute wait, the market-data fetch, or
+the strategy evaluation. Unlike the runtime lock it *blocks*, with a bounded
+timeout: contention here is the normal case rather than an operator error, and
+a wait that could not be bounded could outlive the bar its decision belongs to.
+A lock that cannot be taken in time fails the action closed rather than sending
+the order late.
+
+The race it closes is concrete. 28% of the account is used; both runtimes wake
+with a signal; each reads 2% of headroom and each sizes into it; the account
+ends at 32%. Serialized, the second caller reads the exposure the first one
+consumed and is rejected or re-sized by the existing risk contract.
+
+### One daily baseline
+
+One account, one UTC-day baseline. `ON CONFLICT DO NOTHING` inside a
+`BEGIN IMMEDIATE` transaction behind a primary key means two processes making
+the first observation of a day agree on one value, and the loser's figure is
+discarded rather than overwriting the winner's.
+
+### The shared API budget
+
+Two processes, one set of credentials. **Two counters, not one**, because the
+execution boundary builds one client against the paper *trading* host and a
+separate one against the *market data* host - different hosts, different
+subscriptions, different allowances. Metering a bar fetch against a trading
+allowance would be a limit this system invented rather than observed.
+
+The ceilings are explicitly **this system's own** conservative numbers, derived
+from its own worst realistic cycle with better than two times headroom. They
+are a runaway detector - against retry storms, parallel bursts, and a loop
+making calls it was never designed to make - and **not** a transcription of a
+published provider rate limit, which this repository does not claim to know.
+
+A window that cannot accommodate an action **refuses** it. Nothing sleeps,
+queues, or grants the call later: a strategy signal belongs to the completed
+bar that produced it, and submitting it minutes afterwards because a token
+freed up would be sending a stale decision. Storage is SQLite - no Redis, no
+Kafka, no Celery, no external rate-limit service.
+
+### Full-universe reconciliation
+
+One pass, twelve symbols: BTC/USD, ETH/USD, SPY, QQQ, IWM, AAPL, MSFT, NVDA,
+AMZN, GOOGL, META, TSLA. Order intents were never filtered by the universe, so
+an ambiguous equity order already blocked the crypto runner; what changes is
+that positions are covered too, and that a pass records which symbols it saw,
+so partial coverage is visible rather than merely smaller. Repeated passes stay
+idempotent: `REPAIRED`, then `CLEAN`.
+
+Both runtimes reconcile the whole account at startup, not just their own book -
+each sizes against total exposure, and only a full-universe pass may clear the
+shared halt.
+
+### What combined integration deliberately does not do
+
+Per-book allocation limits, live trading, deployment, and any real equity paper
+order. The combined system has been exercised read-only against the real paper
+account and has submitted **zero** orders.
+
+## The operations dashboard (V0.2)
 
 A read-only web view of the system: is it healthy, is reconciliation clean, is
 trading allowed, what is held, what happened recently, how much risk is used,
 are the runtimes and checkpoints current, and does anything need a person.
+
+**V0.2 shows the combined system**, with the same visual language as V0.1 and
+no redesign:
+
+* **Two runtime cards**, crypto and equity, side by side. They are told apart
+  by real durable evidence - each service writes its own lifecycle event types
+  and claims bars only for its own symbols - and never by guesswork. What is
+  deliberately *not* split is the strategy run: both services open one under
+  the same strategy name, so attributing one to a service would be a guess.
+* **A shared account safety strip** above them, because "may anything trade?"
+  outranks either service's answer to "am I running?". When the account is
+  halted it shows the state, who set it, and the unresolved `client_order_id`;
+  when it is safe it is one quiet line.
+* **An exposure breakdown** - crypto, equity, total - inside the risk card.
+  It is a breakdown of the one enforced number, and it is built so it cannot be
+  misread as two limits: only the total row carries a cap, and only the total
+  row gets a bar.
+* **The shared API budget**, two compact rows, counted across both processes,
+  labelled as this system's own ceiling rather than a provider limit.
+* **The header reflects the account halt.** An `UNSAFE_UNKNOWN` state - an
+  order whose broker outcome is unresolved - makes the whole page `PAUSED`.
+  `UNSAFE_RECONCILIATION` is `ATTENTION` instead: it is the ordinary state of a
+  system that has not reconciled yet, and giving it the loud colour would make
+  the loud colour mean less.
+
+The last failure event is reported **once, on the page** rather than on each
+runtime card: the events this system records are account-level and are not
+tagged with a service, so printing one on both cards would attribute an equity
+problem to the crypto runtime half the time.
 
 It is **structurally incapable of trading.** There is no `POST`, `PUT`,
 `PATCH`, or `DELETE` route anywhere in `src/autotrader/dashboard`, so there is
@@ -1414,16 +1604,19 @@ src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals - one strategy,
 src/autotrader/backtest/    deterministic next-bar-open backtester, fractional
                             quantities, modelled taker fee
 src/autotrader/risk/        deterministic risk decisions and sizing
-src/autotrader/state/       local SQLite operational state, schema v5
+src/autotrader/state/       local SQLite operational state, schema v6
 src/autotrader/execution/   Alpaca PAPER execution - the only place a trading
                             client exists or an order is sent. `paper.py` is
                             crypto (fractional, GTC); `equity.py` is equities
                             (whole shares, DAY, regular hours) and holds the
                             broker session calendar
+src/autotrader/account/     the shared account layer - the durable
+                            account-wide halt, the account execution lock, and
+                            the shared API budget. Nothing here trades
 src/autotrader/reconciliation/
                             crash recovery: broker truth -> local state, and
-                            the safe_to_trade startup answer, scoped by
-                            position universe
+                            the safe_to_trade startup answer, over the full
+                            twelve-symbol universe by default
 src/autotrader/runtime/     shared runtime machinery - durable per-symbol bar
                             checkpoints, the process lock, startup safety, the
                             heartbeat - plus the 24/7 crypto loop and its UTC
@@ -1446,10 +1639,12 @@ docs/SPEC.md                authoritative scope specification
 
 ## What comes next
 
-**The integrated crypto paper smoke gate.** The crypto integration is
-code-complete, green offline, and has been exercised read-only against the real
-paper account. What has not happened is an integrated paper BUY observed end to
-end. That is next.
+**The combined paper smoke gate.** The combined system is code-complete, green
+offline, and has been exercised read-only against the real paper account -
+full-universe reconciliation, both runtimes with `--once --observe-only`, and
+the dashboard against real data, with zero orders submitted. What has not
+happened is a paper order observed end to end, and the equity book has never
+submitted one at all. That is next, and it is a separate gate.
 
 **Failure injection** is done. `tests/test_failure_injection.py` breaks the
 system at each point in the claim/intent/submit chain - process death, lost
@@ -1460,12 +1655,17 @@ against a real broker means placing real orders at moments chosen to be
 unrecoverable. Every protection it covers was mutation-checked by removing the
 protection and confirming the tests fail.
 
-**Combined Integration** connects the two products on the one account: shared
-account-level safety and combined exposure, account execution serialization, a
-shared API budget, the full-universe reconciliation scope, and dashboard V0.2.
-Equity V0.2 provides the seams and does not turn any of it on. Its own first
-real paper order has not been submitted either, and that gate belongs to that
-phase.
+**Combined integration** is done and is described above. The four protections
+it adds were mutation-checked the same way: removing the account execution lock
+fails the exposure race test, ignoring the durable halt fails the cross-asset
+tests, narrowing the reconciliation universe fails the reconciliation tests,
+and adding a write route fails the dashboard read-only guard.
 
-**Phase 10 - Deployment** comes after those. Supervising a process whose first
-integrated paper order has not been observed would be premature.
+**Per-book allocation limits** are *not* approved and *not* implemented. If a
+crypto/equity split is ever wanted it is a policy decision, and it belongs in
+`docs/SPEC.md` before it belongs in code.
+
+**Phase 10 - Deployment** comes after the combined paper smoke: systemd units,
+container images, supervision, and an authentication layer in front of the
+dashboard API, which today has none and binds loopback only. Supervising a
+process whose first paper order has not been observed would be premature.

@@ -62,8 +62,11 @@ from autotrader.dashboard.models import (
     UNAVAILABLE_BROKER_UNREADABLE,
     UNAVAILABLE_DATABASE_UNREADABLE,
     UNAVAILABLE_NOT_RECORDED,
+    Overview,
+    RuntimePanel,
 )
 from autotrader.dashboard.service import build_overview, read_state
+from autotrader.execution.models import TRADABLE_SYMBOLS
 from autotrader.state.sqlite import (
     INTENT_STATUS_REJECTED,
     INTENT_STATUS_SUBMITTED,
@@ -86,6 +89,7 @@ from autotrader.state.sqlite import (
     upsert_position,
     upsert_runtime_checkpoint,
 )
+from conftest import establish_account_safety
 
 NOW = datetime(2026, 3, 4, 12, 20, 7, tzinfo=UTC)
 BTC = "BTC/USD"
@@ -283,6 +287,15 @@ def populated(database_path: Path) -> Path:
             mode="PAPER",
             started_at=NOW - timedelta(hours=2),
         )
+        # The crypto runtime records this on every start, and it is what tells
+        # the two services apart in a table they share. Without it the panel
+        # cannot know a restart happened.
+        record_system_event(
+            connection,
+            event_timestamp=NOW - timedelta(hours=2),
+            event_type="RUNTIME_STARTED",
+            message="Crypto runtime started.",
+        )
         upsert_position(
             connection,
             symbol=BTC,
@@ -337,10 +350,14 @@ def populated(database_path: Path) -> Path:
             status=RECONCILIATION_STATUS_CLEAN,
             safe_to_trade=True,
             orders_checked=1,
-            positions_checked=2,
+            positions_checked=len(TRADABLE_SYMBOLS),
             issues_count=0,
             unresolved_count=0,
         )
+        # A real full-universe pass writes the shared account safety row beside
+        # its audit row; a database with one and not the other is not a state
+        # any pass leaves behind.
+        establish_account_safety(connection)
         ensure_daily_risk_baseline(
             connection,
             risk_date_utc=NOW.date(),
@@ -606,7 +623,7 @@ def test_a_broker_with_nothing_open_reports_the_tracked_symbols_flat(populated: 
 
     assert panel.source == SOURCE_BROKER
     assert panel.rows == ()
-    assert set(panel.flat_symbols) == {BTC, ETH}
+    assert set(panel.flat_symbols) == set(TRADABLE_SYMBOLS)
 
 
 def test_an_equity_symbol_classifies_without_an_equity_implementation(populated: Path) -> None:
@@ -749,7 +766,7 @@ def test_reconciliation_is_quoted_from_the_stored_run(populated: Path) -> None:
     assert panel.status == RECONCILIATION_STATUS_CLEAN
     assert panel.safe_to_trade is True
     assert panel.orders_checked == 1
-    assert panel.positions_checked == 2
+    assert panel.positions_checked == len(TRADABLE_SYMBOLS) == 12
     assert panel.unresolved == 0
     assert panel.repairs == 0
 
@@ -831,13 +848,20 @@ def test_a_failed_reconciliation_also_pauses_the_page(populated: Path) -> None:
 # ==========================================================================
 
 
-def test_runtime_state_is_derived_from_the_durable_trail(populated: Path) -> None:
-    panel = overview(populated).runtime
-    assert panel is not None
+def runtime_named(page: Overview, key: str) -> RuntimePanel:
+    """The panel for one service. There are two of them now."""
+    panel = next((item for item in page.runtimes if item.key == key), None)
+    assert panel is not None, f"no {key} runtime panel"
+    return panel
 
+
+def test_runtime_state_is_derived_from_the_durable_trail(populated: Path) -> None:
+    page = overview(populated)
+    panel = runtime_named(page, "crypto")
+
+    assert panel.label == "Crypto runtime"
     assert panel.state == "RUNNING"
-    assert panel.strategy_name == "EMA20 / EMA50"
-    assert panel.mode == "PAPER"
+    assert panel.started_at == (NOW - timedelta(hours=2)).isoformat()
     assert panel.startup_safety == "SAFE"
     assert panel.last_cycle_at == (NOW - timedelta(minutes=5)).isoformat()
     assert {checkpoint.symbol for checkpoint in panel.checkpoints} == {BTC, ETH}
@@ -847,8 +871,7 @@ def test_runtime_state_is_derived_from_the_durable_trail(populated: Path) -> Non
 def test_the_next_cycle_is_the_real_schedule_not_a_guess(populated: Path) -> None:
     """12:20:07 UTC falls in the 12:15 bar, so the next wake is 12:30 plus the
     provider-lag allowance the runtime itself uses."""
-    panel = overview(populated).runtime
-    assert panel is not None
+    panel = runtime_named(overview(populated), "crypto")
 
     assert panel.next_cycle_at == datetime(2026, 3, 4, 12, 30, 5, tzinfo=UTC).isoformat()
 
@@ -864,8 +887,7 @@ def test_a_runtime_that_stopped_claiming_bars_is_stale_not_running(populated: Pa
             )
 
     page = overview(populated, broker_ok())
-    panel = page.runtime
-    assert panel is not None
+    panel = runtime_named(page, "crypto")
 
     assert panel.state == "STALE"
     assert all(checkpoint.stale is True for checkpoint in panel.checkpoints)
@@ -883,13 +905,14 @@ def test_a_recorded_trading_pause_outranks_an_open_strategy_run(populated: Path)
         )
 
     page = overview(populated, broker_ok())
-    panel = page.runtime
-    assert panel is not None
+    panel = runtime_named(page, "crypto")
 
     assert panel.state == "PAUSED"
     assert page.system_state == SYSTEM_PAUSED
-    assert panel.last_error is not None
-    assert panel.last_error_at == (NOW - timedelta(minutes=1)).isoformat()
+    # The failure event is account-level, not per-service, so it is reported
+    # once on the page rather than on each runtime card.
+    assert page.last_failure is not None
+    assert page.last_failure_at == (NOW - timedelta(minutes=1)).isoformat()
 
 
 def test_a_pause_from_before_the_current_run_does_not_pause_it(populated: Path) -> None:
@@ -902,15 +925,13 @@ def test_a_pause_from_before_the_current_run_does_not_pause_it(populated: Path) 
             message="An older process paused, and then was restarted.",
         )
 
-    panel = overview(populated, broker_ok()).runtime
-    assert panel is not None
+    panel = runtime_named(overview(populated, broker_ok()), "crypto")
 
     assert panel.state == "RUNNING"
 
 
 def test_a_database_with_no_strategy_run_reports_never_started(database_path: Path) -> None:
-    panel = overview(database_path).runtime
-    assert panel is not None
+    panel = runtime_named(overview(database_path), "crypto")
 
     assert panel.state == "NEVER STARTED"
     assert panel.checkpoints == ()
@@ -922,13 +943,11 @@ def test_the_paper_execution_gate_is_reported_as_the_environment_sets_it(
     populated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("AUTOTRADER_PAPER_TRADING_ENABLED", "true")
-    enabled = overview(populated).runtime
-    assert enabled is not None
+    enabled = runtime_named(overview(populated), "crypto")
     assert enabled.paper_execution_enabled is True
 
     monkeypatch.setenv("AUTOTRADER_PAPER_TRADING_ENABLED", "TRUE")
-    typo = overview(populated).runtime
-    assert typo is not None
+    typo = runtime_named(overview(populated), "crypto")
     assert typo.paper_execution_enabled is False
 
 
@@ -1019,8 +1038,7 @@ def test_an_unreadable_database_degrades_every_panel_honestly(tmp_path: Path) ->
     assert page.orders.unavailable_reason == UNAVAILABLE_DATABASE_UNREADABLE
     assert page.reconciliation is not None
     assert page.reconciliation.available is False
-    assert page.runtime is not None
-    assert page.runtime.state == "UNAVAILABLE"
+    assert page.runtimes and all(panel.state == "UNAVAILABLE" for panel in page.runtimes)
     safety = next(row for row in page.health if row.key == "trading_safety")
     assert safety.status == "UNKNOWN"
 
@@ -1170,7 +1188,9 @@ def test_the_overview_route_serializes_the_whole_page(client: TestClient) -> Non
         "orders",
         "health",
         "reconciliation",
-        "runtime",
+        "runtimes",
+        "account_safety",
+        "api_budget",
         "risk",
     }
     assert payload["environment"] == "PAPER"

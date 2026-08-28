@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 from autotrader.equity import EQUITY_SYMBOLS
-from autotrader.execution.models import SUPPORTED_SYMBOLS
+from autotrader.execution.models import SUPPORTED_SYMBOLS, TRADABLE_SYMBOLS
 from autotrader.reconciliation import (
     ItemOutcome,
     ReconciliationInputError,
@@ -109,13 +109,34 @@ def test_an_equity_pass_observes_a_crypto_holding_without_touching_it(
     assert get_position(connection, "BTC/USD") is None
 
 
-def test_the_crypto_default_is_unchanged_and_observes_an_equity_holding(
+def test_the_default_universe_is_every_tracked_symbol(
     connection: sqlite3.Connection,
 ) -> None:
-    """CRITICAL: the existing pass behaves exactly as it did."""
+    """CRITICAL: an unscoped pass is account-wide, not crypto-only.
+
+    Equity V0.2 shipped with the crypto pairs as the default so that merging it
+    changed no existing caller. Combined integration is where that default has
+    to move: one account holds both books, and a pass that looked at two of
+    twelve symbols cannot say the account is understood. An equity holding is
+    now *reconciled* rather than merely observed as out-of-universe.
+    """
     client = FakeTradingClient(positions=[make_position(symbol="SPY", qty="7")])
 
     result = run(connection, client)
+
+    assert result.positions_checked == len(TRADABLE_SYMBOLS) == 12
+    assert set(result.symbols) == set(TRADABLE_SYMBOLS)
+    stored = get_position(connection, "SPY")
+    assert stored is not None and stored.quantity == Decimal(7)
+
+
+def test_a_narrow_pass_still_only_observes_a_holding_outside_it(
+    connection: sqlite3.Connection,
+) -> None:
+    """A caller that scopes the pass gets exactly what it scoped, unchanged."""
+    client = FakeTradingClient(positions=[make_position(symbol="SPY", qty="7")])
+
+    result = run(connection, client, symbols=SUPPORTED_SYMBOLS)
 
     assert result.positions_checked == len(SUPPORTED_SYMBOLS) == 2
     observed = [issue for issue in result.issues if issue.outcome is ItemOutcome.OBSERVED]

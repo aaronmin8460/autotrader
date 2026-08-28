@@ -222,21 +222,25 @@ Phase 2  Data Validation                   <- done, migrated to crypto (C2)
 Phase 3  Strategy                          <- done, unchanged by the pivot (C3)
 Phase 4  Backtesting                       <- done, migrated to crypto (C4)
 Phase 5  Risk Engine                       <- done, migrated to crypto (C5)
-Phase 6  SQLite Operational State          <- done, schema v5 (C6 + C8 + C9)
+Phase 6  SQLite Operational State          <- done, schema v6 (C6 + C8 + C9 + CI1)
 Phase 7  Alpaca Paper Trading              <- done, migrated to crypto (C7)
 --- Crypto Pivot V0.2 complete ---
 Phase 8  Reconciliation / Crash Recovery   <- done (C8)
 Phase 9  24/7 Runtime / Monitoring         <- done (C9)
 --- Phase 8 + Phase 9 integrated (schema v5) ---
 Equity   Equity V0.2                       <- component-complete (E1)
-Phase 10 Deployment                        <- after the integrated paper smoke
+C10      Failure injection / hardening     <- done (C10)
+Dash     Read-only operations dashboard    <- done, V0.2 (CI1)
+CI1      Combined integration              <- done, schema v6 (CI1)
+Phase 10 Deployment                        <- after the combined paper smoke
 ```
 
 Equity V0.2 is a parallel product rather than a later phase of the crypto one.
-It is **component-complete and integration-ready**, and it is deliberately not
-activated alongside crypto: shared account-level risk, combined exposure, a
-shared API budget, the final reconciliation scope and the V0.2 dashboard belong
-to a separate Combined Integration phase (section 9, E1).
+Combined Integration (section 9, CI1) is where the two are connected on the one
+account: shared account safety, combined exposure, account execution
+serialization, the full-universe reconciliation scope, a shared API budget, and
+dashboard V0.2. Both products remain **paper only**, and the equity book has
+still submitted no order.
 
 ---
 
@@ -858,6 +862,8 @@ that at the source level.
 | `reconciliation_runs` | What one finished reconciliation pass concluded (v4) | `status` in `CLEAN`/`REPAIRED`/`UNRESOLVED`/`FAILED`; `safe_to_trade` in `(0, 1)`; counts `>= 0`; `completed_at >= started_at` |
 | `reconciliation_events` | Which order or position a pass repaired, observed, or could not settle (v4) | one run reference; `category` in `ORDER`/`POSITION`/`RUN`; `outcome` in the four statuses plus `OBSERVED`; `detail` non-empty |
 | `runtime_checkpoints` | The newest completed bar a runtime durably claimed, per symbol (v5) | `symbol` PRIMARY KEY; `last_processed_bar_timestamp` non-empty; monotonic - an older claim updates nothing |
+| `account_safety_state` | The one durable answer to whether **any** service may submit (v6) | single row pinned by `CHECK (id = 1)`; `state` in `SAFE`/`UNSAFE_UNKNOWN`/`UNSAFE_RECONCILIATION`; `reason` and `source` non-empty; `client_order_id` carries the recovery anchor for an ambiguous halt |
+| `api_budget_windows` | API calls this system made, per budget per window, across both runtimes (v6) | `(budget, window_start)` PRIMARY KEY; `budget` in `TRADING`/`MARKET_DATA`; `call_count >= 0` |
 
 **Exact decimal quantities.** Every broker-critical quantity column -
 `positions.quantity`, `order_intents.requested_quantity`,
@@ -896,9 +902,9 @@ running continuously, makes the first observation land near the boundary.
 This is a **persistence primitive only**. Nothing here schedules anything,
 watches a clock, or decides when an observation should happen.
 
-**Schema migration (v1 -> v2 -> v3 -> v4 -> v5).** A new database is created
-directly at v5. An older one is upgraded through an explicit ordered path, in a single
-transaction; SQLite's DDL is transactional, so a failure anywhere rolls back to
+**Schema migration (v1 -> v2 -> v3 -> v4 -> v5 -> v6).** A new database is
+created directly at v6. An older one is upgraded through an explicit ordered
+path, in a single transaction; SQLite's DDL is transactional, so a failure anywhere rolls back to
 the original version rather than leaving a half-applied state.
 
 v1 -> v2 is additive. **v2 -> v3 is a rebuild**: SQLite cannot retype a column,
@@ -939,8 +945,19 @@ which is the correct starting state rather than an omission: a checkpoint
 claims that some process already acted on a bar, and backfilling one from
 `signals` would invent a claim this schema never recorded as claimed.
 
+**v5 -> v6 is purely additive too.** Two new tables, `account_safety_state`
+and `api_budget_windows`, and nothing else; the same byte-identical assertion
+covers it. Both start **empty**, and that is deliberate rather than an
+omission: an absent safety row means no reconciliation has ever established
+that this account's broker truth is understood, and `read_account_safety_state`
+reports `UNSAFE_RECONCILIATION` for it. Writing `SAFE` there would be a
+migration asserting something it never checked, about an account it has never
+read - which is the one claim a migration must never invent. The startup
+reconciliation every runtime already runs is what turns it green.
+
 A database written by a **newer** version is refused and left untouched; one
-older than v1 has no path and is refused too.
+older than v1 has no path and is refused too. WAL and foreign keys survive
+every step.
 
 **No CLI.** There is no `db-init`, `db-shell`, or migration command.
 
@@ -1700,25 +1717,165 @@ another.
 
 **Deliberately not done here.** Combined crypto+equity activation, shared
 account-level risk arithmetic, combined exposure limits, per-book allocations
-(a "crypto 20% / stocks 20%" split is a Combined Integration decision and is
-*not* frozen here), a shared API budget, a distributed rate limiter, a
-dashboard, deployment artefacts, and any real equity paper submission. Equity
-V0.2 has been exercised read-only against the real paper account and has
-submitted **no** stock order.
+(a "crypto 20% / stocks 20%" split would be a Combined Integration decision and
+is *not* frozen here), a shared API budget, a distributed rate limiter,
+deployment artefacts, and any real equity paper submission. Equity V0.2 has been
+exercised read-only against the real paper account and has submitted **no**
+stock order. Everything in that list except the per-book split and deployment is
+built in CI1 below.
+
+### CI1 - Combined integration (complete, not activated)
+
+Two products, two runtimes, two processes - and **one Alpaca paper account.**
+That last fact is the whole phase: crypto safety and equity safety cannot be
+independent when a single account holds both books.
+
+| | |
+| --- | --- |
+| Crypto | BTC/USD, ETH/USD, 24/7, 15m, GTC market, fractional |
+| Equity | SPY QQQ IWM AAPL MSFT NVDA AMZN GOOGL META TSLA, regular session, 15m, DAY market, whole shares |
+| Account | one Alpaca **paper** account, one SQLite file, schema v6 |
+| Runtimes | two processes, two runtime locks, one shared account execution lock |
+| Risk | unchanged: 5% per symbol, 30% total, 2% UTC daily loss. **No per-book cap.** |
+| Dashboard | V0.2, read-only, GET-only |
+| Status | Code-complete, green offline, read-only checked. **No equity paper order has been submitted.** |
+
+**The shared account layer.** `autotrader.account` holds exactly what the two
+products cannot own separately, and nothing else. No module in it submits,
+cancels, or replaces an order, and none contacts a broker.
+
+*Global account safety* (`account_safety_state`, one row). The rule is
+`UNKNOWN FROM ANY ASSET = NO NEW ORDERS FROM ANY ASSET`. An ambiguous
+submission raised by either product records `UNSAFE_UNKNOWN` together with the
+`client_order_id` that anchors the recovery, in the same transaction that marks
+the intent `UNKNOWN` - so an ambiguous intent without a halt beside it is not a
+state that can exist. Both runtimes already paused themselves in-process; that
+is kept and is not sufficient, because an in-process pause cannot cross a
+process boundary or survive a restart.
+
+*Only reconciliation clears it, and only a full-universe pass.* Time passing
+clears nothing, a restart clears nothing, and neither runtime can override the
+shared answer locally. A pass that is not `safe_to_trade` halts the account
+whatever it covered; a safe pass over all twelve symbols clears it; a safe pass
+over *fewer* symbols leaves the state exactly as it found it, because it can
+neither vouch for a book it did not read nor report a problem it did not find.
+A database whose `account_safety_state` has no row reports
+`UNSAFE_RECONCILIATION` - "nobody has checked" is not "we checked and it is
+fine", and only one of those may open a gate.
+
+*The account execution lock.* The two runtime locks stay separate files, so the
+services run simultaneously; that is unchanged. What is added is a third,
+account-scoped `fcntl` lock held across the order-decision path only:
+
+    acquire the shared account execution lock
+    -> verify the durable account safety state
+    -> charge the API budget for this section's calls
+    -> read the broker account, read every position
+    -> build the GLOBAL RiskContext, evaluate risk, persist the decision
+    -> persist the durable OrderIntent and its client_order_id
+    -> duplicate preflight
+    -> submit exactly once
+    -> persist the broker snapshot
+    -> release
+
+It is **not** held across the fifteen-minute wait, the market-data fetch, or
+the strategy evaluation. Unlike the runtime lock it *blocks*, with a bounded
+timeout: contention here is the normal case rather than an operator error, and
+a wait that could not be bounded could outlive the bar its decision belongs to.
+A lock that cannot be taken in time fails the action closed.
+
+The race it closes is concrete. 28% of the account is used; both runtimes wake
+with a signal; each reads 2% of headroom and each sizes into it; the account
+ends at 32%. Serialized, the second caller reads the exposure the first one
+consumed and is rejected or re-sized by the existing risk contract - which one
+depends on the arithmetic, and both are correct.
+
+**Global risk is unchanged.** 5% per symbol, 30% total, 2% UTC daily loss, and
+`RiskContext.total_exposure` was already summed over *every* position the
+account holds rather than one product's. Crypto 18% + equity 9% is 27% of one
+30% budget with 3% left - not 12% and 21%. **No per-book allocation exists and
+none was invented here**; a "crypto 20% / equity 20%" split would be a
+loosening of the account cap, not a tightening, and it has not been approved.
+
+**One daily baseline.** One account, one UTC-day baseline. `ON CONFLICT DO
+NOTHING` inside a `BEGIN IMMEDIATE` transaction behind a primary key means two
+processes making the first observation of a day agree on one value; the loser's
+figure is discarded rather than overwriting the winner's.
+
+**Full-universe reconciliation.** `reconcile_paper_state` now defaults to all
+twelve tracked symbols instead of the two crypto pairs, and every entry point -
+`reconcile`, `crypto-run`, `equity-run` - uses that default. Order intents were
+never filtered by the universe, so an ambiguous *equity* order already blocked
+the crypto runner; what changes is that positions are too, and that a pass now
+records which symbols it covered so partial coverage is visible rather than
+merely smaller. Repeated passes remain idempotent: `REPAIRED`, then `CLEAN`.
+
+**The shared API budget.** Two processes, one set of credentials. Two counters,
+not one, because the execution boundary builds one client against the paper
+*trading* host and a separate one against the *market data* host - different
+hosts, different subscriptions, different allowances, and metering a bar fetch
+against a trading allowance would be a limit this system invented rather than
+observed. The ceilings are explicitly **this system's own** conservative
+numbers, derived from its own worst realistic cycle with better than 2x
+headroom - they are a runaway detector, not a transcription of a published
+provider rate limit, which this repository does not claim to know.
+
+A window that cannot accommodate an action **refuses** it. Nothing sleeps,
+queues, or grants a call later: a strategy signal belongs to the completed bar
+that produced it, and submitting one minutes afterwards because a token freed
+up would be sending a stale decision. Storage is SQLite. No Redis, no Kafka, no
+Celery, no external rate-limit service.
+
+**Schema v6**, additive: `account_safety_state` and `api_budget_windows`. No
+existing table is touched, no column widened, no row rewritten; every order
+intent, broker order, risk event, daily baseline, runtime checkpoint,
+reconciliation run and strategy run is carried across untouched. Both tables
+start **empty**, which is why a migrated database reports
+`UNSAFE_RECONCILIATION` rather than `SAFE`: the migration has never read the
+broker and must not assert what it did not check. The upgrade is one
+transaction, rolls back whole on failure, preserves WAL and foreign keys, and a
+future schema version is still refused rather than downgraded.
+
+**Checkpoints are unchanged.** All twelve symbols share `runtime_checkpoints`,
+keyed by symbol, so `SPY` and `BTC/USD` cannot collide and moving one claim
+cannot touch another. Crypto and equity restart safety stay independent, and
+the claim still commits before a bar can reach a strategy.
+
+**Both product contracts survive.** Crypto keeps fractional Decimal quantities,
+GTC market orders, the $10 USD minimum notional, 24/7 scheduling and no session
+logic. Equity keeps whole shares floored, DAY market orders, no extended hours,
+the broker calendar, holidays, early closes, regular-session-only cycles, the
+latest-completed-bar rule and its own runtime lock. Every C10 hardening
+guarantee is intact: no non-durable intent submits, no non-durable checkpoint
+trades, an unreadable or unstorable reply is `UNKNOWN`, nothing is retried,
+nothing is replaced, a locked database fails closed, a partial fill stays
+partial, and recovery is reconciliation-driven.
+
+**Deliberately not done here.** Per-book allocation limits, live trading,
+deployment, and any real equity paper order. The combined system has been
+exercised read-only against the real paper account and has submitted **zero**
+orders.
 
 ### Later phases
 
-**The integrated crypto paper smoke gate.** The integration is code-complete and
-green offline, and the runtime has been exercised read-only against the real
-paper account. What has **not** happened is an integrated paper BUY observed end
-to end. That is the next gate, and nothing is deployed before it.
+**The combined paper smoke gate.** The combined system is code-complete, green
+offline, and has been exercised read-only against the real paper account -
+full-universe reconciliation, `crypto-run --once --observe-only`,
+`equity-run --once --observe-only`, and the dashboard against real data, with
+**zero** orders submitted. What has **not** happened is a paper order observed
+end to end, and the equity book has never submitted one at all. That is the next
+gate, and nothing is deployed before it.
 
 **Failure injection** is complete and is described in C10 above. It is offline
 rather than against the real paper account, for the reason stated there:
 reproducing a lost reply or a mid-write crash at the broker means placing real
 orders at moments chosen to be unrecoverable.
 
+**Per-book allocation limits.** Not approved, not implemented, and not implied
+by the dashboard's exposure breakdown. If a crypto/equity split is ever wanted
+it is a policy decision that belongs in this document first.
+
 **Phase 10 - Deployment.** Systemd units, container images, host provisioning,
-and supervision. Deliberately after the integrated paper smoke gate and failure
-injection: there is no point supervising a process whose first real paper order
-has not yet been observed end to end.
+supervision, and an authentication layer in front of the dashboard API.
+Deliberately after the combined paper smoke gate: there is no point supervising
+a process whose first real paper order has not yet been observed end to end.

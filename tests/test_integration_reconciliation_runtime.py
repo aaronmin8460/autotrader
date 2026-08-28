@@ -80,6 +80,7 @@ from autotrader.state.sqlite import (
     list_system_events,
     upsert_position,
 )
+from conftest import establish_account_safety
 from test_reconciliation import (
     BROKER_ORDER_UUID,
     FakeTradingClient,
@@ -141,7 +142,18 @@ def paper_gate(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def database_path(tmp_path: Path) -> Path:
-    return initialize_database(tmp_path / "state.db")
+    """A database a real reconciliation pass has already vouched for.
+
+    Cases here hand the runtime a *synthesized* `StartupSafetyResult` rather
+    than running a pass, which is what makes them fast and deterministic - but
+    it means nothing writes the durable account safety row that a real pass
+    writes. Establishing it here puts the account where a genuinely reconciled
+    one starts. The cases that are about the halt still create it themselves.
+    """
+    path = initialize_database(tmp_path / "state.db")
+    with connect(path) as setup:
+        establish_account_safety(setup)
+    return path
 
 
 @pytest.fixture

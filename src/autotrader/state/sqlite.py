@@ -1,4 +1,4 @@
-"""The local SQLite operational-state store (schema v4).
+"""The local SQLite operational-state store (schema v6).
 
 This module is **persistence infrastructure and nothing else**. It opens a
 local SQLite database, creates a small fixed schema, and stores a handful of
@@ -34,6 +34,15 @@ intent vocabulary - which is a CHECK constraint, hence a table rebuild. Second,
 a reconciliation run has to leave evidence, so `reconciliation_runs` and
 `reconciliation_events` record when a run happened, what it concluded, whether
 trading was allowed afterwards, and which order or position it touched.
+
+**What v6 changed, and why.** One brokerage account now carries two runtimes -
+crypto and equity - as two separate processes, and two facts they must agree on
+had nowhere durable to live. First, `account_safety_state`: an ambiguous
+submission raised by *either* process has to stop the *other* one, and an
+in-process pause cannot cross a process boundary or survive a restart. Second,
+`api_budget_windows`: two processes sharing one set of provider credentials
+each assuming the whole call allowance is theirs is how a retry storm starts.
+Both are additive - one new table each, no existing table touched.
 
 **What is still deliberately absent.** There is no `fills`, `executions`, or
 `broker_accounts` table. Order-level `filled_quantity` carries everything
@@ -72,10 +81,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 #: The schema this module understands. There is no migration *framework*, but
-#: there is an explicit ordered upgrade path - v1 -> v2 -> v3 -> v4 -> v5 -
+#: there is an explicit ordered upgrade path - v1 -> v2 -> v3 -> v4 -> v5 -> v6 -
 #: applied in a single transaction by `initialize_database`. A database written
 #: by a **newer** version is refused, never downgraded.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 #: The oldest on-disk version this module can still open. Anything below it
 #: predates the migration path and is refused rather than guessed at.
@@ -106,6 +115,8 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "reconciliation_runs",
     "reconciliation_events",
     "runtime_checkpoints",
+    "account_safety_state",
+    "api_budget_windows",
 )
 
 #: The tables v2 added on top of v1. Kept separate so the v1 -> v2 migration
@@ -122,6 +133,12 @@ V4_TABLES: tuple[str, ...] = ("reconciliation_runs", "reconciliation_events")
 #: that survives a process restart. Phase 9's checkpoint was in-process only,
 #: which cannot stop a restart from replaying the bar it already acted on.
 V5_TABLES: tuple[str, ...] = ("runtime_checkpoints",)
+
+#: The tables v6 adds on top of v5, both of them shared-account coordination
+#: between the crypto and equity runtimes. Neither is a second copy of broker
+#: state: `account_safety_state` records this system's own halt, and
+#: `api_budget_windows` records this system's own request accounting.
+V6_TABLES: tuple[str, ...] = ("account_safety_state", "api_budget_windows")
 
 #: Transient names the v2 -> v3 rebuild parks the old tables under. They exist
 #: only inside the migration transaction and are dropped before it commits, so
@@ -232,6 +249,44 @@ RECONCILIATION_OUTCOMES: tuple[str, ...] = (
 
 #: The one persisted timestamp form. Fixed width, so text ordering is also
 #: chronological ordering.
+#: The durable account-level safety vocabulary (schema v6).
+#:
+#: There is one brokerage account, so there is one answer to "may anything
+#: submit a new order right now?" - and it is shared by every process pointed at
+#: this database rather than held in each one's memory.
+#:
+#: `SAFE`                    a full-universe reconciliation established that
+#:                           broker truth is understood. New orders permitted.
+#: `UNSAFE_UNKNOWN`          some submission's outcome is unknown. An order may
+#:                           exist at the broker that nothing here can account
+#:                           for, so **no** process may submit anything.
+#: `UNSAFE_RECONCILIATION`   reconciliation has not established safety - it has
+#:                           never run, it failed, or it left something
+#:                           unresolved.
+#:
+#: Both unsafe states stop new orders identically. They are kept distinct
+#: because they call for different operator responses, and because an operator
+#: reading a status line needs to know whether an order is loose at the broker.
+ACCOUNT_SAFETY_SAFE = "SAFE"
+ACCOUNT_SAFETY_UNSAFE_UNKNOWN = "UNSAFE_UNKNOWN"
+ACCOUNT_SAFETY_UNSAFE_RECONCILIATION = "UNSAFE_RECONCILIATION"
+
+ACCOUNT_SAFETY_STATES: tuple[str, ...] = (
+    ACCOUNT_SAFETY_SAFE,
+    ACCOUNT_SAFETY_UNSAFE_UNKNOWN,
+    ACCOUNT_SAFETY_UNSAFE_RECONCILIATION,
+)
+
+#: The two API budgets this system meters, kept apart because the provider
+#: serves them from different hosts behind different plans. Combining them
+#: would make a market-data read spend a trading allowance, which is a limit
+#: this system would have invented rather than observed. What the ceilings
+#: actually are is policy and lives in `autotrader.account.budget`.
+API_BUDGET_TRADING = "TRADING"
+API_BUDGET_MARKET_DATA = "MARKET_DATA"
+
+API_BUDGETS: tuple[str, ...] = (API_BUDGET_TRADING, API_BUDGET_MARKET_DATA)
+
 TIMESTAMP_FORMAT = "YYYY-MM-DDTHH:MM:SS.ffffff+00:00"
 
 
@@ -737,6 +792,59 @@ class RuntimeCheckpoint:
     updated_at: datetime
 
 
+@dataclass(frozen=True)
+class AccountSafetyState:
+    """The one durable answer to "may anything submit a new order right now?".
+
+    One brokerage account, one row, one answer, shared by every process pointed
+    at this database. `safe_to_trade` is the whole decision; `state`, `reason` and
+    `source` exist so an operator can tell an ambiguous order from an
+    unfinished reconciliation without reading source.
+
+    `client_order_id` is the recovery anchor when an ambiguous submission
+    caused the halt: it names the exact key to ask the broker about. It is
+    None for every other cause.
+
+    `established` is False for the synthetic value returned when the table has
+    no row at all - a database in which no reconciliation has ever established
+    safety. That value is unsafe, which is the honest reading of "nobody has
+    ever checked" and the same default the startup gate already takes.
+    """
+
+    state: str
+    reason: str
+    source: str
+    client_order_id: str | None
+    updated_at: datetime | None
+    established: bool = True
+
+    def __post_init__(self) -> None:
+        if self.state not in ACCOUNT_SAFETY_STATES:
+            raise StateInputError(
+                f"state must be one of {', '.join(ACCOUNT_SAFETY_STATES)}, got {self.state!r}."
+            )
+
+    @property
+    def safe_to_trade(self) -> bool:
+        """Whether any process may submit a new order. Read this, not `state`."""
+        return self.state == ACCOUNT_SAFETY_SAFE
+
+
+@dataclass(frozen=True)
+class ApiBudgetWindow:
+    """How many API calls one budget has spent inside one window.
+
+    A count this system made of its own calls, not a figure read back from a
+    provider. `window_start` is the canonical UTC text of the window's opening
+    instant, so two processes bucketing the same moment land on the same row.
+    """
+
+    budget: str
+    window_start: datetime
+    call_count: int
+    updated_at: datetime
+
+
 # --------------------------------------------------------------------------
 # Schema
 # --------------------------------------------------------------------------
@@ -1026,6 +1134,45 @@ _CREATE_RUNTIME_CHECKPOINTS = """
     )
     """
 
+# --------------------------------------------------------------------------
+# Shared-account coordination (schema v6)
+#
+# Two runtimes, two processes, one brokerage account. Everything above this
+# point is state one process owns; these two tables are state both processes
+# read and write, and both are shaped so the database itself enforces the
+# property rather than trusting a caller to.
+#
+# `account_safety_state` is a **single row**, pinned by `CHECK (id = 1)`. A
+# second row would be a second answer to a question that has exactly one, and
+# the two processes could then each read their own.
+#
+# `api_budget_windows` is keyed by (budget, window_start), so two processes
+# counting into the same window necessarily count into the same row.
+# --------------------------------------------------------------------------
+
+_CREATE_ACCOUNT_SAFETY_STATE = """
+    CREATE TABLE account_safety_state (
+        id              INTEGER PRIMARY KEY CHECK (id = 1),
+        state           TEXT NOT NULL CHECK (
+            state IN ('SAFE', 'UNSAFE_UNKNOWN', 'UNSAFE_RECONCILIATION')
+        ),
+        reason          TEXT NOT NULL CHECK (reason <> ''),
+        source          TEXT NOT NULL CHECK (source <> ''),
+        client_order_id TEXT,
+        updated_at      TEXT NOT NULL
+    )
+    """
+
+_CREATE_API_BUDGET_WINDOWS = """
+    CREATE TABLE api_budget_windows (
+        budget        TEXT NOT NULL CHECK (budget IN ('TRADING', 'MARKET_DATA')),
+        window_start  TEXT NOT NULL CHECK (window_start <> ''),
+        call_count    INTEGER NOT NULL CHECK (call_count >= 0),
+        updated_at    TEXT NOT NULL,
+        PRIMARY KEY (budget, window_start)
+    )
+    """
+
 #: A fresh database is built directly from these, at `SCHEMA_VERSION`. It is
 #: never created at v1 and then migrated forward.
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
@@ -1041,6 +1188,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     _CREATE_RECONCILIATION_RUNS,
     _CREATE_RECONCILIATION_EVENTS,
     _CREATE_RUNTIME_CHECKPOINTS,
+    _CREATE_ACCOUNT_SAFETY_STATE,
+    _CREATE_API_BUDGET_WINDOWS,
     _CREATE_INDEX_SIGNALS,
     _CREATE_INDEX_RISK_EVENTS,
     _CREATE_INDEX_ORDER_INTENTS_STATUS,
@@ -1462,15 +1611,52 @@ def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
     connection.execute(_CREATE_RUNTIME_CHECKPOINTS)
 
 
+def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
+    """Add the two shared-account coordination tables.
+
+    Purely additive, exactly like v4 -> v5: two new tables, no existing table
+    touched, no column widened, no row rewritten. Every order intent, broker
+    snapshot, risk event, daily baseline, runtime checkpoint and reconciliation
+    run is carried across untouched because nothing here reads or writes them.
+
+    **Both tables start empty, and that is the safe starting state rather than
+    an omission.** An absent `account_safety_state` row means no reconciliation
+    has ever established that this account's broker truth is understood, and
+    `read_account_safety_state` reports exactly that - `UNSAFE_RECONCILIATION`
+    - rather than defaulting to safe. Writing a `SAFE` row here would be this
+    migration asserting something it did not check, on behalf of an account it
+    has never read, which is the one claim a migration must never invent. The
+    startup reconciliation every runtime already runs is what turns it green.
+
+    An empty `api_budget_windows` means no API call has been counted yet,
+    which is true of a database that has never metered one.
+
+    Runs inside the caller's transaction, so a failure anywhere in the upgrade
+    rolls both tables back with the rest of it.
+    """
+    existing = _existing_table_names(connection)
+    conflicting = sorted(table for table in V6_TABLES if table in existing)
+    if conflicting:
+        raise DatabaseStateError(
+            f"Cannot upgrade this database to schema version {SCHEMA_VERSION}: it "
+            f"already contains table(s) {', '.join(conflicting)}. Refusing to "
+            "migrate over an inconsistent database."
+        )
+
+    connection.execute(_CREATE_ACCOUNT_SAFETY_STATE)
+    connection.execute(_CREATE_API_BUDGET_WINDOWS)
+
+
 #: Each supported upgrade, in order: the version it produces and how to get
 #: there. `initialize_database` runs every step above the database's current
-#: version, in one transaction, so v1 -> v5 is v1 -> v2 -> v3 -> v4 -> v5 and
-#: never a separate shortcut path that could drift from any of them.
+#: version, in one transaction, so v1 -> v6 is v1 -> v2 -> v3 -> v4 -> v5 -> v6
+#: and never a separate shortcut path that could drift from any of them.
 _MIGRATIONS = (
     (2, _migrate_v1_to_v2),
     (3, _migrate_v2_to_v3),
     (4, _migrate_v3_to_v4),
     (5, _migrate_v4_to_v5),
+    (6, _migrate_v5_to_v6),
 )
 
 
@@ -2796,9 +2982,239 @@ def list_runtime_checkpoints(connection: sqlite3.Connection) -> list[RuntimeChec
     return [_to_runtime_checkpoint(row) for row in connection.execute(_SELECT_RUNTIME_CHECKPOINTS)]
 
 
+# --------------------------------------------------------------------------
+# Shared account safety (schema v6)
+#
+# Persistence only. This module stores the halt and reports it; it does not
+# decide when the account is unsafe, and it never clears the halt on its own.
+# `autotrader.account.safety` owns that policy, and `autotrader.reconciliation`
+# is the only thing allowed to conclude that the account is safe again.
+# --------------------------------------------------------------------------
+
+_UPSERT_ACCOUNT_SAFETY_STATE = """
+INSERT INTO account_safety_state (id, state, reason, source, client_order_id, updated_at)
+VALUES (1, ?, ?, ?, ?, ?)
+ON CONFLICT (id) DO UPDATE SET
+    state           = excluded.state,
+    reason          = excluded.reason,
+    source          = excluded.source,
+    client_order_id = excluded.client_order_id,
+    updated_at      = excluded.updated_at
+"""
+_SELECT_ACCOUNT_SAFETY_STATE = """
+SELECT state, reason, source, client_order_id, updated_at
+FROM account_safety_state WHERE id = 1
+"""
+
+#: What `read_account_safety_state` reports when the table holds no row.
+_NEVER_ESTABLISHED_REASON = (
+    "No reconciliation has ever established that this account's broker truth is "
+    "understood, so no process may submit an order yet. Run a full-universe "
+    "reconciliation."
+)
+
+
+def _to_account_safety_state(row: sqlite3.Row) -> AccountSafetyState:
+    return AccountSafetyState(
+        state=row["state"],
+        reason=row["reason"],
+        source=row["source"],
+        client_order_id=row["client_order_id"],
+        updated_at=from_utc_text(row["updated_at"]),
+    )
+
+
+def set_account_safety_state(
+    connection: sqlite3.Connection,
+    *,
+    account_state: str,
+    reason: str,
+    source: str,
+    updated_at: datetime,
+    client_order_id: str | None = None,
+) -> AccountSafetyState:
+    """Write the account's durable safety answer, replacing whatever was there.
+
+    **Committed before it returns**, for the same reason the bar claim is: a
+    halt that is still inside an open transaction is invisible to the other
+    process, which is precisely the process it exists to stop. A second
+    connection can read it the instant this returns.
+
+    This is the storage primitive and it enforces no policy - it will write
+    `SAFE` if asked to. The rule that only a full-universe reconciliation may
+    write `SAFE` lives in `autotrader.account.safety`, which is the only caller
+    that does.
+    """
+    chosen = _require_choice(account_state, "account_state", ACCOUNT_SAFETY_STATES)
+    reason_text = _require_text(reason, "reason")
+    source_text = _require_text(source, "source")
+    anchor = _optional_text(client_order_id, "client_order_id")
+    updated_text = to_utc_text(updated_at, "updated_at")
+    with transaction(connection):
+        connection.execute(
+            _UPSERT_ACCOUNT_SAFETY_STATE,
+            (chosen, reason_text, source_text, anchor, updated_text),
+        )
+    return AccountSafetyState(
+        state=chosen,
+        reason=reason_text,
+        source=source_text,
+        client_order_id=anchor,
+        updated_at=updated_at,
+    )
+
+
+def read_account_safety_state(connection: sqlite3.Connection) -> AccountSafetyState:
+    """The account's durable safety answer. Never None, never optimistic.
+
+    A database with no row has never had safety established, and this reports
+    `UNSAFE_RECONCILIATION` for it rather than `SAFE`. That is the difference
+    between "we checked and it is fine" and "nobody has checked", and only one
+    of them may open a gate.
+    """
+    row = connection.execute(_SELECT_ACCOUNT_SAFETY_STATE).fetchone()
+    if row is None:
+        return AccountSafetyState(
+            state=ACCOUNT_SAFETY_UNSAFE_RECONCILIATION,
+            reason=_NEVER_ESTABLISHED_REASON,
+            source="never-established",
+            client_order_id=None,
+            updated_at=None,
+            established=False,
+        )
+    return _to_account_safety_state(row)
+
+
+# --------------------------------------------------------------------------
+# Shared API budget (schema v6)
+#
+# Call accounting for two processes sharing one set of provider credentials.
+# This module counts; it holds no opinion about how many calls are too many and
+# never refuses one on its own judgement. `autotrader.account.budget` owns the
+# ceiling and is what decides the number passed in as `limit`.
+# --------------------------------------------------------------------------
+
+_CONSUME_API_BUDGET = """
+INSERT INTO api_budget_windows (budget, window_start, call_count, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (budget, window_start) DO UPDATE SET
+    call_count = api_budget_windows.call_count + excluded.call_count,
+    updated_at = excluded.updated_at
+WHERE api_budget_windows.call_count + excluded.call_count <= ?
+"""
+_SELECT_API_BUDGET_WINDOW = """
+SELECT budget, window_start, call_count, updated_at
+FROM api_budget_windows WHERE budget = ? AND window_start = ?
+"""
+_DELETE_API_BUDGET_WINDOWS_BEFORE = "DELETE FROM api_budget_windows WHERE window_start < ?"
+
+
+def _to_api_budget_window(row: sqlite3.Row) -> ApiBudgetWindow:
+    return ApiBudgetWindow(
+        budget=row["budget"],
+        window_start=from_utc_text(row["window_start"]),
+        call_count=int(row["call_count"]),
+        updated_at=from_utc_text(row["updated_at"]),
+    )
+
+
+def consume_api_budget(
+    connection: sqlite3.Connection,
+    *,
+    budget: str,
+    window_start: datetime,
+    calls: int,
+    limit: int,
+    updated_at: datetime,
+) -> tuple[bool, ApiBudgetWindow | None]:
+    """Spend `calls` from one budget window if - and only if - they fit.
+
+    Returns `(granted, window)`. `granted` is False when the spend would take
+    the window past `limit`, and **nothing is written** in that case: this is a
+    refusal, not a deferral. Nothing here sleeps, queues, or promises to grant
+    the call later.
+
+    **The check and the increment are one statement**, inside one immediate
+    transaction, so two processes racing on the last token of a window cannot
+    both read the old count and both decide it fits. The `WHERE` clause on the
+    upsert is where the limit is enforced; a caller comparing counts itself
+    would have exactly the read-then-write race this exists to close.
+
+    The `INSERT` half needs no guard because it only fires for a window with no
+    row yet, and a caller asking for more than `limit` in one go on a fresh
+    window is refused by the explicit check above rather than by SQL.
+    """
+    chosen = _require_choice(budget, "budget", API_BUDGETS)
+    if calls < 1:
+        raise StateInputError(f"calls must be at least 1, got {calls}.")
+    if limit < 0:
+        raise StateInputError(f"limit must not be negative, got {limit}.")
+    window_text = to_utc_text(window_start, "window_start")
+    updated_text = to_utc_text(updated_at, "updated_at")
+    if calls > limit:
+        return False, _current_api_budget_window(connection, chosen, window_text)
+    with transaction(connection):
+        before = connection.execute(_SELECT_API_BUDGET_WINDOW, (chosen, window_text)).fetchone()
+        spent = 0 if before is None else int(before["call_count"])
+        connection.execute(
+            _CONSUME_API_BUDGET,
+            (chosen, window_text, calls, updated_text, limit),
+        )
+        row = connection.execute(_SELECT_API_BUDGET_WINDOW, (chosen, window_text)).fetchone()
+    if row is None:  # pragma: no cover - the insert above always leaves a row
+        return False, None
+    window = _to_api_budget_window(row)
+    # The spend either landed in full or not at all, so the count says which.
+    # Comparing counts rather than the written timestamp keeps this correct when
+    # two grants in one window share a clock reading.
+    return window.call_count == spent + calls, window
+
+
+def _current_api_budget_window(
+    connection: sqlite3.Connection, budget: str, window_text: str
+) -> ApiBudgetWindow | None:
+    row = connection.execute(_SELECT_API_BUDGET_WINDOW, (budget, window_text)).fetchone()
+    return None if row is None else _to_api_budget_window(row)
+
+
+def get_api_budget_window(
+    connection: sqlite3.Connection, *, budget: str, window_start: datetime
+) -> ApiBudgetWindow | None:
+    """One budget window's spend, or None when nothing has been counted in it."""
+    chosen = _require_choice(budget, "budget", API_BUDGETS)
+    return _current_api_budget_window(connection, chosen, to_utc_text(window_start, "window_start"))
+
+
+def prune_api_budget_windows(connection: sqlite3.Connection, *, before: datetime) -> int:
+    """Drop closed windows older than `before`. Returns how many rows went.
+
+    Housekeeping only: a window that has closed can never be spent again, so
+    its row is history nobody reads. Nothing about the current window's
+    accounting depends on this having run.
+    """
+    cutoff = to_utc_text(before, "before")
+    with transaction(connection):
+        cursor = connection.execute(_DELETE_API_BUDGET_WINDOWS_BEFORE, (cutoff,))
+        return int(cursor.rowcount or 0)
+
+
 __all__ = [
+    "ACCOUNT_SAFETY_SAFE",
+    "ACCOUNT_SAFETY_STATES",
+    "ACCOUNT_SAFETY_UNSAFE_RECONCILIATION",
+    "ACCOUNT_SAFETY_UNSAFE_UNKNOWN",
+    "API_BUDGETS",
+    "API_BUDGET_MARKET_DATA",
+    "API_BUDGET_TRADING",
+    "AccountSafetyState",
+    "ApiBudgetWindow",
     "BUSY_TIMEOUT_MS",
     "DEFAULT_DATABASE_PATH",
+    "DailyRiskBaseline",
+    "DatabaseStateError",
+    "DuplicateBrokerOrderError",
+    "DuplicateOrderIntentError",
+    "DuplicateSignalError",
     "INTENT_STATUS_CONFIRMED_NOT_SUBMITTED",
     "INTENT_STATUS_CREATED",
     "INTENT_STATUS_REJECTED",
@@ -2808,6 +3224,7 @@ __all__ = [
     "MIN_MIGRATABLE_SCHEMA_VERSION",
     "ORDER_INTENT_STATUSES",
     "ORDER_SIDES",
+    "Position",
     "RECONCILIATION_CATEGORIES",
     "RECONCILIATION_OUTCOMES",
     "RECONCILIATION_STATUSES",
@@ -2821,25 +3238,12 @@ __all__ = [
     "RUN_STATUS_COMPLETED",
     "RUN_STATUS_FAILED",
     "RUN_STATUS_RUNNING",
-    "SCHEMA_VERSION",
-    "SIGNAL_TYPES",
-    "TERMINAL_INTENT_STATUSES",
-    "TERMINAL_RUN_STATUSES",
-    "TIMESTAMP_FORMAT",
-    "V2_TABLES",
-    "V3_TABLES",
-    "V4_TABLES",
-    "V5_TABLES",
-    "DailyRiskBaseline",
-    "DatabaseStateError",
-    "DuplicateBrokerOrderError",
-    "DuplicateOrderIntentError",
-    "DuplicateSignalError",
-    "Position",
     "ReconciliationEvent",
     "ReconciliationRun",
-    "RuntimeCheckpoint",
     "RiskEvent",
+    "RuntimeCheckpoint",
+    "SCHEMA_VERSION",
+    "SIGNAL_TYPES",
     "StateError",
     "StateInputError",
     "StoredBrokerOrder",
@@ -2847,16 +3251,25 @@ __all__ = [
     "StoredSignal",
     "StrategyRun",
     "SystemEvent",
+    "TERMINAL_INTENT_STATUSES",
+    "TERMINAL_RUN_STATUSES",
+    "TIMESTAMP_FORMAT",
     "UnknownOrderIntentError",
     "UnknownReconciliationRunError",
     "UnknownStrategyRunError",
     "UnsupportedSchemaVersionError",
+    "V2_TABLES",
+    "V3_TABLES",
+    "V4_TABLES",
+    "V5_TABLES",
     "connect",
+    "consume_api_budget",
     "ensure_daily_risk_baseline",
     "finish_strategy_run",
     "from_decimal_text",
     "from_risk_date_text",
     "from_utc_text",
+    "get_api_budget_window",
     "get_broker_order_by_client_id",
     "get_broker_order_by_intent",
     "get_daily_risk_baseline",
@@ -2875,11 +3288,13 @@ __all__ = [
     "list_positions",
     "list_reconciliation_events",
     "list_reconciliation_runs",
-    "list_runtime_checkpoints",
     "list_risk_events",
+    "list_runtime_checkpoints",
     "list_signals",
     "list_strategy_runs",
     "list_system_events",
+    "prune_api_budget_windows",
+    "read_account_safety_state",
     "record_order_intent",
     "record_reconciliation_event",
     "record_reconciliation_run",
@@ -2887,6 +3302,7 @@ __all__ = [
     "record_signal",
     "record_strategy_run",
     "record_system_event",
+    "set_account_safety_state",
     "to_decimal_text",
     "to_risk_date_text",
     "to_utc_text",

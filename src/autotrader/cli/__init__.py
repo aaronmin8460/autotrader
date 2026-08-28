@@ -702,6 +702,12 @@ def reconcile(
     never by trading. That is why this command needs neither the environment
     gate nor a confirmation token: there is nothing here to confirm.
 
+    **The pass covers the whole account: all twelve tracked symbols**, both
+    crypto pairs and all ten equities, plus every order intent regardless of
+    which book created it. That scope is what lets it clear the shared account
+    safety halt - a pass over fewer symbols reports honestly on what it
+    covered, and is refused as evidence that the account is understood.
+
     `--dry-run` reports exactly the same findings and reconciles nothing into
     the database - no repair, no audit row. Run it first to see what a real
     pass would change. It does still *open* the database, which applies any
@@ -858,10 +864,14 @@ def crypto_run(
 
     \b
     Every start reconciles first, in this order:
-      1. acquire the single-instance runtime lock
+      1. acquire the single-instance crypto runtime lock - a different file
+         from the equity runner's, so the two services run side by side
       2. open the database and apply any pending migration
-      3. run reconciliation against the Alpaca PAPER account
-      4. CLEAN or REPAIRED -> safe to trade; UNRESOLVED or FAILED -> not
+      3. run a FULL-UNIVERSE reconciliation against the Alpaca PAPER account:
+         all twelve tracked symbols, both books, plus every order intent
+      4. CLEAN or REPAIRED over the whole universe -> the shared account
+         safety state becomes SAFE; anything else leaves it halted
+      5. safe_to_trade -> the crypto runtime starts
 
     Running `autotrader reconcile` beforehand is NOT required; that command
     remains available for diagnostics and manual repair.
@@ -871,11 +881,16 @@ def crypto_run(
       1. AUTOTRADER_PAPER_TRADING_ENABLED=true in the environment
       2. --confirm-paper-runtime PAPER on the command line
       3. startup reconciliation reporting that trading is safe
+      4. the shared account safety state being SAFE at the moment of submission
 
-    No environment variable and no flag combination bypasses the third. A start
-    that is not safe prints RECONCILIATION NOT SAFE - TRADING DISABLED, keeps
-    observing - fetching, validating, evaluating, recording, logging - and
-    submits nothing.
+    No environment variable and no flag combination bypasses the third or the
+    fourth. The fourth is account-wide and durable: an ambiguous submission
+    raised by the *equity* service halts this one too, across processes and
+    across restarts, and only a full-universe reconciliation clears it.
+
+    A start that is not safe prints RECONCILIATION NOT SAFE - TRADING DISABLED,
+    keeps observing - fetching, validating, evaluating, recording, logging -
+    and submits nothing.
 
     There is no live mode. `--observe-only` goes further than the gates and
     constructs no execution path at all; it still reports startup safety.
@@ -921,9 +936,12 @@ def crypto_run(
                 connection,
                 market_data=AlpacaCryptoBars(safety_delay=config.safety_delay),
                 execution=None if observe_only else PaperExecutionGateway(),
-                # The startup trading authority. Runs on every start, including
-                # `--observe-only`, because knowing whether local state survived
-                # is useful even when nothing could be submitted anyway.
+                # The startup trading authority, over the **whole account**:
+                # this process sizes against total exposure, which includes the
+                # equity book it does not trade, and only a full-universe pass
+                # may clear the shared account halt. Runs on every start,
+                # including `--observe-only`, because knowing whether local
+                # state survived is useful even when nothing could be submitted.
                 startup_safety=startup_safety_from_reconciliation(connection),
                 checkpoint=SqliteCheckpoint(connection),
                 config=config,
@@ -1176,9 +1194,13 @@ def equity_run(
          runner's, so the two services never block each other, while a second
          equity runner is still refused
       2. open the database and apply any pending migration
-      3. run reconciliation against the Alpaca PAPER account, over the ten
-         equity positions and every order intent the account holds
-      4. CLEAN or REPAIRED -> safe to trade; UNRESOLVED or FAILED -> not
+      3. run a FULL-UNIVERSE reconciliation against the Alpaca PAPER account:
+         all twelve tracked symbols, both books, plus every order intent. Not
+         just the ten equities - this process sizes against total account
+         exposure, which includes the crypto book, and only a full-universe
+         pass may clear the shared account halt
+      4. CLEAN or REPAIRED over the whole universe -> the shared account
+         safety state becomes SAFE; anything else leaves it halted
 
     \b
     Unattended paper execution requires ALL of:
@@ -1232,12 +1254,16 @@ def equity_run(
                 market_data=AlpacaEquityBars(calendar),
                 calendar=calendar,
                 execution=None if observe_only else PaperEquityExecutionGateway(),
-                # The startup trading authority, scoped to the ten equity
-                # positions this process manages. Order intents are reconciled
-                # in full regardless: one account, one client_order_id space.
-                startup_safety=startup_safety_from_reconciliation(
-                    connection, symbols=EQUITY_PROCESSING_ORDER
-                ),
+                # The startup trading authority, over the **whole account**
+                # rather than the ten positions this process manages. Two
+                # things make that necessary rather than merely tidy: only a
+                # full-universe pass can clear the shared account halt, so a
+                # ten-symbol pass could never let this runtime start after a
+                # crypto ambiguity; and this process sizes its orders against
+                # total account exposure, which includes the crypto book it
+                # does not trade. Order intents were always reconciled in full -
+                # one account, one client_order_id space.
+                startup_safety=startup_safety_from_reconciliation(connection),
                 checkpoint=SqliteCheckpoint(connection),
                 config=config,
                 shutdown=shutdown,

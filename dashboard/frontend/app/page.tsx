@@ -9,18 +9,24 @@
  * and the right column says whether the machinery underneath is healthy and
  * how much risk is in use.
  *
+ * Two runtimes now share one account, so the shared account-safety strip sits
+ * directly above them: it answers "may anything trade?", which outranks either
+ * service's answer to "am I running?". The two runtime cards sit side by side
+ * on a wide screen and stack below it.
+ *
  * There is no control on this page. No buy, no sell, no close, no start, no
  * stop, no editable limit - and no endpoint behind any of them, which is the
  * part that actually makes it safe.
  */
 
+import { AccountSafety } from "@/components/AccountSafety";
 import { Attention } from "@/components/Attention";
 import { Header } from "@/components/Header";
 import { Metrics } from "@/components/Metrics";
 import { Orders } from "@/components/Orders";
 import { Positions } from "@/components/Positions";
 import { Risk } from "@/components/Risk";
-import { Runtime } from "@/components/Runtime";
+import { Runtimes } from "@/components/Runtime";
 import { SystemHealth } from "@/components/SystemHealth";
 import { POLL_INTERVAL_MS, useOverview } from "@/lib/api";
 
@@ -84,8 +90,15 @@ export default function Page() {
               <div className="lg:col-span-4">
                 <Risk panel={data.risk} />
               </div>
-              <div className="lg:col-span-8">
-                <Runtime panel={data.runtime} generatedAt={data.generated_at} />
+              <div className="space-y-4 lg:col-span-8">
+                <AccountSafety
+                  panel={data.account_safety}
+                  budget={data.api_budget}
+                  lastFailure={data.last_failure}
+                  lastFailureAt={data.last_failure_at}
+                  generatedAt={data.generated_at}
+                />
+                <Runtimes panels={data.runtimes} generatedAt={data.generated_at} />
               </div>
             </div>
           </div>

@@ -68,6 +68,12 @@ from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.models import Asset
 from alpaca.trading.requests import GetCalendarRequest, MarketOrderRequest
 
+from autotrader.account.budget import (
+    EQUITY_EXECUTION_TRADING_CALLS,
+    EXECUTION_MARKET_DATA_CALLS,
+)
+from autotrader.account.execution import account_execution_section
+from autotrader.account.lock import AccountExecutionLock
 from autotrader.equity import EQUITY_SYMBOLS, EquityError, normalize_symbol
 from autotrader.equity.data import FEED, create_client
 from autotrader.equity.session import (
@@ -523,6 +529,7 @@ def execute_equity_paper_order(
     trading_enabled: bool = True,
     strategy_run_id: int | None = None,
     now: datetime | None = None,
+    account_lock: AccountExecutionLock | None = None,
 ) -> PaperExecutionResult:
     """Run the full paper execution pipeline for one equity order.
 
@@ -553,6 +560,16 @@ def execute_equity_paper_order(
     to chase. Steps 13 and 15 remain in that order for the opposite reason - a
     crash between them leaves a durable key Phase 8 can resolve.
 
+    The account read onwards runs inside the **account execution critical
+    section** shared with the crypto boundary: the account lock is taken, the
+    durable account-wide halt is verified, and this section's API budget is
+    charged, before the account is read. Two products cannot interleave between
+    reading free exposure and consuming it, and an ambiguous crypto order stops
+    this runtime exactly as an ambiguous equity one stops that one.
+    `account_lock` lets a long-lived runtime reuse one lock object; omitted, it
+    is derived from the connection's own database file. A dry run enters none of
+    it - it submits nothing, and observation must stay available while halted.
+
     The broker quantity is never more than `RiskDecision.approved_quantity`.
     Returns a `PaperExecutionResult`; expected operational failures raise an
     `ExecutionError` subclass rather than returning quietly.
@@ -568,140 +585,160 @@ def execute_equity_paper_order(
     client = trading_client if trading_client is not None else create_paper_trading_client()
     prices = data_client if data_client is not None else create_market_data_client()
 
-    account = fetch_paper_account_state(client)
-    require_tradable_account(account)
-    positions = fetch_paper_positions(client)
-    asset = fetch_equity_asset(client, ticker)
-    reference_price = fetch_reference_price(prices, ticker)
-
-    baseline_equity = resolve_daily_baseline_equity(connection, equity=account.equity, now=moment)
-    context = build_risk_context(
-        account,
-        positions,
-        ticker,
-        daily_baseline_equity=baseline_equity,
-        trading_enabled=trading_enabled,
-    )
-    decision = evaluate_risk(
-        RiskRequest(
-            symbol=ticker,
-            side=_to_risk_side(order_side),
-            reference_price=reference_price,
-            requested_quantity=quantity,
-        ),
-        context,
-    )
-
-    # Recorded from what the broker actually reports, before anything is
-    # submitted. An accepted order is not a fill, and inferring a position from
-    # one would be a fabrication.
-    held = positions.get(broker_symbol_key(ticker))
-    state.upsert_position(
+    # ------------------------------------------------------------------
+    # The account execution critical section - the same one the crypto
+    # boundary enters, for the same reason. One account holds both books,
+    # so the equity figure, the free exposure under the 30% cap, the durable
+    # halt and the client_order_id namespace are shared. Serializing here is
+    # what stops SPY and BTC/USD both sizing an order into the same
+    # headroom, and what makes an ambiguous crypto order stop this runtime.
+    #
+    # A dry run passes through unguarded: it submits nothing.
+    # ------------------------------------------------------------------
+    with account_execution_section(
         connection,
-        symbol=ticker,
-        quantity=held.quantity if held is not None else _ZERO,
-        average_price=held.average_entry_price if held is not None else None,
-        updated_at=moment,
-    )
-
-    state.record_risk_event(
-        connection,
-        event_timestamp=moment,
-        decision="APPROVED" if decision.approved else "REJECTED",
-        reason_code=decision.reason_code,
-        symbol=ticker,
-        message=decision.message,
-        strategy_run_id=strategy_run_id,
-    )
-
-    common: dict[str, object] = {
-        "symbol": ticker,
-        "side": order_side,
-        "requested_quantity": quantity,
-        "reference_price": reference_price,
-        "risk_decision": decision,
-        "account": account,
-        "daily_baseline_equity": baseline_equity,
-        # The equity asset carries no broker-published minimum, so there is no
-        # effective-minimum figure to report; the whole-share floor is this
-        # system's policy and is stated in the message when it bites.
-        "asset": None,
-        "effective_minimum_quantity": None,
-    }
-
-    if not decision.approved:
-        return PaperExecutionResult(
-            outcome=ExecutionOutcome.REJECTED_BY_RISK,
-            message=decision.message,
-            **common,  # type: ignore[arg-type]
-        )
-
-    share_quantity = normalize_share_quantity(decision.approved_quantity, asset.symbol)
-
-    intent = OrderIntent(
-        symbol=ticker,
-        side=order_side,
-        requested_quantity=quantity,
-        approved_quantity=share_quantity,
-        reference_price=reference_price,
-        risk_reason_code=decision.reason_code,
-        created_at=moment,
-        strategy_run_id=strategy_run_id,
-    )
-
-    if dry_run:
-        # Deliberately not persisted. No broker attempt will follow, so a row
-        # here would be an intent that never had a chance to become an order.
-        return PaperExecutionResult(
-            outcome=ExecutionOutcome.DRY_RUN,
-            message="Dry run: nothing was persisted and no order was submitted.",
-            intent=intent,
-            **common,  # type: ignore[arg-type]
-        )
-
-    require_market_open(client)
-
-    order_intent_id = state.record_order_intent(
-        connection,
-        client_order_id=intent.client_order_id,
-        created_at=intent.created_at,
-        symbol=intent.symbol,
-        side=intent.side.value,
-        requested_quantity=intent.requested_quantity,
-        approved_quantity=intent.approved_quantity,
-        reference_price=intent.reference_price,
-        risk_reason_code=intent.risk_reason_code,
-        strategy_run_id=strategy_run_id,
-        status=state.INTENT_STATUS_CREATED,
-    )
-
-    submission = submit_order_intent(
-        connection,
-        client,
-        intent,
-        order_intent_id,
         now=moment,
-        build_request=build_equity_market_order_request,
-    )
-    snapshot = submission.snapshot
-    prefix = (
-        "The broker already had an order under this client_order_id, so nothing was submitted"
-        if submission.duplicate
-        else "Paper equity order accepted"
-    )
-    return PaperExecutionResult(
-        outcome=(
-            ExecutionOutcome.DUPLICATE if submission.duplicate else ExecutionOutcome.SUBMITTED
-        ),
-        message=(
-            f"{prefix}: broker order {snapshot.broker_order_id}, status "
-            f"{snapshot.status}. Accepted is not filled."
-        ),
-        intent=intent,
-        order_intent_id=order_intent_id,
-        broker_order=snapshot,
-        **common,  # type: ignore[arg-type]
-    )
+        engaged=not dry_run,
+        trading_calls=EQUITY_EXECUTION_TRADING_CALLS,
+        market_data_calls=EXECUTION_MARKET_DATA_CALLS,
+        lock=account_lock,
+    ):
+        account = fetch_paper_account_state(client)
+        require_tradable_account(account)
+        positions = fetch_paper_positions(client)
+        asset = fetch_equity_asset(client, ticker)
+        reference_price = fetch_reference_price(prices, ticker)
+
+        baseline_equity = resolve_daily_baseline_equity(
+            connection, equity=account.equity, now=moment
+        )
+        context = build_risk_context(
+            account,
+            positions,
+            ticker,
+            daily_baseline_equity=baseline_equity,
+            trading_enabled=trading_enabled,
+        )
+        decision = evaluate_risk(
+            RiskRequest(
+                symbol=ticker,
+                side=_to_risk_side(order_side),
+                reference_price=reference_price,
+                requested_quantity=quantity,
+            ),
+            context,
+        )
+
+        # Recorded from what the broker actually reports, before anything is
+        # submitted. An accepted order is not a fill, and inferring a position from
+        # one would be a fabrication.
+        held = positions.get(broker_symbol_key(ticker))
+        state.upsert_position(
+            connection,
+            symbol=ticker,
+            quantity=held.quantity if held is not None else _ZERO,
+            average_price=held.average_entry_price if held is not None else None,
+            updated_at=moment,
+        )
+
+        state.record_risk_event(
+            connection,
+            event_timestamp=moment,
+            decision="APPROVED" if decision.approved else "REJECTED",
+            reason_code=decision.reason_code,
+            symbol=ticker,
+            message=decision.message,
+            strategy_run_id=strategy_run_id,
+        )
+
+        common: dict[str, object] = {
+            "symbol": ticker,
+            "side": order_side,
+            "requested_quantity": quantity,
+            "reference_price": reference_price,
+            "risk_decision": decision,
+            "account": account,
+            "daily_baseline_equity": baseline_equity,
+            # The equity asset carries no broker-published minimum, so there is no
+            # effective-minimum figure to report; the whole-share floor is this
+            # system's policy and is stated in the message when it bites.
+            "asset": None,
+            "effective_minimum_quantity": None,
+        }
+
+        if not decision.approved:
+            return PaperExecutionResult(
+                outcome=ExecutionOutcome.REJECTED_BY_RISK,
+                message=decision.message,
+                **common,  # type: ignore[arg-type]
+            )
+
+        share_quantity = normalize_share_quantity(decision.approved_quantity, asset.symbol)
+
+        intent = OrderIntent(
+            symbol=ticker,
+            side=order_side,
+            requested_quantity=quantity,
+            approved_quantity=share_quantity,
+            reference_price=reference_price,
+            risk_reason_code=decision.reason_code,
+            created_at=moment,
+            strategy_run_id=strategy_run_id,
+        )
+
+        if dry_run:
+            # Deliberately not persisted. No broker attempt will follow, so a row
+            # here would be an intent that never had a chance to become an order.
+            return PaperExecutionResult(
+                outcome=ExecutionOutcome.DRY_RUN,
+                message="Dry run: nothing was persisted and no order was submitted.",
+                intent=intent,
+                **common,  # type: ignore[arg-type]
+            )
+
+        require_market_open(client)
+
+        order_intent_id = state.record_order_intent(
+            connection,
+            client_order_id=intent.client_order_id,
+            created_at=intent.created_at,
+            symbol=intent.symbol,
+            side=intent.side.value,
+            requested_quantity=intent.requested_quantity,
+            approved_quantity=intent.approved_quantity,
+            reference_price=intent.reference_price,
+            risk_reason_code=intent.risk_reason_code,
+            strategy_run_id=strategy_run_id,
+            status=state.INTENT_STATUS_CREATED,
+        )
+
+        submission = submit_order_intent(
+            connection,
+            client,
+            intent,
+            order_intent_id,
+            now=moment,
+            build_request=build_equity_market_order_request,
+        )
+        snapshot = submission.snapshot
+        prefix = (
+            "The broker already had an order under this client_order_id, so nothing was submitted"
+            if submission.duplicate
+            else "Paper equity order accepted"
+        )
+        return PaperExecutionResult(
+            outcome=(
+                ExecutionOutcome.DUPLICATE if submission.duplicate else ExecutionOutcome.SUBMITTED
+            ),
+            message=(
+                f"{prefix}: broker order {snapshot.broker_order_id}, status "
+                f"{snapshot.status}. Accepted is not filled."
+            ),
+            intent=intent,
+            order_intent_id=order_intent_id,
+            broker_order=snapshot,
+            **common,  # type: ignore[arg-type]
+        )
 
 
 def equity_positions(

@@ -44,6 +44,7 @@ from typer.testing import CliRunner
 
 from autotrader import reconciliation
 from autotrader.cli import app
+from autotrader.execution.models import TRADABLE_SYMBOLS
 from autotrader.execution.paper import (
     PAPER_TRADING_BASE_URL,
     NotPaperEnvironmentError,
@@ -1125,7 +1126,7 @@ def test_btc_and_eth_are_reconciled_independently(connection: sqlite3.Connection
     eth = get_position(connection, ETH)
     assert btc is not None and btc.quantity == Decimal("0.0005")
     assert eth is not None and eth.quantity == Decimal(0)
-    assert result.positions_checked == 2
+    assert result.positions_checked == len(TRADABLE_SYMBOLS) == 12
 
 
 def test_a_fractional_position_quantity_round_trips_exactly(
@@ -1435,7 +1436,7 @@ def test_a_pass_records_what_it_concluded(connection: sqlite3.Connection) -> Non
     assert stored.status == "REPAIRED"
     assert stored.safe_to_trade is True
     assert stored.orders_checked == 1
-    assert stored.positions_checked == 2
+    assert stored.positions_checked == len(TRADABLE_SYMBOLS) == 12
     assert stored.issues_count == result.issues_count
     assert stored.unresolved_count == 0
     assert stored.started_at == T0

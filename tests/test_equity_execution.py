@@ -76,6 +76,7 @@ from autotrader.state.sqlite import (
     list_order_intents,
     list_positions,
 )
+from conftest import establish_account_safety
 
 SYMBOL = "SPY"
 REFERENCE_PRICE = 500.0
@@ -84,9 +85,16 @@ T0 = datetime(2026, 8, 26, 15, 0, tzinfo=UTC)
 
 @pytest.fixture
 def connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+    """A database in the state a running process actually submits from.
+
+    A live system reconciles the full universe at startup and only then
+    submits, so the execution boundary refuses to submit against an account
+    whose safety nothing has ever established.
+    """
     database = tmp_path / "state.db"
     initialize_database(database)
     with connect(database) as open_connection:
+        establish_account_safety(open_connection)
         yield open_connection
 
 

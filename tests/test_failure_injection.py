@@ -101,6 +101,7 @@ from autotrader.state.sqlite import (
     upsert_broker_order,
     upsert_position,
 )
+from conftest import establish_account_safety
 from test_execution_paper import FakeDataClient, api_error
 from test_execution_paper import FakeTradingClient as FakeBrokerClient
 from test_execution_paper import make_order as make_broker_order
@@ -161,7 +162,19 @@ def paper_gate(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def database_path(tmp_path: Path) -> Path:
-    return initialize_database(tmp_path / "state.db")
+    """A database in the state a running process actually submits from.
+
+    A live system reconciles the full universe at startup and only then
+    submits, so the execution boundary refuses to submit against an account
+    whose safety nothing has ever established. That precondition belongs to the
+    *database* rather than to any one connection - several tests here open a
+    second connection to stand in for a second process, and all of them are
+    looking at the same account.
+    """
+    path = initialize_database(tmp_path / "state.db")
+    with connect(path) as setup:
+        establish_account_safety(setup)
+    return path
 
 
 @pytest.fixture

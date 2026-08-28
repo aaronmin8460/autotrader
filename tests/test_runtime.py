@@ -93,6 +93,7 @@ from autotrader.state.sqlite import (
     list_strategy_runs,
     list_system_events,
 )
+from conftest import establish_account_safety
 
 BTC = "BTC/USD"
 ETH = "ETH/USD"
@@ -330,7 +331,17 @@ def unsafe_startup() -> StartupSafetyResult:
 
 @pytest.fixture
 def database_path(tmp_path: Path) -> Path:
-    return initialize_database(tmp_path / "state.db")
+    """A database in the state a running process actually trades from.
+
+    The runtime reconciles the full universe at startup and only then submits,
+    so both the runtime's own gate and the execution boundary refuse to submit
+    against an account whose safety nothing has ever established. Cases that
+    exercise the halt write it themselves, on top of this.
+    """
+    path = initialize_database(tmp_path / "state.db")
+    with connect(path) as setup:
+        establish_account_safety(setup)
+    return path
 
 
 @pytest.fixture

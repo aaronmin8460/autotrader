@@ -1,14 +1,22 @@
 /**
- * The 24/7 loop, as its durable trail describes it.
+ * The two loops, as their durable trails describe them.
  *
- * A full-width strip rather than a column card: this panel is a row of small
- * facts, and six of them read in one pass across the page where they would be
- * cramped stacked in a narrow column.
+ * There are two services now - the 24/7 crypto runtime and the regular-session
+ * equity runtime - and they run as separate processes. Each gets its own strip,
+ * in a fixed order, because a single merged panel would have to average two
+ * states into one and would be wrong whenever they differ.
  *
- * Nothing here is read from the runtime's live heartbeat - that is an
- * in-process object belonging to a different process. Every field comes from
- * something the runtime wrote down, and `Last cycle` is therefore the newest
- * durable bar claim rather than a heartbeat tick. The label says so.
+ * A full-width strip rather than a column card: each panel is a row of small
+ * facts, and they read in one pass across the page where they would be cramped
+ * stacked in a narrow column.
+ *
+ * Nothing here is read from a live heartbeat - that is an in-process object
+ * belonging to a different process. Every field comes from something that
+ * runtime wrote down, and `Last cycle` is therefore the newest durable bar
+ * claim rather than a heartbeat tick. The label says so.
+ *
+ * The last failure event is deliberately **not** here: it belongs to the
+ * account rather than to a service, and the page reports it once.
  *
  * There is no start button, no stop button, and no endpoint behind either.
  */
@@ -28,44 +36,32 @@ function staleMatters(state: string): boolean {
   return state === "RUNNING" || state === "STALE";
 }
 
-export function Runtime({
+function RuntimeStrip({
   panel,
   generatedAt,
 }: {
-  panel: RuntimePanel | null;
+  panel: RuntimePanel;
   generatedAt: string | null;
 }) {
-  if (!panel) {
-    return (
-      <Card title="Runtime">
-        <p className="text-[12px] text-ink-3">Runtime state could not be read.</p>
-      </Card>
-    );
-  }
-
   const flagStale = staleMatters(panel.state);
 
   const meta = (
-    <>
-      {panel.mode ? <span className="text-[11px] text-ink-3">{panel.mode}</span> : null}
-      <span
-        className={cn(
-          "inline-flex items-center gap-1.5 text-[11px] leading-none font-medium",
-          "tracking-[0.06em] uppercase",
-          toneText(panel.tone),
-        )}
-        title={panel.detail ?? undefined}
-      >
-        <Dot tone={panel.tone} />
-        {panel.state}
-      </span>
-    </>
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 text-[11px] leading-none font-medium",
+        "tracking-[0.06em] uppercase",
+        toneText(panel.tone),
+      )}
+      title={panel.detail ?? undefined}
+    >
+      <Dot tone={panel.tone} />
+      {panel.state}
+    </span>
   );
 
   return (
-    <Card title="Runtime" meta={meta} bodyClassName="">
+    <Card title={panel.label} meta={meta} bodyClassName="">
       <div className="grid grid-cols-2 gap-x-5 gap-y-3.5 px-4 py-3.5 sm:grid-cols-3">
-        <Field label="Strategy">{panel.strategy_name ?? "—"}</Field>
         <Field label="Startup safety" title={panel.startup_safety_detail ?? undefined}>
           <span
             className={cn(
@@ -85,6 +81,14 @@ export function Runtime({
             )}
           >
             {panel.paper_execution_enabled ? "Enabled" : "Disabled"}
+          </span>
+        </Field>
+        <Field label={panel.ended_at ? "Ran" : "Started"}>
+          <span className="num">
+            {stampUtc(panel.started_at, generatedAt)}
+            {panel.ended_at ? (
+              <span className="text-ink-3"> → {stampUtc(panel.ended_at, generatedAt)}</span>
+            ) : null}
           </span>
         </Field>
         <Field
@@ -110,69 +114,69 @@ export function Runtime({
             ) : null}
           </span>
         </Field>
-        <Field label={panel.ended_at ? "Ran" : "Started"}>
-          <span className="num">
-            {stampUtc(panel.started_at, generatedAt)}
-            {panel.ended_at ? (
-              <span className="text-ink-3"> → {stampUtc(panel.ended_at, generatedAt)}</span>
-            ) : null}
-          </span>
+        <Field label="Symbols claimed">
+          <span className="num">{panel.checkpoints.length}</span>
         </Field>
       </div>
 
-      <div className="grid grid-cols-1 border-t border-line lg:grid-cols-2">
-        <div className="lg:border-r lg:border-line">
-          <h3 className="eyebrow px-4 pt-3 text-ink-3">Processed-bar checkpoints</h3>
-          {panel.checkpoints.length === 0 ? (
-            <p className="px-4 py-3 text-[12px] text-ink-3">No bar has been claimed yet.</p>
-          ) : (
-            <div className="scroll-x mt-1 px-1 pb-2">
-              <table className="w-full border-collapse">
-                <thead>
-                  <tr>
-                    <Th>Symbol</Th>
-                    <Th align="right">Last processed bar</Th>
-                    <Th align="right">Claimed</Th>
+      <div className="border-t border-line">
+        <h3 className="eyebrow px-4 pt-3 text-ink-3">Processed-bar checkpoints</h3>
+        {panel.checkpoints.length === 0 ? (
+          <p className="px-4 py-3 text-[12px] text-ink-3">No bar has been claimed yet.</p>
+        ) : (
+          <div className="scroll-x mt-1 px-1 pb-2">
+            <table className="w-full border-collapse">
+              <thead>
+                <tr>
+                  <Th>Symbol</Th>
+                  <Th align="right">Last processed bar</Th>
+                  <Th align="right">Claimed</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {panel.checkpoints.map((checkpoint) => (
+                  <tr key={checkpoint.symbol} className="border-t border-line">
+                    <Td className="font-medium text-ink">{checkpoint.symbol}</Td>
+                    <Td numeric className="text-ink-2">
+                      {stampUtc(checkpoint.last_processed_bar, generatedAt)}
+                    </Td>
+                    <Td
+                      numeric
+                      className={flagStale && checkpoint.stale ? "text-warn" : "text-ink-3"}
+                    >
+                      {relative(checkpoint.updated_at, generatedAt)}
+                    </Td>
                   </tr>
-                </thead>
-                <tbody>
-                  {panel.checkpoints.map((checkpoint) => (
-                    <tr key={checkpoint.symbol} className="border-t border-line">
-                      <Td className="font-medium text-ink">{checkpoint.symbol}</Td>
-                      <Td numeric className="text-ink-2">
-                        {stampUtc(checkpoint.last_processed_bar, generatedAt)}
-                      </Td>
-                      <Td
-                        numeric
-                        className={flagStale && checkpoint.stale ? "text-warn" : "text-ink-3"}
-                      >
-                        {relative(checkpoint.updated_at, generatedAt)}
-                      </Td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-
-        <div className="border-t border-line px-4 py-3 lg:border-t-0">
-          <div className="flex items-baseline justify-between gap-3">
-            <h3 className="eyebrow text-ink-3">Last failure event</h3>
-            {panel.last_error_at ? (
-              <span className="num text-[11px] text-ink-3">
-                {stampUtc(panel.last_error_at, generatedAt)} UTC ·{" "}
-                {relative(panel.last_error_at, generatedAt)}
-              </span>
-            ) : null}
+                ))}
+              </tbody>
+            </table>
           </div>
-          <p className="mt-1.5 text-[11.5px] leading-snug text-ink-2">
-            {panel.last_error ?? (
-              <span className="text-ink-3">No failure event is recorded.</span>
-            )}
-          </p>
-        </div>
+        )}
       </div>
     </Card>
+  );
+}
+
+export function Runtimes({
+  panels,
+  generatedAt,
+}: {
+  panels: RuntimePanel[];
+  generatedAt: string | null;
+}) {
+  if (panels.length === 0) {
+    return (
+      <Card title="Runtimes">
+        <p className="text-[12px] text-ink-3">Runtime state could not be read.</p>
+      </Card>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+      {panels.map((panel) => (
+        <RuntimeStrip key={panel.key} panel={panel} generatedAt={generatedAt} />
+      ))}
+    </div>
   );
 }

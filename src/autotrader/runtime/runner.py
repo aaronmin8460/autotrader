@@ -67,6 +67,7 @@ from types import FrameType
 
 import pandas as pd
 
+from autotrader.account import safety as account_safety
 from autotrader.backtest.engine import STRATEGY_NAME
 from autotrader.data.historical import SUPPORTED_SYMBOLS, HistoricalDataError
 from autotrader.data.validation import ValidationResult, validate_frame
@@ -472,9 +473,18 @@ class CryptoRuntime:
         """Whether a submission may happen *right now*.
 
         Re-asked immediately before every execution attempt rather than trusted
-        from startup, because two things can change afterwards: an ambiguous
-        outcome pauses trading, and a shutdown request must stop new orders
-        even mid-cycle.
+        from startup, because three things can change afterwards: an ambiguous
+        outcome pauses trading, a shutdown request must stop new orders even
+        mid-cycle, and - since the account is shared - **the other runtime may
+        have halted it.**
+
+        That last check is a read of durable state rather than of this process's
+        memory, and it is what makes "UNKNOWN from any asset = no new orders
+        from any asset" true across processes. The equity runtime hitting an
+        ambiguous SPY submission writes the halt; this runner sees it at its
+        next boundary and does not submit, without the two ever talking to each
+        other. The execution boundary refuses independently as well, so removing
+        this check would cost a clean status line rather than the guarantee.
         """
         if self._authorization.disabled:
             return False, self._authorization.reason
@@ -482,6 +492,9 @@ class CryptoRuntime:
             return False, "TRADING_PAUSED"
         if self._shutdown.requested:
             return False, "SHUTTING_DOWN"
+        safety = account_safety.read_account_safety(self._connection)
+        if not safety.safe_to_trade:
+            return False, f"ACCOUNT_{safety.state}"
         return True, None
 
     # ------------------------------------------------------------------

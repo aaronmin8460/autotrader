@@ -114,6 +114,7 @@ from autotrader.state.sqlite import (
     list_risk_events,
     list_system_events,
 )
+from conftest import establish_account_safety
 
 T0 = datetime(2025, 1, 2, 14, 30, tzinfo=UTC)
 
@@ -405,7 +406,19 @@ class FakeDataClient:
 
 @pytest.fixture
 def database_path(tmp_path: Path) -> Path:
-    return initialize_database(tmp_path / "state.db")
+    """A database in the state a running process actually submits from.
+
+    A live system reconciles the full universe at startup and only then
+    submits, so the execution boundary refuses to submit against an account
+    whose safety nothing has ever established. That precondition belongs to the
+    *database* rather than to any one connection - several tests here open a
+    second connection to stand in for a second process, and all of them are
+    looking at the same account.
+    """
+    path = initialize_database(tmp_path / "state.db")
+    with connect(path) as setup:
+        establish_account_safety(setup)
+    return path
 
 
 @pytest.fixture
@@ -2175,6 +2188,20 @@ def patched_broker(monkeypatch: pytest.MonkeyPatch) -> FakeTradingClient:
     return client
 
 
+def cli_database(tmp_path: Path) -> Path:
+    """The database the CLI cases below submit against, already reconciled.
+
+    `paper-submit` initializes its own database, and a database nothing has
+    reconciled is one the execution boundary refuses to submit from. An
+    operator gets there by running `reconcile` first; a test gets there by
+    establishing the same starting state.
+    """
+    path = initialize_database(tmp_path / "cli.db")
+    with connect(path) as setup:
+        establish_account_safety(setup)
+    return path
+
+
 def cli_args(tmp_path: Path, *extra: str, qty: str = "0.01") -> list[str]:
     return [
         "paper-submit",
@@ -2185,7 +2212,7 @@ def cli_args(tmp_path: Path, *extra: str, qty: str = "0.01") -> list[str]:
         "--qty",
         qty,
         "--db",
-        str(tmp_path / "cli.db"),
+        str(cli_database(tmp_path)),
         *extra,
     ]
 

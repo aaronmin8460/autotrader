@@ -109,6 +109,12 @@ class ReconciliationResult:
     settled and is not re-queried, and counting it would overstate what this
     pass verified. `positions_checked` counts the symbols in the active
     universe, each of which is reconciled whether or not the broker holds one.
+
+    `symbols` names that universe. A count alone cannot answer "did this pass
+    cover the whole account?", and that is exactly the question the shared
+    account halt turns on: only a pass that covered every tracked symbol may
+    conclude the account is understood again. Naming them makes a narrower pass
+    visibly narrower instead of merely smaller.
     """
 
     status: ReconciliationStatus
@@ -119,6 +125,7 @@ class ReconciliationResult:
     issues: tuple[ReconciliationIssue, ...] = ()
     dry_run: bool = False
     reconciliation_run_id: int | None = None
+    symbols: tuple[str, ...] = ()
 
     @property
     def safe_to_trade(self) -> bool:

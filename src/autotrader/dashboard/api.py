@@ -49,6 +49,7 @@ from autotrader.dashboard import service
 from autotrader.dashboard.broker import SharedBrokerReader
 from autotrader.dashboard.models import (
     ENVIRONMENT_PAPER,
+    AccountSafetyPanel,
     HealthComponent,
     OrdersPanel,
     Overview,
@@ -154,7 +155,7 @@ def create_app() -> FastAPI:
 
     @application.get(f"{_API_PREFIX}/system", tags=["dashboard"])
     def system() -> dict[str, Any]:
-        """System state, component health, reconciliation, and runtime."""
+        """System state, health, reconciliation, both runtimes, and account safety."""
         page = build_overview()
         return {
             "generated_at": page.generated_at,
@@ -164,7 +165,9 @@ def create_app() -> FastAPI:
             "attention": list(page.attention),
             "health": list(page.health),
             "reconciliation": page.reconciliation,
-            "runtime": page.runtime,
+            "runtimes": list(page.runtimes),
+            "account_safety": page.account_safety,
+            "api_budget": list(page.api_budget),
         }
 
     return application
@@ -179,6 +182,7 @@ __all__ = [
     "DATABASE_PATH_ENV",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "AccountSafetyPanel",
     "HealthComponent",
     "ReconciliationPanel",
     "RuntimePanel",

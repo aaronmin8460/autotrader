@@ -34,6 +34,7 @@ from autotrader.state.sqlite import (
     V3_TABLES,
     V4_TABLES,
     V5_TABLES,
+    V6_TABLES,
     DatabaseStateError,
     DuplicateBrokerOrderError,
     DuplicateOrderIntentError,
@@ -288,7 +289,7 @@ def schema_objects(connection: sqlite3.Connection) -> list[tuple[str, str, str]]
 def test_a_new_database_initializes_directly_at_the_current_version(database_path: Path) -> None:
     """A fresh database is never created at an older version and then upgraded."""
     with connect(database_path) as connection:
-        assert get_schema_version(connection) == SCHEMA_VERSION == 5
+        assert get_schema_version(connection) == SCHEMA_VERSION == 6
         assert set(REQUIRED_TABLES) <= table_names(connection)
         assert set(V3_TABLES) <= table_names(connection)
         assert set(V4_TABLES) <= table_names(connection)
@@ -704,7 +705,7 @@ def test_a_version_three_database_migrates_through_four_to_the_current_version(
     initialize_database(v3_database)
 
     with connect(v3_database) as connection:
-        assert get_schema_version(connection) == SCHEMA_VERSION == 5
+        assert get_schema_version(connection) == SCHEMA_VERSION == 6
         assert set(V4_TABLES) <= table_names(connection)
         assert set(V5_TABLES) <= table_names(connection)
 
@@ -1696,7 +1697,7 @@ def populate_v4_reconciliation_history(path: Path) -> tuple[int, int]:
     return run_id, event_id
 
 
-def test_a_version_four_database_migrates_to_five(v4_database: Path) -> None:
+def test_a_version_four_database_migrates_to_the_current_version(v4_database: Path) -> None:
     with connect(v4_database) as connection:
         assert get_schema_version(connection) == 4
         assert not set(V5_TABLES) & table_names(connection)
@@ -1704,7 +1705,7 @@ def test_a_version_four_database_migrates_to_five(v4_database: Path) -> None:
     initialize_database(v4_database)
 
     with connect(v4_database) as connection:
-        assert get_schema_version(connection) == SCHEMA_VERSION == 5
+        assert get_schema_version(connection) == SCHEMA_VERSION == 6
         assert set(V5_TABLES) <= table_names(connection)
         assert set(REQUIRED_TABLES) <= table_names(connection)
 
@@ -1770,8 +1771,12 @@ def test_the_v5_migration_preserves_daily_risk_baselines(v4_database: Path) -> N
         assert list_daily_risk_baselines(connection) == before
 
 
-def test_the_v5_migration_adds_only_the_checkpoint_table(v4_database: Path) -> None:
-    """Purely additive. No existing table is rebuilt, renamed, or reindexed."""
+def test_the_migrations_above_v4_only_add_tables(v4_database: Path) -> None:
+    """Purely additive. No existing table is rebuilt, renamed, or reindexed.
+
+    A v4 database now upgrades through v5 to v6, so this covers both steps at
+    once: the checkpoint table, and the two shared-account coordination tables.
+    """
     with connect(v4_database) as connection:
         before = {name: sql for _type, name, sql in schema_objects(connection)}
 
@@ -1781,10 +1786,15 @@ def test_the_v5_migration_adds_only_the_checkpoint_table(v4_database: Path) -> N
         after = {name: sql for _type, name, sql in schema_objects(connection)}
 
     assert before.items() <= after.items(), "every pre-existing object is byte-identical"
-    # The new table's TEXT PRIMARY KEY brings SQLite's implicit autoindex with
-    # it; that belongs to the new table, not to anything that already existed.
+    # A new table with a TEXT or composite PRIMARY KEY brings SQLite's implicit
+    # autoindex with it; those belong to the new tables, not to anything that
+    # already existed. `account_safety_state` keys on INTEGER, which is rowid
+    # aliased and needs no separate index.
     added = set(after) - set(before)
-    assert added == set(V5_TABLES) | {"sqlite_autoindex_runtime_checkpoints_1"}
+    assert added == set(V5_TABLES) | set(V6_TABLES) | {
+        "sqlite_autoindex_runtime_checkpoints_1",
+        "sqlite_autoindex_api_budget_windows_1",
+    }
 
 
 def test_a_failed_v4_to_v5_migration_rolls_back_completely(v4_database: Path) -> None:
@@ -1827,7 +1837,9 @@ def test_a_database_newer_than_version_five_is_still_refused(database_path: Path
         assert get_schema_version(connection) == SCHEMA_VERSION + 1, "left untouched"
 
 
-def test_a_version_one_database_migrates_all_the_way_to_five(v1_database: Path) -> None:
+def test_a_version_one_database_migrates_all_the_way_to_the_current_version(
+    v1_database: Path,
+) -> None:
     """The whole chain in one transaction: v1 -> v2 -> v3 -> v4 -> v5."""
     populate_v1_data(v1_database)
     with connect(v1_database) as connection:
@@ -1836,7 +1848,7 @@ def test_a_version_one_database_migrates_all_the_way_to_five(v1_database: Path) 
     initialize_database(v1_database)
 
     with connect(v1_database) as connection:
-        assert get_schema_version(connection) == SCHEMA_VERSION == 5
+        assert get_schema_version(connection) == SCHEMA_VERSION == 6
         assert set(REQUIRED_TABLES) <= table_names(connection)
         assert len(list_strategy_runs(connection)) == 1
 
@@ -1940,3 +1952,232 @@ def test_a_naive_checkpoint_timestamp_is_refused(connection: sqlite3.Connection)
             last_processed_bar_timestamp=datetime(2026, 8, 26, 10, 0),
             updated_at=T0,
         )
+
+
+# ==========================================================================
+# v5 -> v6: the shared-account coordination tables
+# ==========================================================================
+
+
+def build_v5_database(path: Path) -> Path:
+    """A database exactly as the Equity V0.2 (v5) release would have left it.
+
+    Built from the module's own current statements minus the v6 tables, so it
+    is the real historical shape rather than an approximation of it.
+    """
+    with connect(path) as connection, transaction(connection):
+        for statement in (
+            state._CREATE_SCHEMA_METADATA,
+            state._CREATE_STRATEGY_RUNS,
+            state._CREATE_SIGNALS,
+            state._CREATE_RISK_EVENTS,
+            state._CREATE_SYSTEM_EVENTS,
+            state._CREATE_POSITIONS,
+            state._CREATE_ORDER_INTENTS,
+            state._CREATE_BROKER_ORDERS,
+            state._CREATE_DAILY_RISK_BASELINES,
+            state._CREATE_RECONCILIATION_RUNS,
+            state._CREATE_RECONCILIATION_EVENTS,
+            state._CREATE_RUNTIME_CHECKPOINTS,
+            state._CREATE_INDEX_SIGNALS,
+            state._CREATE_INDEX_RISK_EVENTS,
+            state._CREATE_INDEX_ORDER_INTENTS_STATUS,
+            state._CREATE_INDEX_RECONCILIATION_EVENTS,
+        ):
+            connection.execute(statement)
+        connection.execute(state._INSERT_SCHEMA_VERSION, (5, "2026-08-28T00:00:00.000000+00:00"))
+    return path
+
+
+@pytest.fixture
+def v5_database(tmp_path: Path) -> Path:
+    return build_v5_database(tmp_path / "v5.db")
+
+
+def populate_v5_history(path: Path) -> dict[str, object]:
+    """One row in every table a v5 database could hold, to migrate across."""
+    with connect(path) as connection:
+        run_id = record_strategy_run(
+            connection, strategy_name="EMA20 / EMA50", mode="PAPER", started_at=T0
+        )
+        record_signal(
+            connection,
+            strategy_run_id=run_id,
+            signal_timestamp=T0,
+            symbol="BTC/USD",
+            signal_type="BUY",
+            reason="EMA20 crossed above EMA50",
+        )
+        record_risk_event(
+            connection,
+            event_timestamp=T0,
+            decision="APPROVED",
+            reason_code="APPROVED",
+            symbol="BTC/USD",
+            message="within limits",
+            strategy_run_id=run_id,
+        )
+        intent_id = record_order_intent(
+            connection,
+            client_order_id="autotrader-v5-carried",
+            strategy_run_id=run_id,
+            created_at=T0,
+            symbol="SPY",
+            side="BUY",
+            requested_quantity=Decimal(3),
+            approved_quantity=Decimal(3),
+            reference_price=500.0,
+            risk_reason_code="APPROVED",
+        )
+        upsert_broker_order(
+            connection,
+            order_intent_id=intent_id,
+            broker_order_id="11111111-2222-3333-4444-555555555555",
+            client_order_id="autotrader-v5-carried",
+            symbol="SPY",
+            side="BUY",
+            quantity=Decimal(3),
+            filled_quantity=Decimal(3),
+            filled_average_price=501.0,
+            status="filled",
+            submitted_at=T0,
+            filled_at=T0 + STEP,
+            updated_at=T0 + STEP,
+        )
+        upsert_position(
+            connection,
+            symbol="BTC/USD",
+            quantity=Decimal("0.05"),
+            average_price=76000.0,
+            updated_at=T0,
+        )
+        ensure_daily_risk_baseline(
+            connection,
+            risk_date_utc=date(2026, 8, 28),
+            baseline_equity=Decimal("201000"),
+            captured_at=T0,
+        )
+        upsert_runtime_checkpoint(
+            connection,
+            symbol="BTC/USD",
+            last_processed_bar_timestamp=T0,
+            updated_at=T0,
+        )
+        reconciliation_run = record_reconciliation_run(
+            connection,
+            started_at=T0,
+            completed_at=T0 + STEP,
+            status="CLEAN",
+            safe_to_trade=True,
+            orders_checked=1,
+            positions_checked=2,
+            issues_count=0,
+            unresolved_count=0,
+        )
+    return {"run_id": run_id, "intent_id": intent_id, "reconciliation_run": reconciliation_run}
+
+
+def test_a_version_five_database_migrates_to_the_current_version(v5_database: Path) -> None:
+    with connect(v5_database) as connection:
+        assert get_schema_version(connection) == 5
+        assert not set(V6_TABLES) & table_names(connection)
+
+    initialize_database(v5_database)
+
+    with connect(v5_database) as connection:
+        assert get_schema_version(connection) == SCHEMA_VERSION == 6
+        assert set(V6_TABLES) <= table_names(connection)
+
+
+def test_the_v6_migration_preserves_every_v5_row(v5_database: Path) -> None:
+    """CRITICAL. Nothing a v5 database held is lost or rewritten."""
+    populate_v5_history(v5_database)
+    with connect(v5_database) as connection:
+        before = {
+            "runs": list_strategy_runs(connection),
+            "signals": list_signals(connection),
+            "risk_events": list_risk_events(connection),
+            "intents": list_order_intents(connection),
+            "broker_orders": list_broker_orders(connection),
+            "positions": [get_position(connection, "BTC/USD")],
+            "baselines": list_daily_risk_baselines(connection),
+            "checkpoints": list_runtime_checkpoints(connection),
+            "reconciliation": list_reconciliation_runs(connection),
+        }
+
+    initialize_database(v5_database)
+
+    with connect(v5_database) as connection:
+        after = {
+            "runs": list_strategy_runs(connection),
+            "signals": list_signals(connection),
+            "risk_events": list_risk_events(connection),
+            "intents": list_order_intents(connection),
+            "broker_orders": list_broker_orders(connection),
+            "positions": [get_position(connection, "BTC/USD")],
+            "baselines": list_daily_risk_baselines(connection),
+            "checkpoints": list_runtime_checkpoints(connection),
+            "reconciliation": list_reconciliation_runs(connection),
+        }
+
+    for key, rows in before.items():
+        assert rows, f"the fixture wrote no {key}, so preserving them proves nothing"
+        assert after[key] == rows, key
+
+
+def test_a_migrated_v5_database_starts_unsafe_rather_than_safe(v5_database: Path) -> None:
+    """CRITICAL. The migration asserts nothing it did not check.
+
+    The upgrade has never read the broker, so it cannot know the account is
+    understood. An empty `account_safety_state` reports
+    `UNSAFE_RECONCILIATION`, and a full-universe pass is what turns it green.
+    """
+    initialize_database(v5_database)
+
+    with connect(v5_database) as connection:
+        safety = state.read_account_safety_state(connection)
+
+    assert safety.state == state.ACCOUNT_SAFETY_UNSAFE_RECONCILIATION
+    assert safety.safe_to_trade is False
+    assert safety.established is False
+
+
+def test_a_failed_v5_to_v6_migration_rolls_back_completely(v5_database: Path) -> None:
+    """A conflicting table refuses the upgrade and leaves a working v5 behind."""
+    populate_v5_history(v5_database)
+    with connect(v5_database) as connection, transaction(connection):
+        connection.execute("CREATE TABLE api_budget_windows (surprise TEXT)")
+
+    with pytest.raises(DatabaseStateError) as error:
+        initialize_database(v5_database)
+
+    assert "api_budget_windows" in str(error.value)
+    with connect(v5_database) as connection:
+        assert get_schema_version(connection) == 5, "the version marker did not move"
+        assert "account_safety_state" not in table_names(connection)
+        assert len(list_order_intents(connection)) == 1, "the v5 rows are untouched"
+
+
+def test_the_migrated_database_keeps_wal_and_foreign_keys(v5_database: Path) -> None:
+    """Both PRAGMAs survive the upgrade, as they must for every other guarantee."""
+    initialize_database(v5_database)
+
+    with connect(v5_database) as connection:
+        journal = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+
+    assert str(journal).lower() == "wal"
+    assert foreign_keys == 1
+
+
+def test_a_v6_database_written_by_a_newer_version_fails_closed(v5_database: Path) -> None:
+    """A schema this code does not understand is refused, never downgraded."""
+    initialize_database(v5_database)
+    with connect(v5_database) as connection, transaction(connection):
+        connection.execute("UPDATE schema_metadata SET schema_version = ?", (SCHEMA_VERSION + 1,))
+
+    with pytest.raises(UnsupportedSchemaVersionError):
+        initialize_database(v5_database)
+
+    with connect(v5_database) as connection:
+        assert get_schema_version(connection) == SCHEMA_VERSION + 1, "left untouched"

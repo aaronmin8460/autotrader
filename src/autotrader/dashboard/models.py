@@ -321,21 +321,38 @@ class CheckpointRow:
 
 @dataclass(frozen=True)
 class RuntimePanel:
-    """What the 24/7 loop's durable trail says about itself.
+    """What one runtime's durable trail says about itself.
 
     The runtime's live `Heartbeat` is an in-process object and this is a
     different process, so nothing here is read from it. Every field comes from
-    something the runtime wrote down: `strategy_runs`, `system_events`, and
-    `runtime_checkpoints`. `last_cycle_at` is therefore the newest checkpoint
-    write, which is the durable evidence of a cycle having completed work -
-    and it is labelled as that rather than as a heartbeat.
+    something that runtime wrote down: its own `system_events` and its own
+    symbols' `runtime_checkpoints`. `last_cycle_at` is therefore the newest
+    checkpoint write, which is the durable evidence of a cycle having completed
+    work - and it is labelled as that rather than as a heartbeat.
+
+    **There are two of these now**, one per service. They are told apart by
+    real evidence rather than by guesswork: each runtime writes its own
+    lifecycle event types (`RUNTIME_STARTED` against
+    `EQUITY_RUNTIME_STARTED`, and so on) and claims bars only for its own
+    symbols. What is deliberately *not* split is the strategy run - both
+    services open one under the same strategy name, so attributing a run to a
+    service would be a guess, and this panel does not report one.
+
+    `key` and `label` name which service the panel describes.
+
+    There is deliberately **no last-failure field here.** The failure events
+    this system records - a rejection, an ambiguous outcome, an unresolved
+    reconciliation - belong to the account rather than to a service, and are not
+    tagged with one. Printing the same account-level failure on both cards would
+    attribute an equity problem to the crypto runtime half the time; it is
+    reported once, on the page.
     """
 
+    key: str
+    label: str
     state: str
     tone: str
     detail: str | None = None
-    strategy_name: str | None = None
-    mode: str | None = None
     started_at: str | None = None
     ended_at: str | None = None
     startup_safety: str = "UNRESOLVED"
@@ -346,8 +363,61 @@ class RuntimePanel:
     last_cycle_at: str | None = None
     next_cycle_at: str | None = None
     checkpoints: tuple[CheckpointRow, ...] = ()
-    last_error: str | None = None
-    last_error_at: str | None = None
+
+
+# --------------------------------------------------------------------------
+# Shared account safety
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AccountSafetyPanel:
+    """The one durable answer to whether any service may submit an order.
+
+    There is one brokerage account, so this is a property of the account rather
+    than of either runtime, and it is read from `account_safety_state` rather
+    than inferred from what the runtimes happen to have logged. An ambiguous
+    order raised by either service halts both, and this is where a person sees
+    that as one fact instead of two half-facts.
+
+    `client_order_id` is the recovery anchor when an ambiguous submission caused
+    the halt - the exact key to ask the broker about. It is None otherwise.
+    """
+
+    state: str
+    tone: str
+    safe_to_trade: bool
+    detail: str
+    source: str | None = None
+    client_order_id: str | None = None
+    updated_at: str | None = None
+    available: bool = True
+    unavailable_reason: str | None = None
+
+
+# --------------------------------------------------------------------------
+# Shared API budget
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ApiBudgetRow:
+    """One shared API budget's usage inside the current window.
+
+    A count this system made of its own calls across both runtimes, never a
+    figure read back from the provider - and `limit` is this system's own
+    conservative ceiling, not a published provider rate limit. Shown because
+    two processes sharing one set of credentials is a thing an operator should
+    be able to see, not because anything here is close to a limit.
+    """
+
+    key: str
+    label: str
+    used: int
+    limit: int
+    remaining: int
+    window_start: str | None = None
+    tone: str = TONE_MUTED
 
 
 # --------------------------------------------------------------------------
@@ -378,10 +448,37 @@ class RiskLimit:
 
 
 @dataclass(frozen=True)
+class ExposureRow:
+    """One book's share of total account exposure. **Display only.**
+
+    This is a breakdown of a number that is already enforced as one total, not
+    a second limit. There is no per-book cap in the risk engine - crypto and
+    equity draw on the same 30% - and putting a "crypto limit" on this screen
+    would name a rule nothing enforces. `fraction` is against account equity,
+    so the crypto and equity rows sum to the total row.
+    """
+
+    key: str
+    label: str
+    value: Amount
+    fraction: float | None = None
+    enforced: bool = False
+
+
+@dataclass(frozen=True)
 class RiskPanel:
-    """The V0.2 policy, plus current utilization when it can be read."""
+    """The V0.2 policy, plus current utilization when it can be read.
+
+    `limits` are the three enforced rules. `exposure` is the crypto / equity /
+    total split of the one total-exposure figure, carried separately precisely
+    so that a renderer cannot mistake a breakdown row for a limit: every
+    `ExposureRow` except the total says `enforced=False`, and the total points
+    at the single 30% account cap that actually exists.
+    """
 
     limits: tuple[RiskLimit, ...] = ()
+    exposure: tuple[ExposureRow, ...] = ()
+    total_exposure_limit_fraction: float | None = None
     available: bool = False
     unavailable_reason: str | None = None
 
@@ -398,6 +495,11 @@ class Overview:
     Assembled from a single short read transaction plus at most one broker
     read, so two panels can never disagree about the same instant the way two
     independently polled endpoints would.
+
+    `runtimes` is a tuple because the system now runs two of them - crypto and
+    equity - as separate processes. `account_safety`, by contrast, is a single
+    value, because there is one brokerage account and therefore one answer to
+    whether anything may submit.
     """
 
     generated_at: str
@@ -412,7 +514,11 @@ class Overview:
     orders: OrdersPanel | None = None
     health: tuple[HealthComponent, ...] = ()
     reconciliation: ReconciliationPanel | None = None
-    runtime: RuntimePanel | None = None
+    runtimes: tuple[RuntimePanel, ...] = ()
+    account_safety: AccountSafetyPanel | None = None
+    api_budget: tuple[ApiBudgetRow, ...] = ()
+    last_failure: str | None = None
+    last_failure_at: str | None = None
     risk: RiskPanel | None = None
     notices: tuple[str, ...] = field(default_factory=tuple)
 
@@ -420,7 +526,23 @@ class Overview:
 __all__ = [
     "ASSET_CLASS_CRYPTO",
     "ASSET_CLASS_EQUITY",
+    "AccountSafetyPanel",
+    "Amount",
+    "ApiBudgetRow",
+    "CheckpointRow",
     "ENVIRONMENT_PAPER",
+    "ExposureRow",
+    "HealthComponent",
+    "OrderRow",
+    "OrdersPanel",
+    "Overview",
+    "PositionRow",
+    "PositionsPanel",
+    "PrimaryMetrics",
+    "ReconciliationPanel",
+    "RiskLimit",
+    "RiskPanel",
+    "RuntimePanel",
     "SOURCE_BROKER",
     "SOURCE_LOCAL",
     "SOURCE_UNAVAILABLE",
@@ -439,17 +561,4 @@ __all__ = [
     "UNAVAILABLE_DATABASE_UNREADABLE",
     "UNAVAILABLE_NOT_RECORDED",
     "UNAVAILABLE_REASONS",
-    "Amount",
-    "CheckpointRow",
-    "HealthComponent",
-    "OrderRow",
-    "OrdersPanel",
-    "Overview",
-    "PositionRow",
-    "PositionsPanel",
-    "PrimaryMetrics",
-    "ReconciliationPanel",
-    "RiskLimit",
-    "RiskPanel",
-    "RuntimePanel",
 ]

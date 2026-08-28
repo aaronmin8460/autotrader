@@ -45,6 +45,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from autotrader import state
+from autotrader.account import budget as api_budget_module
 from autotrader.dashboard import models
 from autotrader.dashboard.broker import BrokerRead, read_broker
 from autotrader.dashboard.models import (
@@ -66,8 +67,11 @@ from autotrader.dashboard.models import (
     UNAVAILABLE_BROKER_UNREADABLE,
     UNAVAILABLE_DATABASE_UNREADABLE,
     UNAVAILABLE_NOT_RECORDED,
+    AccountSafetyPanel,
     Amount,
+    ApiBudgetRow,
     CheckpointRow,
+    ExposureRow,
     HealthComponent,
     OrderRow,
     OrdersPanel,
@@ -80,7 +84,8 @@ from autotrader.dashboard.models import (
     RiskPanel,
     RuntimePanel,
 )
-from autotrader.execution.models import SUPPORTED_SYMBOLS
+from autotrader.execution.models import EQUITY_SYMBOLS, SUPPORTED_SYMBOLS
+from autotrader.execution.models import TRADABLE_SYMBOLS as TRACKED_SYMBOLS
 from autotrader.execution.paper import broker_symbol_key, paper_trading_enabled
 from autotrader.risk.engine import (
     MAX_DAILY_LOSS_FRACTION,
@@ -138,15 +143,32 @@ _ZERO = Decimal(0)
 # --------------------------------------------------------------------------
 
 
-def asset_class_for(symbol: str) -> str:
-    """The asset class implied by a symbol's own notation.
+#: The tracked universes, keyed the way the broker might spell them. Alpaca
+#: reports a crypto market as `BTC/USD` in some responses and `BTCUSD` in
+#: others, so a slash is not a reliable discriminator on its own.
+_CRYPTO_KEYS = frozenset(broker_symbol_key(symbol) for symbol in SUPPORTED_SYMBOLS)
+_EQUITY_KEYS = frozenset(broker_symbol_key(symbol) for symbol in EQUITY_SYMBOLS)
 
-    A quoted pair (`BTC/USD`) is a crypto market; a bare ticker (`SPY`) is not.
-    That is the distinction the rest of this repository already makes - the
-    execution boundary's `is_usd_quoted` reads the same slash - and it means a
-    future equity symbol classifies correctly without this milestone shipping
-    an equity list it would then have to maintain.
+
+def asset_class_for(symbol: str) -> str:
+    """Which book a symbol belongs to.
+
+    Resolved against the two tracked universes first, using the same
+    slash-insensitive key the execution boundary matches positions with. That
+    matters now that this classification feeds an exposure *breakdown*: Alpaca
+    reports a crypto position as `BTC/USD` or `BTCUSD` depending on the
+    response, and a slash test alone would file the second spelling under
+    equity - putting real crypto exposure in the equity row.
+
+    Anything outside both universes falls back to the notation: a quoted pair
+    is a crypto market, a bare ticker is not. That case is a position this
+    system does not track, which reconciliation reports and never trades.
     """
+    key = broker_symbol_key(symbol)
+    if key in _CRYPTO_KEYS:
+        return ASSET_CLASS_CRYPTO
+    if key in _EQUITY_KEYS:
+        return ASSET_CLASS_EQUITY
     return ASSET_CLASS_CRYPTO if "/" in symbol else ASSET_CLASS_EQUITY
 
 
@@ -224,6 +246,8 @@ class StateSnapshot:
     reconciliation: state.ReconciliationRun | None = None
     reconciliation_repairs: int | None = None
     baseline: state.DailyRiskBaseline | None = None
+    account_safety: state.AccountSafetyState | None = None
+    api_budget: tuple[state.ApiBudgetWindow, ...] = ()
 
 
 def read_state(path: str | Path, *, now: datetime) -> StateSnapshot:
@@ -257,6 +281,19 @@ def read_state(path: str | Path, *, now: datetime) -> StateSnapshot:
                     )
                 )
                 baseline = state.get_daily_risk_baseline(connection, state.utc_risk_date(now))
+                account_safety = state.read_account_safety_state(connection)
+                api_budget = tuple(
+                    window
+                    for window in (
+                        state.get_api_budget_window(
+                            connection,
+                            budget=budget,
+                            window_start=api_budget_module.window_start_for(now),
+                        )
+                        for budget in state.API_BUDGETS
+                    )
+                    if window is not None
+                )
             finally:
                 connection.execute("COMMIT")
     except (sqlite3.Error, state.StateError, OSError, ValueError):
@@ -274,6 +311,8 @@ def read_state(path: str | Path, *, now: datetime) -> StateSnapshot:
         reconciliation=reconciliation,
         reconciliation_repairs=repairs,
         baseline=baseline,
+        account_safety=account_safety,
+        api_budget=api_budget,
     )
 
 
@@ -326,9 +365,10 @@ def build_positions(snapshot: StateSnapshot, broker: BrokerRead) -> PositionsPan
                 )
             )
         held = {broker_symbol_key(row.symbol) for row in rows}
-        flat = tuple(
-            symbol for symbol in SUPPORTED_SYMBOLS if broker_symbol_key(symbol) not in held
-        )
+        # Every symbol this system tracks, both books. A flat equity is as much
+        # a tracked-and-flat symbol as a flat pair, and listing only the pairs
+        # would read as "the equities are not being watched".
+        flat = tuple(symbol for symbol in TRACKED_SYMBOLS if broker_symbol_key(symbol) not in held)
         return PositionsPanel(
             source=SOURCE_BROKER, as_of=as_of, rows=tuple(rows), flat_symbols=flat
         )
@@ -500,15 +540,63 @@ def _latest_failure(snapshot: StateSnapshot) -> state.SystemEvent | None:
     return max(failures, key=lambda event: (event.event_timestamp, event.id))
 
 
-def build_runtime(snapshot: StateSnapshot, *, now: datetime) -> RuntimePanel:
-    """What the runtime's durable trail says about itself.
+#: The two services, and the durable evidence that tells them apart. Each
+#: runtime writes its own lifecycle event types and claims bars only for its own
+#: symbols, so a panel per service is derived rather than guessed. What is
+#: *not* here is the strategy run: both services open one under the same
+#: strategy name, so attributing a run to a service would be a guess.
+RUNTIME_SPECS: tuple[dict[str, object], ...] = (
+    {
+        "key": "crypto",
+        "label": "Crypto runtime",
+        "symbols": frozenset(SUPPORTED_SYMBOLS),
+        "started": "RUNTIME_STARTED",
+        "stopped": "RUNTIME_STOPPED",
+        "paused": "RUNTIME_TRADING_PAUSED",
+    },
+    {
+        "key": "equity",
+        "label": "Equity runtime",
+        "symbols": frozenset(EQUITY_SYMBOLS),
+        "started": "EQUITY_RUNTIME_STARTED",
+        "stopped": "EQUITY_RUNTIME_STOPPED",
+        "paused": "EQUITY_RUNTIME_TRADING_PAUSED",
+    },
+)
 
-    Derived, never guessed: the strategy run says whether a loop is open, a
-    `RUNTIME_TRADING_PAUSED` event recorded after that run started says whether
-    it stopped trading, and the checkpoints say how recently it did any work.
-    A run that says `RUNNING` but has not moved a checkpoint for two whole bar
-    intervals is reported `STALE`, because a loop that is not looping is not
-    running whatever its row says.
+
+def _latest_event_at(snapshot: StateSnapshot, event_type: str) -> datetime | None:
+    """When one event type was last recorded, or None."""
+    return max(
+        (
+            event.event_timestamp
+            for event in snapshot.system_events
+            if event.event_type == event_type
+        ),
+        default=None,
+    )
+
+
+def build_runtime(
+    snapshot: StateSnapshot,
+    *,
+    now: datetime,
+    spec: dict[str, object],
+    account_safety: AccountSafetyPanel | None = None,
+) -> RuntimePanel:
+    """What one runtime's durable trail says about itself.
+
+    Derived, never guessed. This service's own lifecycle events say whether it
+    started, stopped, or paused; this service's own symbols' checkpoints say how
+    recently it did work. A runtime that started and has not moved one of its
+    checkpoints for two whole bar intervals is `STALE`, because a loop that is
+    not looping is not running.
+
+    **The shared account halt is reported here too**, and on *both* panels,
+    because that is what it does: an ambiguous order raised by either service
+    stops both. A runtime whose own trail looks perfectly healthy is still
+    `PAUSED` while the account is halted, and saying otherwise on one of the two
+    panels would be the single most misleading thing this screen could do.
     """
     paper_enabled = paper_trading_enabled()
     paper_detail = (
@@ -517,9 +605,13 @@ def build_runtime(snapshot: StateSnapshot, *, now: datetime) -> RuntimePanel:
         if paper_enabled
         else "AUTOTRADER_PAPER_TRADING_ENABLED is not set to true. No order can be submitted."
     )
+    key = str(spec["key"])
+    label = str(spec["label"])
 
     if not snapshot.ok:
         return RuntimePanel(
+            key=key,
+            label=label,
             state="UNAVAILABLE",
             tone=TONE_ATTENTION,
             detail="The operational database could not be read.",
@@ -527,6 +619,9 @@ def build_runtime(snapshot: StateSnapshot, *, now: datetime) -> RuntimePanel:
             paper_execution_detail=paper_detail,
         )
 
+    symbols = spec["symbols"]
+    assert isinstance(symbols, frozenset)  # noqa: S101 - RUNTIME_SPECS is a module literal
+    mine = tuple(checkpoint for checkpoint in snapshot.checkpoints if checkpoint.symbol in symbols)
     checkpoints = tuple(
         CheckpointRow(
             symbol=checkpoint.symbol,
@@ -535,43 +630,61 @@ def build_runtime(snapshot: StateSnapshot, *, now: datetime) -> RuntimePanel:
             age_seconds=(now - checkpoint.updated_at).total_seconds(),
             stale=(now - checkpoint.updated_at) > STALE_AFTER,
         )
-        for checkpoint in snapshot.checkpoints
+        for checkpoint in mine
     )
-    last_cycle = max((checkpoint.updated_at for checkpoint in snapshot.checkpoints), default=None)
+    last_cycle = max((checkpoint.updated_at for checkpoint in mine), default=None)
 
-    run = max(snapshot.strategy_runs, key=lambda item: (item.started_at, item.id), default=None)
-    paused_at = max(
-        (
-            event.event_timestamp
-            for event in snapshot.system_events
-            if event.event_type == _EVENT_TRADING_PAUSED
-            and (run is None or event.event_timestamp >= run.started_at)
-        ),
-        default=None,
-    )
+    started_at = _latest_event_at(snapshot, str(spec["started"]))
+    stopped_at = _latest_event_at(snapshot, str(spec["stopped"]))
+    paused_at = _latest_event_at(snapshot, str(spec["paused"]))
+    if started_at is not None and paused_at is not None and paused_at < started_at:
+        paused_at = None
+    if started_at is not None and stopped_at is not None and stopped_at < started_at:
+        stopped_at = None
 
-    if run is None:
-        runtime_state, tone, detail = "NEVER STARTED", TONE_MUTED, "No strategy run is recorded."
+    if started_at is None and last_cycle is None:
+        runtime_state, tone = "NEVER STARTED", TONE_MUTED
+        detail = f"No {key} runtime cycle is recorded."
     elif paused_at is not None:
         runtime_state, tone = "PAUSED", TONE_NEGATIVE
-        detail = "The runtime recorded RUNTIME_TRADING_PAUSED. It submits nothing further."
-    elif run.status == state.RUN_STATUS_RUNNING:
+        detail = "This runtime recorded that it paused trading. It submits nothing further."
+    elif stopped_at is not None:
+        runtime_state, tone = "STOPPED", TONE_MUTED
+        detail = "This runtime recorded a clean shutdown."
+    else:
         stale = last_cycle is None or (now - last_cycle) > STALE_AFTER
         runtime_state = "STALE" if stale else "RUNNING"
         tone = TONE_ATTENTION if stale else TONE_POSITIVE
         detail = (
-            "The strategy run is open but no bar has been claimed for two whole intervals."
+            "This runtime started but has not claimed a bar for two whole intervals."
             if stale
             else None
         )
-    elif run.status == state.RUN_STATUS_FAILED:
-        runtime_state, tone = "FAILED", TONE_NEGATIVE
-        detail = "The most recent strategy run ended in FAILED."
-    else:
-        runtime_state, tone = "STOPPED", TONE_MUTED
-        detail = "The most recent strategy run completed and closed."
 
-    failure = _latest_failure(snapshot)
+    # An outstanding ambiguous order outranks this service's own view of itself:
+    # it stops every service on the account, so a panel reporting RUNNING would
+    # be describing a loop that is running and cannot trade. Applied after the
+    # local verdict rather than mixed into it, so the reason shown is the
+    # account's rather than a guess about this process.
+    #
+    # `UNSAFE_RECONCILIATION` deliberately does *not* override it. That state
+    # means nothing has cleared trading yet - the ordinary condition of a system
+    # that has not reconciled - and a loop that is observing really is running.
+    # The reconciliation row and the trading-safety row both already say that
+    # nothing may submit.
+    if (
+        account_safety is not None
+        and account_safety.available
+        and account_safety.state == state.ACCOUNT_SAFETY_UNSAFE_UNKNOWN
+        and runtime_state in {"RUNNING", "STALE"}
+    ):
+        runtime_state, tone = "PAUSED", TONE_NEGATIVE
+        detail = (
+            "Held by the shared account safety halt: an order with an unresolved "
+            "broker outcome stops every service on this account, not only the one "
+            "that hit it."
+        )
+
     reconciliation = snapshot.reconciliation
     if reconciliation is None:
         safety, safety_tone = "UNRESOLVED", TONE_ATTENTION
@@ -584,13 +697,13 @@ def build_runtime(snapshot: StateSnapshot, *, now: datetime) -> RuntimePanel:
         safety_detail = f"Latest reconciliation is {reconciliation.status}."
 
     return RuntimePanel(
+        key=key,
+        label=label,
         state=runtime_state,
         tone=tone,
         detail=detail,
-        strategy_name=None if run is None else run.strategy_name,
-        mode=None if run is None else run.mode,
-        started_at=None if run is None else _iso(run.started_at),
-        ended_at=None if run is None else _iso(run.ended_at),
+        started_at=_iso(started_at),
+        ended_at=_iso(stopped_at),
         startup_safety=safety,
         startup_safety_tone=safety_tone,
         startup_safety_detail=safety_detail,
@@ -599,8 +712,19 @@ def build_runtime(snapshot: StateSnapshot, *, now: datetime) -> RuntimePanel:
         last_cycle_at=_iso(last_cycle),
         next_cycle_at=_iso(next_wake_time(now)),
         checkpoints=checkpoints,
-        last_error=None if failure is None else _truncate(failure.message or failure.event_type),
-        last_error_at=None if failure is None else _iso(failure.event_timestamp),
+    )
+
+
+def build_runtimes(
+    snapshot: StateSnapshot,
+    *,
+    now: datetime,
+    account_safety: AccountSafetyPanel | None = None,
+) -> tuple[RuntimePanel, ...]:
+    """One panel per service, in a fixed order: crypto first, then equity."""
+    return tuple(
+        build_runtime(snapshot, now=now, spec=spec, account_safety=account_safety)
+        for spec in RUNTIME_SPECS
     )
 
 
@@ -719,9 +843,12 @@ def build_risk(metrics: PrimaryMetrics, broker: BrokerRead) -> RiskPanel:
     behind it is unreadable - while utilization is an observation and carries
     its own unavailable state.
 
-    There is deliberately no separate crypto book and no separate equity book:
-    the risk engine has one set of limits and inventing a second would put a
-    number on this screen that nothing enforces.
+    There is deliberately no separate crypto **limit** and no separate equity
+    limit: the risk engine has one set of limits and inventing a second would
+    put a number on this screen that nothing enforces. The crypto/equity split
+    that `build_exposure` returns alongside these is a *breakdown* of the one
+    total, carried in its own field and flagged `enforced=False`, so the two
+    can never be confused for each other.
     """
     equity = metrics.equity
     largest_symbol: str | None = None
@@ -788,19 +915,158 @@ def build_risk(metrics: PrimaryMetrics, broker: BrokerRead) -> RiskPanel:
         (limit.used_value.unavailable_reason for limit in limits if not limit.used_value.available),
         None,
     )
-    return RiskPanel(limits=limits, available=available, unavailable_reason=reason)
+    return RiskPanel(
+        limits=limits,
+        exposure=build_exposure(metrics, broker),
+        total_exposure_limit_fraction=MAX_TOTAL_EXPOSURE_FRACTION,
+        available=available,
+        unavailable_reason=reason,
+    )
+
+
+def build_exposure(metrics: PrimaryMetrics, broker: BrokerRead) -> tuple[ExposureRow, ...]:
+    """Total account exposure, split by book. **A display breakdown, not limits.**
+
+    One account holds both books and one 30% cap covers both, so this answers
+    "where is the exposure?" and never "how much may each book have?". No
+    per-book allocation exists in the risk engine, and none is implied here:
+    every row but the total carries `enforced=False`, and only the total row is
+    paired with the cap that actually exists.
+
+    The split is by the symbol's own notation, the same rule the rest of this
+    package uses - a quoted pair is crypto, a bare ticker is not - and it is
+    summed from the broker's positions, so the two rows necessarily add up to
+    the total rather than being three independently sourced numbers.
+    """
+    if not broker.ok or broker.positions is None:
+        reason = _broker_reason(broker)
+        unavailable = Amount.unavailable(reason)
+        return (
+            ExposureRow(key="crypto", label="Crypto", value=unavailable),
+            ExposureRow(key="equity", label="Equity", value=unavailable),
+            ExposureRow(key="total", label="Total", value=unavailable, enforced=True),
+        )
+
+    totals = {ASSET_CLASS_CRYPTO: 0.0, ASSET_CLASS_EQUITY: 0.0}
+    for position in broker.positions.values():
+        if position.market_value > 0:
+            totals[asset_class_for(position.symbol)] += position.market_value
+    combined = totals[ASSET_CLASS_CRYPTO] + totals[ASSET_CLASS_EQUITY]
+
+    equity = metrics.equity
+
+    def row(key: str, label: str, value: float, *, enforced: bool = False) -> ExposureRow:
+        return ExposureRow(
+            key=key,
+            label=label,
+            value=Amount.of(value),
+            fraction=(
+                None if not equity.available or not equity.value else _fraction(value, equity.value)
+            ),
+            enforced=enforced,
+        )
+
+    return (
+        row("crypto", "Crypto", totals[ASSET_CLASS_CRYPTO]),
+        row("equity", "Equity", totals[ASSET_CLASS_EQUITY]),
+        row("total", "Total", combined, enforced=True),
+    )
+
+
+def build_account_safety(snapshot: StateSnapshot) -> AccountSafetyPanel:
+    """The shared account halt, read from the row both runtimes read.
+
+    Not inferred from what either runtime logged: the halt is a property of the
+    account, and the whole reason it is durable is that neither process's own
+    view of itself can be trusted to describe it. `UNSAFE_UNKNOWN` carries the
+    `client_order_id` an operator needs in order to ask the broker what actually
+    happened.
+    """
+    if not snapshot.ok or snapshot.account_safety is None:
+        return AccountSafetyPanel(
+            state="UNAVAILABLE",
+            tone=TONE_ATTENTION,
+            safe_to_trade=False,
+            detail="The shared account safety state could not be read.",
+            available=False,
+            unavailable_reason=UNAVAILABLE_DATABASE_UNREADABLE,
+        )
+
+    safety = snapshot.account_safety
+    if safety.safe_to_trade:
+        tone = TONE_POSITIVE
+    elif safety.state == state.ACCOUNT_SAFETY_UNSAFE_UNKNOWN:
+        tone = TONE_NEGATIVE
+    else:
+        tone = TONE_ATTENTION
+
+    return AccountSafetyPanel(
+        state=safety.state,
+        tone=tone,
+        safe_to_trade=safety.safe_to_trade,
+        detail=_truncate(safety.reason),
+        source=safety.source,
+        client_order_id=safety.client_order_id,
+        updated_at=_iso(safety.updated_at),
+    )
+
+
+#: How each shared budget is labelled on screen.
+_BUDGET_LABELS = {
+    state.API_BUDGET_TRADING: "Trading API",
+    state.API_BUDGET_MARKET_DATA: "Market data API",
+}
+
+
+def build_api_budget(snapshot: StateSnapshot, *, now: datetime) -> tuple[ApiBudgetRow, ...]:
+    """The shared API budgets' usage in the current window.
+
+    Both rows are always shown, including at zero: an empty window is a real
+    and common state for a fifteen-minute system, and a row that vanished when
+    nothing had been spent would make "no traffic" look like "not metered".
+
+    The limits here are this system's own conservative ceilings, not published
+    provider rate limits, and the row is labelled that way on screen.
+    """
+    if not snapshot.ok:
+        return ()
+
+    spent = {window.budget: window for window in snapshot.api_budget}
+    window_start = api_budget_module.window_start_for(now)
+    rows: list[ApiBudgetRow] = []
+    for budget in state.API_BUDGETS:
+        limit = api_budget_module.limit_for(budget)
+        used = spent[budget].call_count if budget in spent else 0
+        remaining = max(0, limit - used)
+        rows.append(
+            ApiBudgetRow(
+                key=budget.lower(),
+                label=_BUDGET_LABELS.get(budget, budget),
+                used=used,
+                limit=limit,
+                remaining=remaining,
+                window_start=_iso(window_start),
+                tone=TONE_ATTENTION if remaining == 0 else TONE_MUTED,
+            )
+        )
+    return tuple(rows)
 
 
 def build_health(
     snapshot: StateSnapshot,
     broker: BrokerRead,
     reconciliation: ReconciliationPanel,
-    runtime: RuntimePanel,
+    runtimes: tuple[RuntimePanel, ...],
+    account_safety: AccountSafetyPanel,
 ) -> tuple[HealthComponent, HealthComponent, tuple[HealthComponent, ...]]:
     """The health panel, plus the database and broker rows the header also uses.
 
     Returned as `(database, broker, all_components)` so the header does not
     have to search the list by key for the two subsystems it reports on.
+
+    There is one row per runtime and one row for the shared account safety
+    state, in that order: the account row is the one that answers "may anything
+    trade", and the runtime rows answer "is each service doing its job".
     """
     if snapshot.ok:
         database = HealthComponent(
@@ -878,12 +1144,22 @@ def build_health(
             detail="Reconciliation state could not be read.",
         )
 
-    runtime_row = HealthComponent(
-        key="runtime",
-        label="Runtime",
-        status=runtime.state,
-        tone=runtime.tone,
-        detail=runtime.detail,
+    runtime_rows = tuple(
+        HealthComponent(
+            key=f"runtime_{runtime.key}",
+            label=runtime.label,
+            status=runtime.state,
+            tone=runtime.tone,
+            detail=runtime.detail,
+        )
+        for runtime in runtimes
+    )
+    account_row = HealthComponent(
+        key="account_safety",
+        label="Account safety",
+        status=account_safety.state,
+        tone=account_safety.tone,
+        detail=account_safety.detail,
     )
 
     if not snapshot.ok:
@@ -893,6 +1169,17 @@ def build_health(
             status="UNKNOWN",
             tone=TONE_ATTENTION,
             detail="Trading permission cannot be established without the database.",
+        )
+    elif not account_safety.safe_to_trade:
+        safety_row = HealthComponent(
+            key="trading_safety",
+            label="Trading safety",
+            status="BLOCKED",
+            tone=account_safety.tone,
+            detail=(
+                f"The shared account safety state is {account_safety.state}. No service "
+                "on this account may submit."
+            ),
         )
     elif reconciliation.safe_to_trade is not True:
         safety_row = HealthComponent(
@@ -906,15 +1193,16 @@ def build_health(
                 else "No completed reconciliation has cleared trading."
             ),
         )
-    elif runtime.state == "PAUSED":
+    elif any(runtime.state == "PAUSED" for runtime in runtimes):
+        paused = ", ".join(r.label for r in runtimes if r.state == "PAUSED")
         safety_row = HealthComponent(
             key="trading_safety",
             label="Trading safety",
             status="PAUSED",
             tone=TONE_NEGATIVE,
-            detail="The runtime paused trading and will not submit again.",
+            detail=f"{paused} paused trading and will not submit again.",
         )
-    elif runtime.paper_execution_enabled:
+    elif any(runtime.paper_execution_enabled for runtime in runtimes):
         safety_row = HealthComponent(
             key="trading_safety",
             label="Trading safety",
@@ -931,7 +1219,14 @@ def build_health(
             detail="Reconciliation cleared trading, but the paper submission gate is closed.",
         )
 
-    components = (reconciliation_row, runtime_row, broker_row, database, safety_row)
+    components = (
+        account_row,
+        reconciliation_row,
+        *runtime_rows,
+        broker_row,
+        database,
+        safety_row,
+    )
     return database, broker_row, components
 
 
@@ -940,16 +1235,29 @@ def derive_system_state(
     snapshot: StateSnapshot,
     broker: BrokerRead,
     reconciliation: ReconciliationPanel,
-    runtime: RuntimePanel,
+    runtimes: tuple[RuntimePanel, ...],
+    account_safety: AccountSafetyPanel,
     orders: OrdersPanel,
 ) -> tuple[str, str, tuple[str, ...]]:
     """The header verdict, its tone, and the reasons behind it.
 
     The rule, written down once:
 
-    ``PAUSED``     trading is durably blocked - the latest reconciliation is
-                   not `safe_to_trade`, or the runtime recorded that it stopped
+    ``PAUSED``     trading is durably blocked - the shared account safety state
+                   is `UNSAFE_UNKNOWN`, the latest reconciliation is not
+                   `safe_to_trade`, or either runtime recorded that it stopped
                    trading. This is the state that means *stop and look*.
+
+                   `UNSAFE_RECONCILIATION` is deliberately **not** here. It is
+                   the ordinary state of a system that has not reconciled yet -
+                   a fresh database is in it - so it belongs with the other
+                   "needs a person" conditions rather than with the ones that
+                   mean something has gone wrong.
+
+                   The account halt is listed first because it is the widest of
+                   the three: one ambiguous order stops both services, and a
+                   header that stayed green while an order of unknown status sat
+                   at the broker would be the worst thing this screen could do.
     ``ATTENTION``  something needs a person: an `UNKNOWN` order, an unresolved
                    reconciliation issue, a reconciliation that never ran, a
                    database or broker that cannot be read, a paper account the
@@ -964,10 +1272,19 @@ def derive_system_state(
     """
     reasons: list[str] = []
 
+    if account_safety.available and account_safety.state == state.ACCOUNT_SAFETY_UNSAFE_UNKNOWN:
+        anchor = (
+            "" if account_safety.client_order_id is None else f" ({account_safety.client_order_id})"
+        )
+        reasons.append(
+            f"Account safety {account_safety.state}{anchor} - an order's broker outcome "
+            "is unresolved and no service on this account may submit."
+        )
     if reconciliation.available and reconciliation.safe_to_trade is False:
         reasons.append(f"Reconciliation {reconciliation.status} - trading is not cleared.")
-    if runtime.state == "PAUSED":
-        reasons.append("The runtime paused trading and will not submit again.")
+    for runtime in runtimes:
+        if runtime.state == "PAUSED":
+            reasons.append(f"{runtime.label} paused trading and will not submit again.")
     if reasons:
         return SYSTEM_PAUSED, TONE_NEGATIVE, tuple(reasons)
 
@@ -987,12 +1304,25 @@ def derive_system_state(
         )
     if not snapshot.ok:
         reasons.append("The operational database could not be read.")
+    if not account_safety.available:
+        reasons.append("The shared account safety state could not be read.")
+    elif not account_safety.safe_to_trade and (
+        account_safety.state != state.ACCOUNT_SAFETY_UNSAFE_UNKNOWN
+    ):
+        # Nothing has cleared trading yet. That needs a person, but it is not
+        # the same thing as an order loose at the broker, and giving it the same
+        # colour would make the colour that matters mean less.
+        reasons.append(
+            f"Account safety {account_safety.state} - no full-universe reconciliation "
+            "has established that this account may trade."
+        )
     if not broker.ok and broker.reason == UNAVAILABLE_BROKER_UNREADABLE:
         reasons.append("The Alpaca paper account could not be read.")
     if broker.ok and broker.tradable is False:
         reasons.append("The paper account is not currently able to trade.")
-    if runtime.state in {"STALE", "FAILED", "UNAVAILABLE"}:
-        reasons.append(f"Runtime {runtime.state}.")
+    for runtime in runtimes:
+        if runtime.state in {"STALE", "FAILED", "UNAVAILABLE"}:
+            reasons.append(f"{runtime.label} {runtime.state}.")
 
     if reasons:
         return SYSTEM_ATTENTION, TONE_ATTENTION, tuple(reasons)
@@ -1028,16 +1358,23 @@ def build_overview(
     positions = build_positions(snapshot, broker)
     orders = build_orders(snapshot, limit=order_limit)
     reconciliation = build_reconciliation(snapshot)
-    runtime = build_runtime(snapshot, now=moment)
+    account_safety = build_account_safety(snapshot)
+    runtimes = build_runtimes(snapshot, now=moment, account_safety=account_safety)
+    api_budget = build_api_budget(snapshot, now=moment)
     risk = build_risk(metrics, broker)
-    database_row, broker_row, health = build_health(snapshot, broker, reconciliation, runtime)
+    database_row, broker_row, health = build_health(
+        snapshot, broker, reconciliation, runtimes, account_safety
+    )
     system_state, tone, reasons = derive_system_state(
         snapshot=snapshot,
         broker=broker,
         reconciliation=reconciliation,
-        runtime=runtime,
+        runtimes=runtimes,
+        account_safety=account_safety,
         orders=orders,
     )
+
+    failure = _latest_failure(snapshot) if snapshot.ok else None
 
     notices: list[str] = []
     if not broker.ok and broker.reason == UNAVAILABLE_BROKER_NOT_CONFIGURED:
@@ -1059,7 +1396,13 @@ def build_overview(
         orders=orders,
         health=health,
         reconciliation=reconciliation,
-        runtime=runtime,
+        runtimes=runtimes,
+        account_safety=account_safety,
+        api_budget=api_budget,
+        last_failure=(
+            None if failure is None else _truncate(failure.message or failure.event_type)
+        ),
+        last_failure_at=None if failure is None else _iso(failure.event_timestamp),
         risk=risk,
         notices=tuple(notices),
     )
@@ -1076,9 +1419,13 @@ __all__ = [
     "build_orders",
     "build_overview",
     "build_positions",
+    "build_account_safety",
+    "build_api_budget",
+    "build_exposure",
     "build_reconciliation",
     "build_risk",
     "build_runtime",
+    "build_runtimes",
     "derive_system_state",
     "models",
     "read_only_connection",

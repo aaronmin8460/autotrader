@@ -56,6 +56,7 @@ from typing import Protocol
 
 import pandas as pd
 
+from autotrader.account import safety as account_safety
 from autotrader.backtest.engine import STRATEGY_NAME
 from autotrader.data.validation import (
     EQUITY_UNIVERSE_LABEL,
@@ -433,13 +434,26 @@ class EquityRuntime:
         return ExecutionAuthorization(True, None)
 
     def _may_submit(self) -> tuple[bool, str | None]:
-        """Whether a submission may happen *right now*."""
+        """Whether a submission may happen *right now*.
+
+        The last check reads durable state rather than this process's memory,
+        and it is what makes "UNKNOWN from any asset = no new orders from any
+        asset" true across processes. The crypto runtime hitting an ambiguous
+        BTC/USD submission writes the halt; this runner sees it on its next
+        in-session cycle and does not submit, without the two ever talking to
+        each other. The execution boundary refuses independently as well, so
+        removing this check would cost a clean status line rather than the
+        guarantee itself.
+        """
         if self._authorization.disabled:
             return False, self._authorization.reason
         if self._heartbeat.state is RuntimeState.TRADING_PAUSED:
             return False, "TRADING_PAUSED"
         if self._shutdown.requested:
             return False, "SHUTTING_DOWN"
+        safety = account_safety.read_account_safety(self._connection)
+        if not safety.safe_to_trade:
+            return False, f"ACCOUNT_{safety.state}"
         return True, None
 
     # ------------------------------------------------------------------

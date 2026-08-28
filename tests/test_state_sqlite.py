@@ -139,8 +139,8 @@ def test_initialize_database_creates_the_file(tmp_path: Path) -> None:
 def test_a_fresh_database_initializes_directly_at_the_current_version(
     connection: sqlite3.Connection,
 ) -> None:
-    assert SCHEMA_VERSION == 5
-    assert get_schema_version(connection) == 5
+    assert SCHEMA_VERSION == 6
+    assert get_schema_version(connection) == 6
 
 
 def test_initialization_is_idempotent(tmp_path: Path) -> None:

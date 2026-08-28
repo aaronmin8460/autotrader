@@ -16,7 +16,7 @@
  */
 
 import { money, percent, unavailableLabel } from "@/lib/format";
-import type { RiskLimit, RiskPanel } from "@/lib/types";
+import type { ExposureRow, RiskLimit, RiskPanel } from "@/lib/types";
 
 import { Bar, Card, Tag, cn } from "./ui";
 
@@ -56,6 +56,60 @@ function Limit({ limit }: { limit: RiskLimit }) {
   );
 }
 
+/**
+ * Where total exposure sits, split by book.
+ *
+ * This is a **breakdown of one enforced number**, not two limits. Crypto and
+ * equity draw on the same 30% account cap; there is no per-book allocation in
+ * the risk engine, and putting a "crypto limit" on this screen would name a
+ * rule that nothing enforces. Only the total row carries a cap, and only the
+ * total row gets a bar - the two book rows are figures, not tracks against a
+ * ceiling, and giving them tracks is exactly how a reader would misread them.
+ */
+function Exposure({ rows, limitFraction }: { rows: ExposureRow[]; limitFraction: number | null }) {
+  if (rows.length === 0) return null;
+  const total = rows.find((row) => row.enforced) ?? null;
+  const books = rows.filter((row) => !row.enforced);
+
+  return (
+    <div className="mt-3 border-t border-line pt-3">
+      <h3 className="eyebrow text-ink-3">Exposure by book</h3>
+      <div className="mt-2 space-y-1.5">
+        {books.map((row) => (
+          <div key={row.key} className="flex items-baseline justify-between gap-3">
+            <span className="text-[12.5px] text-ink-2">{row.label}</span>
+            <span className="num shrink-0 text-[12.5px] whitespace-nowrap">
+              {row.value.available ? (
+                <>
+                  <span className="text-ink">{percent(row.fraction)}</span>
+                  <span className="text-ink-3"> · {money(row.value.value)}</span>
+                </>
+              ) : (
+                <span className="text-ink-3">—</span>
+              )}
+            </span>
+          </div>
+        ))}
+        {total ? (
+          <div className="flex items-baseline justify-between gap-3 border-t border-line pt-1.5">
+            <span className="text-[12.5px] font-medium text-ink">{total.label}</span>
+            <span className="num shrink-0 text-[12.5px] whitespace-nowrap">
+              <span className="text-ink">
+                {total.value.available ? percent(total.fraction) : "—"}
+              </span>
+              <span className="text-ink-3"> / {percent(limitFraction, 0)} account</span>
+            </span>
+          </div>
+        ) : null}
+      </div>
+      <p className="mt-2 text-[11px] leading-snug text-ink-3">
+        One account, one 30% cap. There is no per-book limit - this is where the total sits, not
+        an allocation between the two.
+      </p>
+    </div>
+  );
+}
+
 export function Risk({ panel }: { panel: RiskPanel | null }) {
   if (!panel) {
     return (
@@ -76,6 +130,7 @@ export function Risk({ panel }: { panel: RiskPanel | null }) {
           <Limit key={limit.key} limit={limit} />
         ))}
       </div>
+      <Exposure rows={panel.exposure} limitFraction={panel.total_exposure_limit_fraction} />
       {panel.available ? null : (
         <p className="mt-3 border-t border-line pt-3 text-[11px] leading-snug text-ink-3">
           Limits are policy and are always shown. Current utilization needs a broker read.

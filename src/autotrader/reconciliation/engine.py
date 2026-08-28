@@ -84,8 +84,9 @@ from enum import Enum
 
 from alpaca.trading.client import TradingClient
 
+from autotrader.account import safety as account_safety
 from autotrader.execution.models import (
-    SUPPORTED_SYMBOLS,
+    TRADABLE_SYMBOLS,
     ExecutionError,
     format_quantity,
 )
@@ -740,12 +741,21 @@ def _finish(
     orders_checked: int,
     positions_checked: int,
     dry_run: bool,
+    symbols: tuple[str, ...] = (),
 ) -> ReconciliationResult:
-    """Assemble the result and, unless this is a dry run, record it.
+    """Assemble the result, record it, and move the shared account halt.
 
     If the audit write itself fails there is no honest way to report success:
     the pass becomes `FAILED`, because a runtime that cannot be told what
     happened must not start trading on the strength of it.
+
+    **Every finished pass updates `account_safety_state`**, and it happens here
+    rather than in each caller so that running a reconciliation and forgetting
+    to act on it is not a thing a caller can do. What the update actually is -
+    clear the halt, raise one, or leave it alone because this pass was narrower
+    than the account - is decided by `account.safety`, which owns that policy;
+    this function only makes sure it is asked. A dry run asks and is told
+    nothing changes.
     """
     result = ReconciliationResult(
         status=_status_for(tuple(issues)),
@@ -755,6 +765,7 @@ def _finish(
         positions_checked=positions_checked,
         issues=tuple(issues),
         dry_run=dry_run,
+        symbols=symbols,
     )
     if dry_run:
         return result
@@ -769,25 +780,48 @@ def _finish(
                 detail=f"the reconciliation audit record could not be written: {error}",
             )
         )
-        return ReconciliationResult(
-            status=ReconciliationStatus.FAILED,
-            started_at=started_at,
-            completed_at=completed_at,
-            orders_checked=orders_checked,
-            positions_checked=positions_checked,
-            issues=tuple(issues),
-            dry_run=dry_run,
+        return _with_account_safety(
+            connection,
+            ReconciliationResult(
+                status=ReconciliationStatus.FAILED,
+                started_at=started_at,
+                completed_at=completed_at,
+                orders_checked=orders_checked,
+                positions_checked=positions_checked,
+                issues=tuple(issues),
+                dry_run=dry_run,
+                symbols=symbols,
+            ),
         )
-    return ReconciliationResult(
-        status=result.status,
-        started_at=result.started_at,
-        completed_at=result.completed_at,
-        orders_checked=result.orders_checked,
-        positions_checked=result.positions_checked,
-        issues=result.issues,
-        dry_run=dry_run,
-        reconciliation_run_id=run_id,
+    return _with_account_safety(
+        connection,
+        ReconciliationResult(
+            status=result.status,
+            started_at=result.started_at,
+            completed_at=result.completed_at,
+            orders_checked=result.orders_checked,
+            positions_checked=result.positions_checked,
+            issues=result.issues,
+            dry_run=dry_run,
+            reconciliation_run_id=run_id,
+            symbols=symbols,
+        ),
     )
+
+
+def _with_account_safety(
+    connection: sqlite3.Connection, result: ReconciliationResult
+) -> ReconciliationResult:
+    """Hand a finished pass to the shared account halt, and return it unchanged.
+
+    A failure to write the halt is **not** swallowed. The halt is what stops the
+    other runtime, and a pass that concluded the account is unsafe but could not
+    record it would leave the crypto runner free to trade over an ambiguous
+    equity order. Letting the `StateError` out is the fail-closed answer: both
+    runtimes already treat one as fatal.
+    """
+    account_safety.apply_reconciliation_result(connection, result, now=result.completed_at)
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -801,7 +835,7 @@ def reconcile_paper_state(
     trading_client: TradingClient | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
-    symbols: tuple[str, ...] = SUPPORTED_SYMBOLS,
+    symbols: tuple[str, ...] = TRADABLE_SYMBOLS,
     confirmations: int = NOT_FOUND_CONFIRMATIONS,
     recheck_delay_seconds: float = NOT_FOUND_RECHECK_DELAY_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
@@ -834,12 +868,19 @@ def reconcile_paper_state(
     repair, no run row, no event, no system event. It is the audit mode: run it
     to see what a real pass would change.
 
-    `symbols` is the position universe this pass owns. It defaults to the
-    crypto pairs, so an existing caller's behaviour is unchanged. Step 4 -
-    order intents - is deliberately **not** filtered by it: a `client_order_id`
-    whose outcome is unknown blocks trading for the whole account, which is the
-    only correct answer when the account is shared. A position held outside
-    `symbols` is recorded as observed and never traded out of.
+    `symbols` is the position universe this pass owns. It defaults to **all
+    twelve tracked symbols** - both crypto pairs and all ten equities - because
+    one account holds both books and a pass that looked at half of it cannot say
+    the account is understood. A narrower universe may still be passed, and such
+    a pass reports honestly on what it covered; what it may not do is clear the
+    shared account halt, which `account.safety.apply_reconciliation_result`
+    enforces by checking coverage rather than by trusting the caller.
+
+    Step 4 - order intents - is deliberately **not** filtered by the universe: a
+    `client_order_id` whose outcome is unknown blocks trading for the whole
+    account, which is the only correct answer when the account is shared. A
+    position held outside `symbols` is recorded as observed and never traded out
+    of.
 
     `confirmations`, `recheck_delay_seconds`, and `sleep` control the bounded
     re-read that a not-found answer has to survive. They are parameters so a
@@ -880,6 +921,10 @@ def reconcile_paper_state(
             orders_checked=0,
             positions_checked=0,
             dry_run=dry_run,
+            # A pass that failed before reading the broker verified nothing, so
+            # it names no covered symbol. Reporting the intended universe here
+            # would let a failed pass look like full coverage.
+            symbols=(),
         )
 
     try:
@@ -1016,6 +1061,7 @@ def reconcile_paper_state(
         orders_checked=orders_checked,
         positions_checked=len(universe),
         dry_run=dry_run,
+        symbols=universe,
     )
 
 

@@ -120,6 +120,13 @@ from alpaca.trading.models import Asset, Order, TradeAccount
 from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.requests import MarketOrderRequest
 
+from autotrader.account import safety as account_safety
+from autotrader.account.budget import (
+    CRYPTO_EXECUTION_TRADING_CALLS,
+    EXECUTION_MARKET_DATA_CALLS,
+)
+from autotrader.account.execution import account_execution_section
+from autotrader.account.lock import AccountExecutionLock
 from autotrader.execution.models import (
     ExecutionError,
     ExecutionInputError,
@@ -1552,23 +1559,58 @@ def _mark_unknown(
 
     The intent moves to `UNKNOWN` and keeps its `client_order_id`. No second
     submission is attempted here or anywhere else - that is the entire point.
+
+    **The whole account is halted here, not just this product.** One brokerage
+    account holds both books, so an order that may or may not exist makes the
+    account's true position and true exposure unknown - and every number the
+    *other* runtime would size against is derived from those. The durable halt
+    in `account_safety_state` is what stops the crypto runner waking at the next
+    boundary and trading over an ambiguous SPY order, and the equity runner
+    opening at 09:30 over an ambiguous BTC one. Both runtimes also pause
+    themselves in-process, which is kept and is not enough on its own: an
+    in-process pause cannot cross a process boundary or survive a restart.
+
+    **The three writes are one transaction.** An intent recorded `UNKNOWN`
+    without the halt beside it is precisely the dangerous state - a loose order
+    at the broker and an account that still believes it may trade - so they
+    commit together or not at all. A failure to write leaves the caller with a
+    `StateError`, which both runtimes already treat as fatal.
     """
-    state.update_order_intent_status(
-        connection,
-        order_intent_id=order_intent_id,
-        status=state.INTENT_STATUS_UNKNOWN,
-        updated_at=now,
+    source = (
+        account_safety.SOURCE_CRYPTO
+        if is_usd_quoted(intent.symbol)
+        else account_safety.SOURCE_EQUITY
     )
-    state.record_system_event(
-        connection,
-        event_timestamp=now,
-        event_type=EVENT_UNKNOWN,
-        message=(
-            f"Submission outcome unknown for client_order_id {intent.client_order_id} "
-            f"({detail}). The order may or may not exist at the broker. It was NOT "
-            "retried and the client_order_id was NOT regenerated."
-        ),
-    )
+    with state.transaction(connection):
+        state.update_order_intent_status(
+            connection,
+            order_intent_id=order_intent_id,
+            status=state.INTENT_STATUS_UNKNOWN,
+            updated_at=now,
+        )
+        account_safety.halt_account_for_unknown(
+            connection,
+            source=source,
+            client_order_id=intent.client_order_id,
+            detail=(
+                f"The outcome of a {intent.symbol} submission is unknown ({detail}). "
+                "The order may or may not exist at the broker, so this account's true "
+                "position and exposure are both unknown and no runtime may submit."
+            ),
+            now=now,
+        )
+        state.record_system_event(
+            connection,
+            event_timestamp=now,
+            event_type=EVENT_UNKNOWN,
+            message=(
+                f"Submission outcome unknown for client_order_id "
+                f"{intent.client_order_id} ({detail}). The order may or may not exist "
+                "at the broker. It was NOT retried and the client_order_id was NOT "
+                "regenerated. The whole account is halted until a full-universe "
+                "reconciliation resolves it."
+            ),
+        )
     return AmbiguousSubmissionError(
         "The submission outcome is unknown: the broker may or may not have accepted "
         f"the order ({detail}). It was not retried. The intent is recorded as UNKNOWN "
@@ -1589,6 +1631,7 @@ def execute_paper_order(
     trading_enabled: bool = True,
     strategy_run_id: int | None = None,
     now: datetime | None = None,
+    account_lock: AccountExecutionLock | None = None,
 ) -> PaperExecutionResult:
     """Run the full paper execution pipeline for one crypto order.
 
@@ -1610,6 +1653,19 @@ def execute_paper_order(
     13. preflight for a duplicate, failing closed if the check cannot complete;
     14. submit exactly once;
     15. persist whatever the broker said.
+
+    Steps 2 to 15 run inside the **account execution critical section**: the
+    shared account lock is taken, the durable account-wide halt is verified, and
+    the API budget for this section's calls is charged, before the account is
+    read at all. The equity boundary enters the identical section, so the two
+    products cannot interleave between reading free exposure and consuming it,
+    and an ambiguous order raised by either stops both. `account_lock` lets a
+    long-lived runtime reuse one lock object; omitted, it is derived from the
+    connection's own database file.
+
+    A dry run enters none of it. It submits nothing and therefore changes no
+    account state, and an operator must be able to observe while the account is
+    halted.
 
     Steps 12 and 14 are in that order deliberately: a crash between them leaves
     a durable key that Phase 8 can resolve, whereas submitting first would
@@ -1636,137 +1692,161 @@ def execute_paper_order(
     client = trading_client if trading_client is not None else create_paper_trading_client()
     prices = data_client if data_client is not None else create_market_data_client()
 
-    account = fetch_paper_account_state(client)
-    require_tradable_account(account)
-    positions = fetch_paper_positions(client)
-    asset = fetch_crypto_asset(client, ticker)
-    reference_price = fetch_reference_price(prices, ticker)
+    # ------------------------------------------------------------------
+    # The account execution critical section.
+    #
+    # Everything from here to the end of this function reads or acts on
+    # state that belongs to the whole account rather than to crypto: the
+    # equity figure, the free exposure under the 30% cap, the durable halt,
+    # and the one client_order_id namespace. The equity boundary enters the
+    # identical section, so the two cannot interleave inside it and cannot
+    # both size an order into the same headroom.
+    #
+    # A dry run passes through unguarded: it reads the broker and submits
+    # nothing, so it changes no account state and must stay available to an
+    # operator precisely when the account is halted.
+    # ------------------------------------------------------------------
+    with account_execution_section(
+        connection,
+        now=moment,
+        engaged=not dry_run,
+        trading_calls=CRYPTO_EXECUTION_TRADING_CALLS,
+        market_data_calls=EXECUTION_MARKET_DATA_CALLS,
+        lock=account_lock,
+    ):
+        account = fetch_paper_account_state(client)
+        require_tradable_account(account)
+        positions = fetch_paper_positions(client)
+        asset = fetch_crypto_asset(client, ticker)
+        reference_price = fetch_reference_price(prices, ticker)
 
-    baseline_equity = resolve_daily_baseline_equity(connection, equity=account.equity, now=moment)
-    context = build_risk_context(
-        account,
-        positions,
-        ticker,
-        daily_baseline_equity=baseline_equity,
-        trading_enabled=trading_enabled,
-    )
-    decision = evaluate_risk(
-        RiskRequest(
+        baseline_equity = resolve_daily_baseline_equity(
+            connection, equity=account.equity, now=moment
+        )
+        context = build_risk_context(
+            account,
+            positions,
+            ticker,
+            daily_baseline_equity=baseline_equity,
+            trading_enabled=trading_enabled,
+        )
+        decision = evaluate_risk(
+            RiskRequest(
+                symbol=ticker,
+                side=_to_risk_side(order_side),
+                reference_price=reference_price,
+                requested_quantity=quantity,
+            ),
+            context,
+        )
+
+        # The observed position is recorded from what the broker actually reports,
+        # before anything is submitted. Nothing later in this function updates it:
+        # an accepted order is not a fill, and inferring a position from one would
+        # be a fabrication. Phase 8 reconciles this table properly.
+        held = positions.get(broker_symbol_key(ticker))
+        state.upsert_position(
+            connection,
             symbol=ticker,
-            side=_to_risk_side(order_side),
-            reference_price=reference_price,
-            requested_quantity=quantity,
-        ),
-        context,
-    )
+            quantity=held.quantity if held is not None else _ZERO,
+            average_price=held.average_entry_price if held is not None else None,
+            updated_at=moment,
+        )
 
-    # The observed position is recorded from what the broker actually reports,
-    # before anything is submitted. Nothing later in this function updates it:
-    # an accepted order is not a fill, and inferring a position from one would
-    # be a fabrication. Phase 8 reconciles this table properly.
-    held = positions.get(broker_symbol_key(ticker))
-    state.upsert_position(
-        connection,
-        symbol=ticker,
-        quantity=held.quantity if held is not None else _ZERO,
-        average_price=held.average_entry_price if held is not None else None,
-        updated_at=moment,
-    )
-
-    state.record_risk_event(
-        connection,
-        event_timestamp=moment,
-        decision="APPROVED" if decision.approved else "REJECTED",
-        reason_code=decision.reason_code,
-        symbol=ticker,
-        message=decision.message,
-        strategy_run_id=strategy_run_id,
-    )
-
-    common = {
-        "symbol": ticker,
-        "side": order_side,
-        "requested_quantity": quantity,
-        "reference_price": reference_price,
-        "risk_decision": decision,
-        "account": account,
-        "daily_baseline_equity": baseline_equity,
-        "asset": asset,
-        # Reported on every outcome, including a risk rejection: an operator
-        # sizing the next attempt needs the threshold whether or not this
-        # attempt got as far as being measured against it.
-        "effective_minimum_quantity": effective_minimum_quantity(
-            asset, reference_price=reference_price
-        ),
-    }
-
-    if not decision.approved:
-        return PaperExecutionResult(
-            outcome=ExecutionOutcome.REJECTED_BY_RISK,
+        state.record_risk_event(
+            connection,
+            event_timestamp=moment,
+            decision="APPROVED" if decision.approved else "REJECTED",
+            reason_code=decision.reason_code,
+            symbol=ticker,
             message=decision.message,
-            **common,
+            strategy_run_id=strategy_run_id,
         )
 
-    broker_quantity = normalize_broker_quantity(
-        decision.approved_quantity, asset, reference_price=reference_price
-    )
+        common = {
+            "symbol": ticker,
+            "side": order_side,
+            "requested_quantity": quantity,
+            "reference_price": reference_price,
+            "risk_decision": decision,
+            "account": account,
+            "daily_baseline_equity": baseline_equity,
+            "asset": asset,
+            # Reported on every outcome, including a risk rejection: an operator
+            # sizing the next attempt needs the threshold whether or not this
+            # attempt got as far as being measured against it.
+            "effective_minimum_quantity": effective_minimum_quantity(
+                asset, reference_price=reference_price
+            ),
+        }
 
-    intent = OrderIntent(
-        symbol=ticker,
-        side=order_side,
-        requested_quantity=quantity,
-        approved_quantity=broker_quantity,
-        reference_price=reference_price,
-        risk_reason_code=decision.reason_code,
-        created_at=moment,
-        strategy_run_id=strategy_run_id,
-    )
+        if not decision.approved:
+            return PaperExecutionResult(
+                outcome=ExecutionOutcome.REJECTED_BY_RISK,
+                message=decision.message,
+                **common,
+            )
 
-    if dry_run:
-        # Deliberately not persisted. No broker attempt will follow, so a row
-        # here would be an intent that never had a chance to become an order -
-        # noise in the very table crash recovery has to trust.
+        broker_quantity = normalize_broker_quantity(
+            decision.approved_quantity, asset, reference_price=reference_price
+        )
+
+        intent = OrderIntent(
+            symbol=ticker,
+            side=order_side,
+            requested_quantity=quantity,
+            approved_quantity=broker_quantity,
+            reference_price=reference_price,
+            risk_reason_code=decision.reason_code,
+            created_at=moment,
+            strategy_run_id=strategy_run_id,
+        )
+
+        if dry_run:
+            # Deliberately not persisted. No broker attempt will follow, so a row
+            # here would be an intent that never had a chance to become an order -
+            # noise in the very table crash recovery has to trust.
+            return PaperExecutionResult(
+                outcome=ExecutionOutcome.DRY_RUN,
+                message="Dry run: nothing was persisted and no order was submitted.",
+                intent=intent,
+                **common,
+            )
+
+        order_intent_id = state.record_order_intent(
+            connection,
+            client_order_id=intent.client_order_id,
+            created_at=intent.created_at,
+            symbol=intent.symbol,
+            side=intent.side.value,
+            requested_quantity=intent.requested_quantity,
+            approved_quantity=intent.approved_quantity,
+            reference_price=intent.reference_price,
+            risk_reason_code=intent.risk_reason_code,
+            strategy_run_id=strategy_run_id,
+            status=state.INTENT_STATUS_CREATED,
+        )
+
+        submission = submit_order_intent(connection, client, intent, order_intent_id, now=moment)
+        snapshot = submission.snapshot
+        prefix = (
+            "The broker already had an order under this client_order_id, so nothing was submitted"
+            if submission.duplicate
+            else "Paper order accepted"
+        )
         return PaperExecutionResult(
-            outcome=ExecutionOutcome.DRY_RUN,
-            message="Dry run: nothing was persisted and no order was submitted.",
+            outcome=(
+                ExecutionOutcome.DUPLICATE if submission.duplicate else ExecutionOutcome.SUBMITTED
+            ),
+            message=(
+                f"{prefix}: broker order {snapshot.broker_order_id}, status "
+                f"{snapshot.status}. Accepted is not filled."
+            ),
             intent=intent,
+            order_intent_id=order_intent_id,
+            broker_order=snapshot,
             **common,
         )
-
-    order_intent_id = state.record_order_intent(
-        connection,
-        client_order_id=intent.client_order_id,
-        created_at=intent.created_at,
-        symbol=intent.symbol,
-        side=intent.side.value,
-        requested_quantity=intent.requested_quantity,
-        approved_quantity=intent.approved_quantity,
-        reference_price=intent.reference_price,
-        risk_reason_code=intent.risk_reason_code,
-        strategy_run_id=strategy_run_id,
-        status=state.INTENT_STATUS_CREATED,
-    )
-
-    submission = submit_order_intent(connection, client, intent, order_intent_id, now=moment)
-    snapshot = submission.snapshot
-    prefix = (
-        "The broker already had an order under this client_order_id, so nothing was submitted"
-        if submission.duplicate
-        else "Paper order accepted"
-    )
-    return PaperExecutionResult(
-        outcome=(
-            ExecutionOutcome.DUPLICATE if submission.duplicate else ExecutionOutcome.SUBMITTED
-        ),
-        message=(
-            f"{prefix}: broker order {snapshot.broker_order_id}, status "
-            f"{snapshot.status}. Accepted is not filled."
-        ),
-        intent=intent,
-        order_intent_id=order_intent_id,
-        broker_order=snapshot,
-        **common,
-    )
 
 
 __all__ = [

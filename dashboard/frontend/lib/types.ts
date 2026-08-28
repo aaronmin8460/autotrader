@@ -123,11 +123,11 @@ export interface CheckpointRow {
 }
 
 export interface RuntimePanel {
+  key: string;
+  label: string;
   state: string;
   tone: Tone;
   detail: string | null;
-  strategy_name: string | null;
-  mode: string | null;
   started_at: string | null;
   ended_at: string | null;
   startup_safety: string;
@@ -155,10 +155,55 @@ export interface RiskLimit {
   detail: string | null;
 }
 
+/**
+ * One book's share of total account exposure. A display breakdown, never a
+ * limit: there is no per-book cap in the risk engine, and `enforced` is true
+ * only on the total row, which is the one the 30% account cap applies to.
+ */
+export interface ExposureRow {
+  key: string;
+  label: string;
+  value: Amount;
+  fraction: number | null;
+  enforced: boolean;
+}
+
 export interface RiskPanel {
   limits: RiskLimit[];
+  exposure: ExposureRow[];
+  total_exposure_limit_fraction: number | null;
   available: boolean;
   unavailable_reason: UnavailableReason | null;
+}
+
+/**
+ * The one durable answer to whether any service may submit an order. There is
+ * one brokerage account, so there is one of these, not one per runtime.
+ */
+export interface AccountSafetyPanel {
+  state: string;
+  tone: Tone;
+  safe_to_trade: boolean;
+  detail: string;
+  source: string | null;
+  client_order_id: string | null;
+  updated_at: string | null;
+  available: boolean;
+  unavailable_reason: UnavailableReason | null;
+}
+
+/**
+ * One shared API budget's usage this window, counted across both runtimes.
+ * `limit` is this system's own conservative ceiling, not a provider limit.
+ */
+export interface ApiBudgetRow {
+  key: string;
+  label: string;
+  used: number;
+  limit: number;
+  remaining: number;
+  window_start: string | null;
+  tone: Tone;
 }
 
 export interface Overview {
@@ -174,7 +219,11 @@ export interface Overview {
   orders: OrdersPanel | null;
   health: HealthComponent[];
   reconciliation: ReconciliationPanel | null;
-  runtime: RuntimePanel | null;
+  runtimes: RuntimePanel[];
+  account_safety: AccountSafetyPanel | null;
+  api_budget: ApiBudgetRow[];
+  last_failure: string | null;
+  last_failure_at: string | null;
   risk: RiskPanel | null;
   notices: string[];
 }

@@ -48,7 +48,12 @@ from autotrader.equity.session import (
     regular_session_bar_starts,
     session_from_local,
 )
-from autotrader.execution.models import ExecutionInputError, OrderIntent, OrderSide
+from autotrader.execution.models import (
+    TRADABLE_SYMBOLS,
+    ExecutionInputError,
+    OrderIntent,
+    OrderSide,
+)
 from autotrader.execution.paper import (
     PAPER_TRADING_ENABLED_ENV,
     AmbiguousSubmissionError,
@@ -78,6 +83,7 @@ from autotrader.state.sqlite import (
     list_signals,
     list_system_events,
 )
+from conftest import establish_account_safety
 from test_equity_execution import (
     FakeDataClient,
     FakeTradingClient,
@@ -311,7 +317,17 @@ def unsafe_startup() -> StartupSafetyResult:
 
 @pytest.fixture
 def database_path(tmp_path: Path) -> Path:
-    return initialize_database(tmp_path / "state.db")
+    """A database in the state a running process actually submits from.
+
+    The runtime reconciles the full universe at startup and only then submits,
+    so the execution boundary refuses to submit against an account whose safety
+    nothing has ever established. Most cases here fake the execution gateway
+    and never reach that check; the ones that drive the real boundary do.
+    """
+    path = initialize_database(tmp_path / "state.db")
+    with connect(path) as setup:
+        establish_account_safety(setup)
+    return path
 
 
 @pytest.fixture
@@ -1308,11 +1324,19 @@ def test_crypto_runtime_contract_is_unchanged_by_equity_v02() -> None:
             crypto_paper.normalize_symbol(symbol)
     assert crypto_paper.ORDER_TIME_IN_FORCE.value == "gtc"
 
-    # 5. Reconciliation still defaults to the crypto pairs.
+    # 5. Reconciliation now defaults to the whole account, which is the one
+    #    deliberate change combined integration makes here. Equity V0.2 kept the
+    #    crypto pairs as the default so that merging it altered no existing
+    #    caller; with both books live on one account, a pass that looked at two
+    #    of twelve symbols cannot establish that the account is understood. The
+    #    crypto pairs are still in it, and still first.
     import inspect
 
     signature = inspect.signature(reconciliation_engine.reconcile_paper_state)
-    assert signature.parameters["symbols"].default == ("BTC/USD", "ETH/USD")
+    default_universe = signature.parameters["symbols"].default
+    assert default_universe == TRADABLE_SYMBOLS
+    assert default_universe[:2] == ("BTC/USD", "ETH/USD")
+    assert len(default_universe) == 12
 
     # 6. The risk policy is shared and unchanged.
     assert (MAX_POSITION_FRACTION, MAX_TOTAL_EXPOSURE_FRACTION, MAX_DAILY_LOSS_FRACTION) == (
