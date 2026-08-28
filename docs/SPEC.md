@@ -1,12 +1,15 @@
 # autotrader - Project Specification (v0.2)
 
-**Status:** Crypto Pivot V0.2 complete. The active system is crypto spot -
-BTC/USD and ETH/USD, 15-minute bars, 24/7 - and it can place an order only into
-Alpaca's paper environment. Next: Phase 8 reconciliation / crash recovery and
-Phase 9 24/7 runtime / monitoring, planned to be developed in parallel.
+**Status:** Crypto Pivot V0.2 complete, plus Phase 9 - the 24/7 runtime (C8).
+The active system is crypto spot - BTC/USD and ETH/USD, 15-minute bars, 24/7 -
+it can place an order only into Alpaca's paper environment, and it can now run
+unattended on completed 15-minute UTC bars. **The runtime does not trade yet:**
+it fails closed on an unresolved startup-safety check until Phase 8
+reconciliation is integrated. Next: Phase 8 reconciliation / crash recovery,
+developed in parallel, then the Phase 8 / Phase 9 integration gate.
 **Archived milestone:** Equity V0.1 is preserved at the Git tag
 `equity-v0.1-phase7`.
-**Last updated:** 2026-08-27
+**Last updated:** 2026-08-28
 
 This document is the authoritative scope definition for this repository. When
 this document and any prior conversation, chat history, or memory disagree,
@@ -137,9 +140,9 @@ Phase 5  Risk Engine                       <- done, migrated to crypto (C5)
 Phase 6  SQLite Operational State          <- done, schema v3 (C6)
 Phase 7  Alpaca Paper Trading              <- done, migrated to crypto (C7)
 --- Crypto Pivot V0.2 complete ---
-Phase 8  Reconciliation / Crash Recovery   <- next, in parallel with Phase 9
-Phase 9  24/7 Runtime / Monitoring         <- next, in parallel with Phase 8
-Phase 10 Deployment
+Phase 8  Reconciliation / Crash Recovery   <- open, in parallel with Phase 9
+Phase 9  24/7 Runtime / Monitoring         <- done (C8)
+Phase 10 Deployment                        <- after Phase 8 integration
 ```
 
 ---
@@ -258,7 +261,14 @@ parameter or walk-forward optimization.
 TradingView integration, strategy marketplace.
 
 **Infrastructure:** PostgreSQL, Supabase, Redis, Celery, Kafka, Kubernetes,
-cloud deployment, Docker (unless explicitly requested in a future phase).
+cloud deployment, Docker (unless explicitly requested in a future phase). The
+C8 runtime is a single local synchronous process holding an `fcntl` file lock;
+it introduces no broker, queue, scheduler daemon, or external coordination
+service, and no `asyncio`.
+
+**Monitoring:** Telegram, Slack, Discord, email, SMS, paid monitoring agents,
+and hosted metrics. C8's whole monitoring surface is a heartbeat object and
+standard-library structured logging to stdout.
 
 **Process:** dual-market abstractions, asset-class switches, speculative
 refactors, abstractions built for hypothetical future requirements, complex
@@ -961,18 +971,178 @@ cancellation as part of the execution path; multi-broker abstraction; notional,
 limit, stop, bracket, or OCO orders; a scheduler or 24/7 loop; a monitoring
 surface; a frontend; and deployment.
 
+### C8 - 24/7 crypto runtime and monitoring (complete)
+
+The long-running process that operates BTC/USD and ETH/USD unattended.
+`autotrader.runtime` joins the existing stages and adds **no trading logic of
+its own**: C1 supplies the bars, C2 validates them, C3 produces the signal, C5
+sizes it, C6 records it, and C7 stays the only thing that speaks to a broker.
+
+**Scheduling is UTC wall-clock, every day.** The runtime wakes at `00`, `15`,
+`30` and `45` minutes past every hour, recomputed from the current UTC time on
+every cycle rather than by repeatedly sleeping 900 seconds - a fixed sleep
+accumulates every scheduler delay and drifts off the boundary within a day.
+There is no `get_clock`, no exchange calendar, no market open or close, no
+weekday filter, and no `America/New_York`. Saturday and Sunday are ordinary
+days, and source-level tests assert each of those absences.
+
+**Completed bars only.** Alpaca's crypto 15-minute bars are stamped at
+**interval start** - measured against the live endpoint, not assumed - and the
+endpoint serves the interval that is still running: at 00:16:17 UTC it already
+returns a bar stamped 00:15:00, whose close has not happened. So a bar is
+processed only when
+
+```
+bar_timestamp + 15 minutes <= now - safety_delay
+```
+
+An in-progress candle is never evaluated and never traded.
+
+**A small explicit safety delay.** 5 seconds by default, configurable with
+`--safety-delay`, and required to be shorter than one bar. It covers provider
+publication lag: an interval ending at exactly 10:15:00 does not mean the
+provider has published it at 10:15:00.000. It is subtracted from `now`
+everywhere completeness is judged, so an early wake-up cannot smuggle an
+unpublished bar through.
+
+**Bounded fetching.** Each cycle requests one window of 200 completed bars per
+symbol, bounded to 100-200. EMA 50 needs 50 observations plus the previous bar,
+and after 200 bars a span-50 EMA retains about 0.04% of its seed. The window
+ends at the last instant of the newest completed interval, so the in-progress
+candle is not even asked for. Two provider calls every fifteen minutes for the
+whole system: no polling, no constant account or position reads, and no
+re-download of history. A per-cycle provider-call counter feeds the later
+shared crypto+equity API-budget work.
+
+**Deterministic, sequential processing.** BTC/USD is processed to completion -
+risk sized against the account as it stands, order submitted or refused -
+before ETH/USD is looked at. Nothing runs concurrently and there is no
+`asyncio`: two symbols and one cycle every fifteen minutes have no concurrency
+in them, and sequencing keeps two same-boundary signals from sizing against the
+same stale cash and exposure figures.
+
+**Only the newest completed bar may act.** The lookback exists to give the
+recursive EMA its state. Historical signals inside the window are **not**
+replayed: every crossover older than the newest bar has already happened, and
+re-emitting them would turn a restart into a burst of stale orders.
+
+**In-process duplicate protection.** A per-symbol `last_processed_bar_timestamp`
+checkpoint is claimed **before** the strategy runs, so one completed bar is one
+decision per symbol per process even when the provider repeats the newest bar
+or a cycle overruns its boundary. The checkpoint is an interface with an
+in-memory implementation, and **no SQLite schema change was made in this
+phase**. Cross-restart exactly-once recovery is Phase 8's and is deliberately
+not invented here.
+
+**Startup fail-closed.** Broker submission is off until an external
+startup-safety check reports `SAFE`. The shipped production default is
+`unresolved_startup_safety()`, which reports `UNRESOLVED` - nobody has checked -
+and keeps submission off. This is the narrow seam Phase 8's reconciliation
+result will be connected to: one zero-argument callable returning a
+`StartupSafetyResult`. There is no plugin framework, no registry, and no
+discovery. While unresolved the runtime still fetches, validates, evaluates,
+records signals, and logs; it simply does not trade.
+
+**Unattended paper execution needs three things, all closed by default:**
+
+1. `AUTOTRADER_PAPER_TRADING_ENABLED=true` in the environment - C7's gate,
+   unchanged and not bypassed;
+2. `--confirm-paper-runtime PAPER`, authorizing **this process** for its
+   lifetime. A daemon cannot have a token typed every fifteen minutes, so the
+   confirmation moved to process start rather than being removed or weakened;
+3. a startup-safety check reporting that trading is safe.
+
+`--observe-only` goes further than refusing: it constructs no execution path at
+all, so submission is unexpressible rather than merely disabled. There is no
+live mode, no `--live`, no `paper=False`, no `stock-run`, and no `live-run`.
+
+**Cycle failure policy** - three outcomes, no exception framework:
+
+| Failure | Severity |
+| --- | --- |
+| Provider fetch error, invalid bars, strategy input violation | `RETRY_NEXT_CYCLE` |
+| Risk rejection, including EXIT while flat | not a failure: an ordinary no-order result |
+| Ambiguous `UNKNOWN` submission outcome | `TRADING_PAUSED` |
+| Rejected credentials, untradable account, broken local state, anything unexpected | `FATAL` |
+
+Invalid bars fail that cycle closed: nothing is sorted, repaired, or traded.
+
+**`UNKNOWN` pauses trading for the life of the process.** The order may or may
+not exist at the broker, so no later signal is submitted on top of a position
+nobody can describe. Observation continues, `run_forever` stops scheduling, and
+the CLI exits `2`. Nothing here resolves, retries, or reasons about the
+ambiguity - that is Phase 8.
+
+**Heartbeat.** A structured status object exposing runtime start, last cycle
+start, last successful cycle, last processed bar per symbol, whether paper
+execution is enabled and the reason when it is not, the startup-safety code,
+cycle and order counts, provider-call counters, and the last error.
+
+**Logging.** Standard-library `logging` under `autotrader.runtime`, emitted as
+parseable `event=... key=value` lines to stdout - suitable for systemd and
+journald, with no repository log file required. No monitoring dependency, no
+Telegram, no Slack, no webhook, no agent. Credentials are read only inside C7,
+are never returned from it, and are never arguments to anything in the runtime,
+so there is no line for them to leak through; a test asserts it.
+
+**Single-instance lock.** An `fcntl` exclusive non-blocking lock on
+`<database>.runtime.lock`, released in a `finally`. Two runners on one database
+would each hold their own in-process checkpoint, neither able to see the
+other's, and both would act on the same completed bar. A PID file is not
+sufficient: it records an intention, survives a crash, and names a pid that may
+have been reused. A second runner exits non-zero before it fetches a bar or
+reaches a broker.
+
+**Graceful shutdown.** `SIGINT` and `SIGTERM` set a flag and the loop stops at
+its next safe point. The handler does not raise, cancel, or touch the database -
+a signal can arrive mid-broker-call, and the only correct response there is to
+let that call finish. No new cycle is scheduled, no new submission is started,
+the strategy run is closed, database resources are released, and the lock is
+released.
+
+**Strategy run lifecycle.** One `strategy_runs` row per runtime session, opened
+at startup in mode `PAPER` and closed at shutdown - `COMPLETED` on a clean
+stop, `FAILED` when the runtime ended paused or fatal. The newest completed
+bar's signal is recorded through C6's existing `record_signal`; a repeat raises
+`DuplicateSignalError`, which is respected rather than worked around. No schema
+was redesigned and no table was added.
+
+**Sizing stays C5's.** The runtime holds no sizing policy. A signal requests a
+quantity larger than any position this account can hold or any ceiling this
+policy can approve, and the risk engine's clamp - never the runtime's - is the
+size that reaches the broker.
+
+**CLI.** `crypto-run`, with `--once`, `--confirm-paper-runtime`,
+`--observe-only`, `--safety-delay`, and `--db`. Exit codes: `0` a clean stop
+including `SIGINT`/`SIGTERM`; `1` a controlled refusal or a fatal cycle
+failure; **`2` trading paused by an `UNKNOWN` outcome**.
+
+**Testing.** Entirely offline. The clock, the sleep, the market-data boundary,
+the execution boundary, the startup-safety check and the checkpoint are all
+injected, so no test waits fifteen real minutes or opens a socket. Four
+critical regressions are pinned: an in-progress bar is never processed, the
+same completed bar is never processed twice in one process, an `UNKNOWN`
+outcome pauses future trading, and a second runner instance is refused.
+
+**Explicitly out of scope for C8:** everything Phase 8 owns - `UNKNOWN`
+resolution, broker-vs-local reconciliation, open-order synchronization, fill
+history, position repair, `reconciliation_runs`, and startup broker truth
+synchronization; cross-restart exactly-once recovery; any SQLite schema change;
+live trading in any form; `asyncio`; alerting and monitoring integrations
+(Telegram, Slack, Discord, email, SMS); a distributed rate limiter; and every
+deployment artefact - systemd units, Docker, cloud scripts, and VPS
+provisioning, which are Phase 10.
+
 ### Later phases
 
-**Phase 8 - Reconciliation / Crash Recovery.** It owns: resolving `UNKNOWN`
-intents against the broker by `client_order_id`, startup broker-vs-local
+**Phase 8 - Reconciliation / Crash Recovery.** Still open, and developed in
+parallel with C8 on its own branch. It owns: resolving `UNKNOWN` intents
+against the broker by `client_order_id`, startup broker-vs-local
 reconciliation, open-order synchronization, fill history, position repair, and
-the local order state machine. C7 deliberately built only the durable anchors
-it will need.
+the local order state machine. C7 built the durable anchors it will need; C8
+built the startup-safety seam its result plugs into, and fails closed until it
+does.
 
-**Phase 9 - 24/7 Runtime / Monitoring.** It owns: the continuous loop, wake-up
-scheduling on completed 15-minute bars, bar-freshness checks, heartbeat and
-alerting, and the process supervision that makes the first equity observation
-of a UTC day land near the boundary. The pivot made every contract 24/7-*safe*;
-nothing in the current system loops, schedules, or polls.
-
-These two are planned to be developed in parallel. Neither has started.
+**Phase 10 - Deployment.** Systemd units, container images, host provisioning,
+and supervision. Deliberately after Phase 8 integration and failure injection:
+there is no point supervising a process that is not yet allowed to trade.

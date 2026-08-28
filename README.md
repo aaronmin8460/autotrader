@@ -6,10 +6,18 @@ run as a local Python CLI process against an Alpaca **paper** account.
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Crypto Pivot V0.2 complete. Next: Phase 8 reconciliation / crash recovery and Phase 9 24/7 runtime, in parallel
+## Status: Crypto V0.2 plus the 24/7 runtime (Phase 9). Next: Phase 8 reconciliation, then integration
 
 **Current active version: Crypto V0.2.** The system trades BTC/USD and ETH/USD
 only, on 15-minute bars, 24 hours a day and 7 days a week.
+
+**Phase 9 - the 24/7 runtime - is complete, and it does not trade yet.** The
+runtime wakes on completed 15-minute UTC boundaries, fetches, validates,
+evaluates the strategy, records signals and logs a heartbeat - but broker
+submission stays off until an external startup-safety check says trading is
+safe, and the shipped default says `UNRESOLVED` because Phase 8 reconciliation
+is not integrated. That is the intended state: a process that assumes its local
+view survived the last shutdown is how a duplicate position gets created.
 
 **Archived milestone: Equity V0.1** is preserved at the Git tag
 [`equity-v0.1-phase7`](#the-archived-equity-milestone). It was a complete,
@@ -23,8 +31,9 @@ What exists today: downloading historical 15-minute crypto bars from Alpaca's
 US crypto feed as Parquet, validating a stored dataset, the EMA 20 / EMA 50
 signal generator, a deterministic backtester with fractional positions and a
 modelled taker fee, a deterministic risk engine, a local SQLite
-operational-state database at schema v3, and a single deliberately awkward
-paper-order command. Validation never downloads or repairs data; the strategy
+operational-state database at schema v3, a single deliberately awkward
+paper-order command, and the 24/7 runtime that drives all of it on a
+schedule. Validation never downloads or repairs data; the strategy
 emits signals only; the backtester is local arithmetic; the risk engine is a
 pure calculator that persists nothing; and the database stores records without
 deciding anything.
@@ -48,9 +57,11 @@ crash recovery will need but resolves nothing. An ambiguous submission outcome
 is recorded as `UNKNOWN` and left alone - never retried, never re-keyed. There
 is no fills, executions, or reconciliation table.
 
-**There is no 24/7 runner yet either.** The contracts are 24/7-safe - UTC
-dates, a UTC risk day, no market-session logic anywhere - but nothing loops,
-schedules, or polls. Running the system is still a human typing a command.
+**The 24/7 runner exists, and it is deliberately not allowed to trade.** It
+loops on completed 15-minute UTC boundaries, observes, and records - but
+submission is gated on a startup-safety answer that only Phase 8 reconciliation
+can give, so today it observes and nothing else. See
+[The 24/7 runtime](#the-247-runtime).
 
 ## Scope summary
 
@@ -628,7 +639,109 @@ increments it.
 
 No reconciliation, no crash recovery, no automatic `UNKNOWN` resolution, no
 fill history, no open-order synchronization, no position repair, no streaming
-or websockets, no scheduler or 24/7 loop, no monitoring, and no live trading.
+or websockets, and no live trading.
+
+## The 24/7 runtime
+
+`crypto-run` is the long-running process. It adds no trading logic: the data,
+validation, strategy, risk, state, and paper-execution stages are the existing
+ones, and it is the schedule and the safety envelope around them.
+
+Run one completed-bar cycle and exit - the intended way to check the runtime by
+hand, and safe with no gate open:
+
+```bash
+python -m autotrader.cli crypto-run --once --observe-only
+```
+
+Run it continuously:
+
+```bash
+python -m autotrader.cli crypto-run --confirm-paper-runtime PAPER
+```
+
+### The schedule
+
+The runtime wakes at `00`, `15`, `30` and `45` minutes past every hour, **UTC,
+every day of the week**. Weekends are ordinary trading days. The next wake-up
+is recomputed from the wall clock each cycle rather than by sleeping 900
+seconds repeatedly, because a fixed sleep accumulates every delay and drifts
+off the boundary within a day.
+
+### Completed bars only
+
+Alpaca stamps a crypto 15-minute bar at its **interval start**, and it serves
+the interval that is still running: at 00:16 UTC it will hand you a bar stamped
+00:15, whose close has not happened. So a bar is processed only once
+
+```
+bar_timestamp + 15 minutes <= now - safety_delay
+```
+
+An in-progress candle is never evaluated. `--safety-delay` (5 seconds by
+default) covers the provider's publication lag and is subtracted from `now`
+everywhere completeness is judged, so waking early cannot smuggle an
+unpublished bar through.
+
+Each cycle fetches one bounded window of 200 completed bars per symbol - enough
+for the EMA 50 to have forgotten its seed, and small enough to be one cheap
+request. Two provider calls every fifteen minutes for the whole system: nothing
+polls, and the account and positions are read only when a signal actually needs
+sizing.
+
+### One bar, one decision
+
+BTC/USD is processed to completion before ETH/USD is looked at, so two signals
+landing on the same boundary cannot size themselves against the same stale cash
+figure. Only the **newest completed bar** may cause an action: older crossovers
+in the lookback exist to establish EMA state and are never replayed. A
+per-symbol checkpoint means a completed bar is acted on at most once per
+process, even if the provider repeats it.
+
+Cross-restart exactly-once recovery is Phase 8's, and is deliberately not
+invented here.
+
+### Three gates, all closed by default
+
+Unattended paper execution requires **all** of:
+
+1. `AUTOTRADER_PAPER_TRADING_ENABLED=true` in the environment - the same C7
+   gate, not bypassed;
+2. `--confirm-paper-runtime PAPER`, which authorizes *this process* for its
+   lifetime. A daemon cannot have a token typed every fifteen minutes, so the
+   confirmation moved to process start rather than being removed;
+3. a startup-safety check reporting that trading is safe - which, until Phase 8
+   is integrated, it never does.
+
+`--observe-only` goes further than refusing: it constructs no execution path at
+all. There is still no live mode, no `--live`, and no `paper=False`.
+
+### When something goes wrong
+
+| Failure | What happens |
+| --- | --- |
+| Provider error, invalid bars, strategy input violation | logged; no order; retried next cycle |
+| Risk rejection, including an EXIT while flat | an ordinary no-order result, not a failure |
+| Ambiguous `UNKNOWN` submission outcome | **trading paused for the process**; exit `2` |
+| Rejected credentials, untradable account, broken state | stops, fails closed; exit `1` |
+
+An `UNKNOWN` outcome means an order may or may not exist at the broker. Nothing
+here resolves it, and nothing else is submitted on top of it.
+
+### Monitoring and operation
+
+Structured `event=... key=value` lines on the standard library's `logging`,
+written to stdout - which is what systemd and journald already collect, so no
+log file is required in the repository. A heartbeat reports the runtime start,
+the last cycle, the last successful cycle, the last processed bar per symbol,
+whether execution is enabled and why not, counts, and the last error. No
+Telegram, no Slack, no webhook, no agent.
+
+Only one runner may hold a database at a time, enforced by an `fcntl` lock on
+`<database>.runtime.lock` and released in a `finally`. A second runner exits
+non-zero before it fetches a bar. `SIGINT` and `SIGTERM` stop the process
+cleanly: no new cycle, no new submission, the strategy run closed, the lock
+released.
 
 ## Development
 
@@ -652,7 +765,7 @@ stripped, so prose describing a forbidden construct cannot mask its presence.
 src/autotrader/data/        Alpaca crypto bars -> canonical Parquet, and
                             stored-dataset validation
 src/autotrader/cli/         Typer CLI (version, download, validate, backtest,
-                            paper-submit)
+                            paper-submit, crypto-run)
 src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals
 src/autotrader/backtest/    deterministic next-bar-open backtester, fractional
                             quantities, modelled taker fee
@@ -660,6 +773,9 @@ src/autotrader/risk/        deterministic risk decisions and sizing
 src/autotrader/state/       local SQLite operational state, schema v3
 src/autotrader/execution/   Alpaca PAPER crypto execution - the only place a
                             trading client exists or an order is sent
+src/autotrader/runtime/     the 24/7 loop: UTC boundary scheduling, bounded
+                            bar fetching, startup safety, duplicate
+                            protection, heartbeat, process lock
 tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)
 data/processed/             validated market data (git-ignored)
@@ -669,7 +785,15 @@ docs/SPEC.md                authoritative scope specification
 
 ## What comes next
 
-**Phase 8 - Reconciliation / Crash Recovery** and **Phase 9 - 24/7 Runtime /
-Monitoring**, developed in parallel. Neither is started. The pivot's job was to
-make the existing stack crypto-compatible and 24/7-safe *in its contracts*, not
-to run it unattended.
+**Phase 8 - Reconciliation / Crash Recovery**, developed in parallel on its own
+branch. It owns resolving `UNKNOWN` intents against the broker, startup
+broker-vs-local reconciliation, open-order synchronization, fill history, and
+position repair.
+
+Then the **integration gate**: Phase 8's reconciliation result becomes the
+startup-safety answer the runtime already asks for and already fails closed
+against. Until that lands, the runtime observes and does not trade - by design,
+not by accident.
+
+**Phase 10 - Deployment** comes after that. Supervising a process that is not
+yet allowed to trade would be premature.
