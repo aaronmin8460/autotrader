@@ -22,6 +22,9 @@ venv/
 logs/
 *.log
 
+# Local runtime single-instance lock
+*.runtime.lock
+
 # Local operational trading state (SQLite; introduced in a later phase)
 *.db
 *.sqlite

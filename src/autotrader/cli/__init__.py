@@ -10,18 +10,27 @@ Everything here is crypto spot: BTC/USD and ETH/USD, 15-minute bars, UTC
 dates, 24/7. There is no asset-class selector and no equity command; the
 completed equity milestone is archived at the Git tag `equity-v0.1-phase7`.
 
-`paper-submit` is the only command that can **submit** an order, and it can
-only ever reach Alpaca paper. It requires an environment gate and an explicit
-confirmation token, both closed by default, and there is no `--live` option,
-no `--paper` option, and no way to ask for anything but paper (docs/SPEC.md
-section 8, C7).
+`paper-submit` and `crypto-run` are the only commands that can **submit** an
+order, and they can only ever reach Alpaca paper. Both require an environment
+gate and an explicit confirmation token, both closed by default, and there is
+no `--live` option, no `--paper` option, and no way to ask for anything but
+paper (docs/SPEC.md section 8, C7).
 
 `reconcile` also reaches the broker, but only to read it. It may rewrite local
 SQLite state from what the broker reports; it can never place an order, and it
 needs neither gate for that reason (docs/SPEC.md section 8, C8).
+
+`crypto-run` is the 24/7 runtime (C9). It wakes on completed 15-minute UTC
+boundaries, every day of the week, and additionally refuses to submit until
+startup reconciliation reports that trading is safe - which is now the real
+Phase 8 pass (`reconcile_paper_state`) rather than a placeholder, so a
+`crypto-run` start reconciles against the paper broker on its own.
 """
 
-from datetime import UTC, datetime
+import logging
+import sys
+import time
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
@@ -63,6 +72,22 @@ from autotrader.reconciliation import (
     ReconciliationStatus,
     reconcile_paper_state,
 )
+from autotrader.runtime.execution import PaperExecutionGateway
+from autotrader.runtime.lock import RuntimeLock, RuntimeLockError, lock_path_for
+from autotrader.runtime.market_data import AlpacaCryptoBars
+from autotrader.runtime.monitoring import LOGGER_NAME, RuntimeState
+from autotrader.runtime.runner import (
+    PROCESSING_ORDER,
+    RUNTIME_CONFIRMATION_TOKEN,
+    CryptoRuntime,
+    RuntimeConfig,
+    ShutdownRequest,
+)
+from autotrader.runtime.schedule import (
+    DEFAULT_LOOKBACK_BARS,
+    DEFAULT_SAFETY_DELAY,
+    ScheduleError,
+)
 from autotrader.state.sqlite import DEFAULT_DATABASE_PATH, StateError, connect, initialize_database
 
 DEFAULT_OUTPUT_DIR = Path("data/raw")
@@ -99,6 +124,16 @@ PAPER_SUBMIT_UNKNOWN_EXIT_CODE = 2
 #:    the broker. Its own code so a script can never read it as a clean run.
 RECONCILE_FAILED_EXIT_CODE = 1
 RECONCILE_UNRESOLVED_EXIT_CODE = 2
+
+#: `crypto-run` exit codes, deliberately the same shape as `paper-submit`'s.
+#:
+#: 0  the runtime ran and stopped cleanly, including a clean SIGINT/SIGTERM.
+#: 1  a controlled refusal - another runner holds the lock, the configuration
+#:    is unusable, or a cycle failed fatally. Nothing ambiguous happened.
+#: 2  trading was paused because a submission outcome is UNKNOWN. An order may
+#:    exist at the broker and must be reconciled before anything else is sent.
+CRYPTO_RUN_REFUSED_EXIT_CODE = 1
+CRYPTO_RUN_PAUSED_EXIT_CODE = 2
 
 #: Width of the label column in the backtest report.
 _LABEL_WIDTH = 23
@@ -613,6 +648,208 @@ def reconcile(
     exit_code = _RECONCILE_EXIT_CODES[result.status]
     if exit_code != 0:
         raise typer.Exit(code=exit_code)
+
+
+def _configure_runtime_logging(verbose: bool) -> None:
+    """Send structured runtime events to stdout, once, without stomping on a host.
+
+    stdout rather than a repository file: journald, `docker logs`, and a shell
+    redirect all already know what to do with it, and a daemon that insists on
+    owning a log path is a deployment decision made in the wrong place.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(asctime)sZ %(levelname)s %(message)s"))
+        handler.formatter.converter = time.gmtime  # type: ignore[union-attr]
+        logger.addHandler(handler)
+        logger.propagate = False
+
+
+def _echo_runtime_banner(runtime: CryptoRuntime, *, once: bool, lock: Path) -> None:
+    """Print what this process is and is not allowed to do, before it does it."""
+    authorization = runtime.authorization
+    heartbeat = runtime.heartbeat
+    typer.echo("AUTO TRADER - 24/7 CRYPTO RUNTIME")
+    typer.echo("")
+    typer.echo(_field("Environment", "PAPER ONLY"))
+    typer.echo(_field("Trading", "CRYPTO SPOT, 24/7"))
+    typer.echo(_field("Symbols", ", ".join(PROCESSING_ORDER)))
+    typer.echo(_field("Mode", "ONCE" if once else "RUN"))
+    typer.echo(_field("Bar Interval", "15m, completed bars only"))
+    typer.echo(_field("Startup Safety", heartbeat.startup_safety_code))
+    typer.echo(_field("Lock File", str(lock)))
+    typer.echo("")
+    if authorization.enabled:
+        typer.secho("PAPER EXECUTION ENABLED", fg=typer.colors.YELLOW)
+        typer.echo("Signals on completed bars may be submitted to the PAPER account.")
+    else:
+        typer.secho("OBSERVATION ONLY - NO ORDER WILL BE SUBMITTED", fg=typer.colors.GREEN)
+        typer.echo(f"Reason: {authorization.reason}")
+    typer.echo("")
+
+
+def _echo_runtime_summary(runtime: CryptoRuntime) -> None:
+    """Print the final heartbeat as an operator-readable block."""
+    heartbeat = runtime.heartbeat
+    typer.echo("")
+    typer.echo(_field("Final State", heartbeat.state.value))
+    typer.echo(_field("Cycles Started", str(heartbeat.cycles_started)))
+    typer.echo(_field("Cycles Completed", str(heartbeat.cycles_completed)))
+    for symbol, timestamp in heartbeat.last_processed_bars.items():
+        label = f"Last {symbol} Bar"
+        typer.echo(_field(label, timestamp.isoformat() if timestamp else "none"))
+    typer.echo(_field("Orders Submitted", str(heartbeat.orders_submitted)))
+    typer.echo(_field("Provider Calls", str(heartbeat.api_calls_total)))
+    if heartbeat.last_error is not None:
+        typer.echo(_field("Last Error", heartbeat.last_error))
+
+
+@app.command(name="crypto-run")
+def crypto_run(
+    once: bool = typer.Option(
+        False,
+        "--once",
+        help="Process the current completed-bar cycle once and exit, without waiting.",
+    ),
+    confirm_paper_runtime: str = typer.Option(
+        "",
+        "--confirm-paper-runtime",
+        help=(
+            f"Type {RUNTIME_CONFIRMATION_TOKEN} exactly to authorize THIS process to use "
+            "the paper execution path for its lifetime. Without it the runtime only "
+            "observes."
+        ),
+    ),
+    observe_only: bool = typer.Option(
+        False,
+        "--observe-only",
+        help=(
+            "Run without an execution path at all: bars, validation, strategy and "
+            "signals only. Submission is not refused, it is unavailable."
+        ),
+    ),
+    safety_delay: float = typer.Option(
+        DEFAULT_SAFETY_DELAY.total_seconds(),
+        "--safety-delay",
+        help=(
+            "Seconds to wait after a 15-minute UTC boundary before treating the bar "
+            "that just closed as fetchable. Covers provider publication lag."
+        ),
+    ),
+    database: Annotated[
+        Path,
+        typer.Option("--db", help="Local operational-state database."),
+    ] = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Run the 24/7 crypto runtime on completed 15-minute UTC bars.
+
+    Wakes at 00, 15, 30 and 45 minutes past every hour - every day, weekends
+    included - waits a small safety delay for the provider to publish, then
+    processes BTC/USD and then ETH/USD in that fixed order: fetch a bounded
+    window of recent completed bars, validate it, evaluate EMA 20 / EMA 50 on
+    the newest completed bar only, record any signal, and - if and only if
+    every gate is open - hand that signal to the existing paper execution path.
+
+    An in-progress candle is never processed, and a completed bar is never
+    processed twice within one process.
+
+    \b
+    Unattended paper execution requires ALL of:
+      1. AUTOTRADER_PAPER_TRADING_ENABLED=true in the environment
+      2. --confirm-paper-runtime PAPER on the command line
+      3. a startup-safety check reporting that trading is safe
+
+    The third is the one that is not satisfiable in this build: reconciliation
+    against the broker is Phase 8 and is not integrated here, so startup safety
+    reports UNRESOLVED and no order is submitted. The runtime still fetches,
+    validates, evaluates, records and logs - which is exactly what it is for
+    until crash recovery exists.
+
+    There is no live mode. `--observe-only` goes further than the gates and
+    constructs no execution path at all.
+
+    Only one runner may hold a given database at a time; a second exits
+    immediately rather than processing the same bar twice.
+
+    Exits 0 on a clean stop including SIGINT/SIGTERM, 1 on a controlled refusal
+    or a fatal cycle failure, and 2 when trading was paused by an UNKNOWN
+    submission outcome that must be reconciled.
+    """
+    _configure_runtime_logging(verbose=False)
+
+    try:
+        config = RuntimeConfig(
+            safety_delay=timedelta(seconds=safety_delay),
+            lookback_bars=DEFAULT_LOOKBACK_BARS,
+            observe_only=observe_only,
+            runtime_confirmation=confirm_paper_runtime or None,
+        )
+    except ScheduleError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=CRYPTO_RUN_REFUSED_EXIT_CODE) from None
+
+    try:
+        initialize_database(database)
+    except StateError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=CRYPTO_RUN_REFUSED_EXIT_CODE) from None
+
+    lock = RuntimeLock(lock_path_for(database))
+    try:
+        lock.acquire()
+    except RuntimeLockError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=CRYPTO_RUN_REFUSED_EXIT_CODE) from None
+
+    shutdown = ShutdownRequest()
+    shutdown.install()
+    try:
+        with connect(database) as connection:
+            runtime = CryptoRuntime(
+                connection,
+                market_data=AlpacaCryptoBars(safety_delay=config.safety_delay),
+                execution=None if observe_only else PaperExecutionGateway(),
+                config=config,
+                shutdown=shutdown,
+            )
+            runtime.start()
+            _echo_runtime_banner(runtime, once=once, lock=lock.path)
+            try:
+                if once:
+                    runtime.run_cycle()
+                else:
+                    runtime.run_forever()
+            finally:
+                # `stop` is idempotent, so the long-running path's own call
+                # makes this a no-op. It matters for `--once`: a cycle that
+                # raised must still close its strategy run rather than leave a
+                # RUNNING row behind for the next start to trip over.
+                runtime.stop()
+            _echo_runtime_summary(runtime)
+            state = runtime.heartbeat.state
+    finally:
+        # `finally`, not a happy-path release: a lock that outlives a crashed
+        # runner would refuse every later start for a process that no longer
+        # exists.
+        shutdown.restore()
+        lock.release()
+
+    if state is RuntimeState.TRADING_PAUSED:
+        typer.echo("")
+        typer.secho("TRADING PAUSED - SUBMISSION OUTCOME UNKNOWN", fg=typer.colors.YELLOW, err=True)
+        typer.echo(
+            "An order may exist at the broker. Nothing further was submitted, and "
+            "nothing here resolves it: reconcile against the broker before starting "
+            "the runtime again.",
+            err=True,
+        )
+        raise typer.Exit(code=CRYPTO_RUN_PAUSED_EXIT_CODE)
+    if state is RuntimeState.FAILED:
+        typer.echo("")
+        typer.secho("RUNTIME STOPPED ON A FATAL ERROR", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=CRYPTO_RUN_REFUSED_EXIT_CODE)
 
 
 def main() -> None:

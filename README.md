@@ -6,10 +6,18 @@ run as a local Python CLI process against an Alpaca **paper** account.
 This is an engineering project. It makes **no claim of profitability**, and it
 is not investment advice.
 
-## Status: Crypto V0.2 with Phase 8 reconciliation complete. Next: Phase 9 24/7 runtime
+## Status: Crypto V0.2 with Phase 8 and Phase 9 merged. Next: the integration gate
 
 **Current active version: Crypto V0.2.** The system trades BTC/USD and ETH/USD
 only, on 15-minute bars, 24 hours a day and 7 days a week.
+
+**Phase 8 and Phase 9 are both merged here, and not yet wired together.** The
+runtime wakes on completed 15-minute UTC boundaries, fetches, validates,
+evaluates the strategy, records signals and logs a heartbeat - but broker
+submission stays off until its startup-safety check says trading is safe, and
+that check still reports `UNRESOLVED` until reconciliation is connected to it.
+That is the intended state at this commit: a process that assumes its local
+view survived the last shutdown is how a duplicate position gets created.
 
 **Archived milestone: Equity V0.1** is preserved at the Git tag
 [`equity-v0.1-phase7`](#the-archived-equity-milestone). It was a complete,
@@ -24,10 +32,11 @@ US crypto feed as Parquet, validating a stored dataset, the EMA 20 / EMA 50
 signal generator, a deterministic backtester with fractional positions and a
 modelled taker fee, a deterministic risk engine, a local SQLite
 operational-state database at schema v4, a single deliberately awkward
-paper-order command, and a crash-recovery reconciliation command. Validation
-never downloads or repairs data; the strategy emits signals only; the
-backtester is local arithmetic; the risk engine is a pure calculator that
-persists nothing; and the database stores records without deciding anything.
+paper-order command, a crash-recovery reconciliation command, and the 24/7
+runtime that drives all of it on a schedule. Validation never downloads or
+repairs data; the strategy emits signals only; the backtester is local
+arithmetic; the risk engine is a pure calculator that persists nothing; and the
+database stores records without deciding anything.
 
 **Live trading is not implemented, not configurable, and not reachable.** The
 trading client is constructed with `paper=True` hardcoded; there is no
@@ -52,11 +61,11 @@ A position mismatch is corrected in the database, never by trading. The
 command reports one answer a runtime can act on, `safe_to_trade`, which is
 false for anything ambiguous.
 
-**There is no 24/7 runner yet.** The contracts are 24/7-safe - UTC dates, a UTC
-risk day, no market-session logic anywhere - and reconciliation now provides
-the startup gate such a runner will need, but nothing loops, schedules, or
-polls. Running the system is still a human typing a command. Phase 9 is not
-started.
+**The 24/7 runner exists, and it is deliberately not allowed to trade yet.**
+It loops on completed 15-minute UTC boundaries, observes, and records; broker
+submission is gated on a startup-safety answer that only reconciliation can
+give, and connecting the two is the integration gate. See
+[The 24/7 runtime](#the-247-runtime).
 
 ## Scope summary
 
@@ -655,7 +664,9 @@ increments it. Reconciliation keeps the same rule.
 ### Not implemented
 
 No fill history, no streaming or websockets, no order replacement or
-cancellation, no scheduler or 24/7 loop, no monitoring, and no live trading.
+cancellation, and no live trading. Submission is one attempt; settling what
+it produced is [reconciliation](#reconciliation-and-crash-recovery)'s job,
+and scheduling it is [the runtime](#the-247-runtime)'s.
 
 ## Reconciliation and crash recovery
 
@@ -806,6 +817,108 @@ No order replacement or cancellation, no fill history, no automatic retry, and
 no loop, scheduler, or heartbeat. Reconciliation runs once, when asked, and
 returns.
 
+## The 24/7 runtime
+
+`crypto-run` is the long-running process. It adds no trading logic: the data,
+validation, strategy, risk, state, and paper-execution stages are the existing
+ones, and it is the schedule and the safety envelope around them.
+
+Run one completed-bar cycle and exit - the intended way to check the runtime by
+hand, and safe with no gate open:
+
+```bash
+python -m autotrader.cli crypto-run --once --observe-only
+```
+
+Run it continuously:
+
+```bash
+python -m autotrader.cli crypto-run --confirm-paper-runtime PAPER
+```
+
+### The schedule
+
+The runtime wakes at `00`, `15`, `30` and `45` minutes past every hour, **UTC,
+every day of the week**. Weekends are ordinary trading days. The next wake-up
+is recomputed from the wall clock each cycle rather than by sleeping 900
+seconds repeatedly, because a fixed sleep accumulates every delay and drifts
+off the boundary within a day.
+
+### Completed bars only
+
+Alpaca stamps a crypto 15-minute bar at its **interval start**, and it serves
+the interval that is still running: at 00:16 UTC it will hand you a bar stamped
+00:15, whose close has not happened. So a bar is processed only once
+
+```
+bar_timestamp + 15 minutes <= now - safety_delay
+```
+
+An in-progress candle is never evaluated. `--safety-delay` (5 seconds by
+default) covers the provider's publication lag and is subtracted from `now`
+everywhere completeness is judged, so waking early cannot smuggle an
+unpublished bar through.
+
+Each cycle fetches one bounded window of 200 completed bars per symbol - enough
+for the EMA 50 to have forgotten its seed, and small enough to be one cheap
+request. Two provider calls every fifteen minutes for the whole system: nothing
+polls, and the account and positions are read only when a signal actually needs
+sizing.
+
+### One bar, one decision
+
+BTC/USD is processed to completion before ETH/USD is looked at, so two signals
+landing on the same boundary cannot size themselves against the same stale cash
+figure. Only the **newest completed bar** may cause an action: older crossovers
+in the lookback exist to establish EMA state and are never replayed. A
+per-symbol checkpoint means a completed bar is acted on at most once per
+process, even if the provider repeats it.
+
+Cross-restart exactly-once recovery is Phase 8's, and is deliberately not
+invented here.
+
+### Three gates, all closed by default
+
+Unattended paper execution requires **all** of:
+
+1. `AUTOTRADER_PAPER_TRADING_ENABLED=true` in the environment - the same C7
+   gate, not bypassed;
+2. `--confirm-paper-runtime PAPER`, which authorizes *this process* for its
+   lifetime. A daemon cannot have a token typed every fifteen minutes, so the
+   confirmation moved to process start rather than being removed;
+3. a startup-safety check reporting that trading is safe - which, until Phase 8
+   is integrated, it never does.
+
+`--observe-only` goes further than refusing: it constructs no execution path at
+all. There is still no live mode, no `--live`, and no `paper=False`.
+
+### When something goes wrong
+
+| Failure | What happens |
+| --- | --- |
+| Provider error, invalid bars, strategy input violation | logged; no order; retried next cycle |
+| Risk rejection, including an EXIT while flat | an ordinary no-order result, not a failure |
+| Ambiguous `UNKNOWN` submission outcome | **trading paused for the process**; exit `2` |
+| Rejected credentials, untradable account, broken state | stops, fails closed; exit `1` |
+
+An `UNKNOWN` outcome means an order may or may not exist at the broker. Nothing
+here resolves it, and nothing else is submitted on top of it.
+
+### Monitoring and operation
+
+Structured `event=... key=value` lines on the standard library's `logging`,
+written to stdout - which is what systemd and journald already collect, so no
+log file is required in the repository. A heartbeat reports the runtime start,
+the last cycle, the last successful cycle, the last processed bar per symbol,
+whether execution is enabled and why not, counts, and the last error. No
+Telegram, no Slack, no webhook, no agent.
+
+Only one runner may hold a database at a time, enforced by an `fcntl` lock on
+`<database>.runtime.lock` and released in a `finally`. A second runner exits
+non-zero before it fetches a bar. `SIGINT` and `SIGTERM` stop the process
+cleanly: no new cycle, no new submission, the strategy run closed, the lock
+released.
+
 ## Development
 
 ```bash
@@ -828,7 +941,7 @@ stripped, so prose describing a forbidden construct cannot mask its presence.
 src/autotrader/data/        Alpaca crypto bars -> canonical Parquet, and
                             stored-dataset validation
 src/autotrader/cli/         Typer CLI (version, download, validate, backtest,
-                            paper-submit, reconcile)
+                            paper-submit, reconcile, crypto-run)
 src/autotrader/strategies/  EMA 20 / EMA 50 crossover signals
 src/autotrader/backtest/    deterministic next-bar-open backtester, fractional
                             quantities, modelled taker fee
@@ -839,6 +952,9 @@ src/autotrader/execution/   Alpaca PAPER crypto execution - the only place a
 src/autotrader/reconciliation/
                             crash recovery: broker truth -> local state, and
                             the safe_to_trade startup answer
+src/autotrader/runtime/     the 24/7 loop: UTC boundary scheduling, bounded
+                            bar fetching, startup safety, duplicate
+                            protection, heartbeat, process lock
 tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)
 data/processed/             validated market data (git-ignored)
@@ -848,11 +964,11 @@ docs/SPEC.md                authoritative scope specification
 
 ## What comes next
 
-**Phase 9 - 24/7 Runtime / Monitoring.** It owns the continuous loop, wake-up
-scheduling on completed 15-minute bars, bar-freshness checks, heartbeat and
-alerting, and process supervision. It is **not started**, and nothing in this
-repository loops, schedules, or polls.
+**The integration gate.** Phase 8's reconciliation result becomes the
+startup-safety answer the runtime already asks for and already fails closed
+against, and the in-process bar checkpoint gains a durable counterpart. Until
+that lands, the runtime observes and does not trade - by design, not by
+accident.
 
-The integration boundary between the two is deliberately one line: a runtime
-may begin trading only when `reconcile_paper_state(...).safe_to_trade` is
-true. Phase 8 built that answer and stopped there.
+**Phase 10 - Deployment** comes after the integrated paper smoke gate and
+failure injection.
