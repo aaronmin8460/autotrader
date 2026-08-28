@@ -27,6 +27,7 @@ from enum import Enum
 
 from autotrader.execution import paper
 from autotrader.execution.models import ExecutionError
+from autotrader.execution.paper import broker_symbol_key
 from autotrader.smoke.models import (
     BrokerReadClient,
     BrokerUnreadableError,
@@ -99,13 +100,20 @@ def read_account(client: BrokerReadClient) -> paper.PaperAccountState:
 
 
 def read_positions(client: BrokerReadClient) -> dict[str, PositionSnapshot]:
-    """Every open broker position, keyed by uppercase symbol.
+    """Every open broker position, keyed by `broker_symbol_key`.
 
     **This is the authoritative quantity** for everything downstream. A short
     position makes the underlying reader raise, and that is surfaced as an
     unreadable broker rather than swallowed: this system is long only, and a
     harness that quietly ignored a short would plan a cleanup around exposure
     it had not accounted for.
+
+    The key is slash-insensitive because the broker is not consistent with
+    itself: the same market is `BTC/USD` on an order and `BTCUSD` on the
+    position that order creates. Keying by the literal spelling means a
+    position looked up by its canonical pair name is never found - and
+    `position_for` reports "not mentioned" as a confident flat zero, so the
+    miss reads as an authoritative "you hold nothing" rather than as an error.
     """
     try:
         positions = paper.fetch_paper_positions(client)
@@ -116,7 +124,7 @@ def read_positions(client: BrokerReadClient) -> dict[str, PositionSnapshot]:
             f"Could not read broker positions ({type(error).__name__})."
         ) from None
     return {
-        normalize_smoke_symbol(position.symbol): PositionSnapshot(
+        broker_symbol_key(position.symbol): PositionSnapshot(
             symbol=normalize_smoke_symbol(position.symbol),
             quantity=position.quantity,
             market_value=position.market_value,
@@ -133,9 +141,20 @@ def position_for(positions: dict[str, PositionSnapshot], symbol: str) -> Positio
     answer rather than a missing one - so it is returned as a quantity of zero
     instead of `None`. Callers then have one shape to reason about, and no
     caller can accidentally read "absent" as "unknown".
+
+    That guarantee is exactly why the lookup is slash-insensitive. Alpaca
+    names the same market two ways - `BTC/USD` on the order, `BTCUSD` on the
+    resulting position - so matching on the literal spelling turns a real
+    position into a confident zero. Downstream that is not a cosmetic miss:
+    the cleanup planner would report NO_CLEANUP_REQUIRED against an open
+    position, and the final audit would call the exposure restored while the
+    smoke's own BUY was still held.
+
+    The returned snapshot keeps the **caller's** spelling when the broker is
+    flat, so a report reads in the vocabulary it was asked in.
     """
     ticker = normalize_smoke_symbol(symbol)
-    found = positions.get(ticker)
+    found = positions.get(broker_symbol_key(ticker))
     if found is not None:
         return found
     return PositionSnapshot(symbol=ticker, quantity=Decimal(0), market_value=0.0)

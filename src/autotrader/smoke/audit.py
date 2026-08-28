@@ -25,9 +25,11 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from autotrader.execution.models import format_quantity
+from autotrader.execution.paper import broker_symbol_key
 from autotrader.smoke import broker, health, tracking
 from autotrader.smoke.baseline import Baseline
 from autotrader.smoke.broker import LookupOutcome
@@ -265,22 +267,36 @@ def _comparisons(
     positions: dict[str, PositionSnapshot], baseline: Baseline, universe: Sequence[str]
 ) -> tuple[BaselineComparison, ...]:
     """Before/after for every symbol in the baseline or the current universe."""
-    symbols = sorted(
-        {normalize_smoke_symbol(symbol) for symbol in universe}
-        | set(baseline.positions)
-        | set(positions)
-    )
+    # One row per market. The three sources spell the same market differently -
+    # the universe and the baseline use `BTC/USD`, the broker's position list
+    # uses `BTCUSD` - so they are deduped by `broker_symbol_key` and rendered in
+    # the canonical spelling where one is known. Unioning the raw strings would
+    # emit two rows for one holding and compare each against the wrong half.
+    chosen: dict[str, str] = {}
+    for symbol in (
+        *(normalize_smoke_symbol(item) for item in universe),
+        *baseline.positions,
+    ):
+        chosen.setdefault(broker_symbol_key(symbol), symbol)
+    for symbol in positions:
+        chosen.setdefault(broker_symbol_key(symbol), symbol)
+
+    # Indexed by market rather than read by key, because callers key this dict
+    # in either vocabulary: the tracked map is keyed by the universe's canonical
+    # names, a raw broker read by the broker's own spelling.
+    by_market = {broker_symbol_key(symbol): position for symbol, position in positions.items()}
+
     return tuple(
         BaselineComparison(
             symbol=symbol,
             before=baseline.quantity_for(symbol),
             after=(
-                positions[symbol].quantity
-                if symbol in positions
-                else baseline.quantity_for(symbol) * 0
+                by_market[broker_symbol_key(symbol)].quantity
+                if broker_symbol_key(symbol) in by_market
+                else Decimal(0)
             ),
         )
-        for symbol in symbols
+        for symbol in sorted(chosen.values())
     )
 
 

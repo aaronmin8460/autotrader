@@ -2528,3 +2528,100 @@ def test_every_cli_command_runs_without_a_network(
         result = runner.invoke(app, arguments)
         assert result.exit_code in (0, 1, 2), (arguments, result.output)
         assert not isinstance(result.exception, AssertionError), arguments
+
+
+# ---------------------------------------------------------------------------
+# The broker names one market two ways
+#
+# Alpaca returns `BTC/USD` on an order and `BTCUSD` on the position that order
+# creates. Every test above builds its fake positions with the slashed
+# spelling, which is exactly why this went unnoticed until a real smoke ran:
+# matching on the literal string turned a live position into a confident zero,
+# and a confident zero is what the cleanup planner and the final audit both
+# treat as "nothing to do".
+# ---------------------------------------------------------------------------
+
+BROKER_BTC = "BTCUSD"
+
+
+def test_a_position_the_broker_spells_without_a_slash_is_still_found() -> None:
+    client = FakeBrokerClient(
+        positions=[make_position(BROKER_BTC, qty="0.000322094", market_value="24.92")]
+    )
+    live = broker_module.read_positions(client)
+
+    found = broker_module.position_for(live, BTC)
+    assert found.quantity == Decimal("0.000322094"), (
+        "the broker's own position spelling must not hide it from a canonical lookup"
+    )
+
+
+def test_a_flat_symbol_is_still_reported_flat() -> None:
+    """The fix must not turn 'not held' into a false match."""
+    client = FakeBrokerClient(
+        positions=[make_position(BROKER_BTC, qty="0.000322094", market_value="24.92")]
+    )
+    live = broker_module.read_positions(client)
+
+    assert broker_module.position_for(live, ETH).quantity == Decimal(0)
+    assert broker_module.position_for(live, "SPY").quantity == Decimal(0)
+
+
+def test_a_baseline_quantity_is_found_by_either_spelling() -> None:
+    baseline = flat_baseline()
+    assert baseline.quantity_for(BTC) == Decimal(0)
+    assert baseline.quantity_for(BROKER_BTC) == Decimal(0)
+
+
+def test_the_final_audit_sees_a_position_the_broker_spelled_without_a_slash(
+    writer: sqlite3.Connection, database_path: Path
+) -> None:
+    """The failure this pins is a FALSE GREEN, which is the worst kind here.
+
+    A smoke BUY that is still held must never be reported as restored exposure.
+    """
+    seed_reconciliation(writer)
+    client = FakeBrokerClient(
+        positions=[make_position(BROKER_BTC, qty="0.000322094", market_value="24.92")]
+    )
+
+    with open_readonly(database_path) as reader:
+        result = run_audit(reader, client=client, baseline=flat_baseline())
+
+    assert result.exposure_text() == EXPOSURE_NOT_RESTORED
+    assert result.complete is False
+
+
+def test_the_audit_compares_one_row_per_market_not_one_per_spelling(
+    writer: sqlite3.Connection, database_path: Path
+) -> None:
+    """Two spellings of one holding must not become two comparisons."""
+    seed_reconciliation(writer)
+    client = FakeBrokerClient(
+        positions=[make_position(BROKER_BTC, qty="0.000322094", market_value="24.92")]
+    )
+
+    with open_readonly(database_path) as reader:
+        result = run_audit(reader, client=client, baseline=flat_baseline())
+
+    symbols = [comparison.symbol for comparison in result.report.comparisons]
+    assert len(symbols) == len(set(symbols)), symbols
+    keys = [symbol.replace("/", "") for symbol in symbols]
+    assert len(keys) == len(set(keys)), f"one market compared twice: {symbols}"
+
+
+def test_preflight_does_not_call_a_tracked_market_untracked(
+    writer: sqlite3.Connection, database_path: Path
+) -> None:
+    """`BTCUSD` is the BTC/USD the universe already tracks, not a surprise holding."""
+    seed_reconciliation(writer)
+    client = FakeBrokerClient(
+        positions=[make_position(BROKER_BTC, qty="0.000322094", market_value="24.92")]
+    )
+
+    with open_readonly(database_path) as reader:
+        report = run_preflight(reader, client=client)
+
+    positions = check_named(report, "broker.positions")
+    assert "0.000322094" in positions.detail, positions.detail
+    assert "untracked" not in positions.detail, positions.detail
