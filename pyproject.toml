@@ -25,6 +25,14 @@ dashboard = [
     "fastapi",
     "uvicorn[standard]",
 ]
+# tests/test_web_publish_browser.py drives the published dashboard in Chromium,
+# because nothing that fails to execute JavaScript can tell a rendered page from
+# a blank one - both return 200. Deliberately NOT in `dev`: the deploy script
+# installs `dev` on the VPS and runs the suite there, and a trading host has no
+# reason to carry a browser. The test skips itself when this extra is absent.
+browser = [
+    "playwright",
+]
 dev = [
     "pytest",
     "ruff",

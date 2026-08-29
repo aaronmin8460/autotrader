@@ -1,0 +1,128 @@
+# AutoTrader crypto runtime - Alpaca PAPER only, BTC/USD + ETH/USD, 24/7.
+#
+# Install to /usr/lib/systemd/system/autotrader-crypto.service.
+#
+# This unit starts a process that CAN submit paper orders, but only when three
+# independent gates are all open (docs/SPEC.md section 8, C7/C9):
+#
+#   1. AUTOTRADER_PAPER_TRADING_ENABLED=true in the environment
+#   2. --confirm-paper-runtime PAPER on the command line
+#   3. startup reconciliation reporting that trading is safe
+#
+# This file supplies neither 1 nor 2 by itself. Both arrive only from
+# /etc/autotrader/autotrader.trading.env, which does not exist until an
+# operator runs `autotrader-enable-paper-trading`. Deploying this unit
+# therefore cannot start trading; see docs/DEPLOYMENT.md, "Deploy is not
+# activation".
+
+[Unit]
+Description=AutoTrader crypto runtime (Alpaca PAPER, BTC/USD + ETH/USD, 24/7)
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+# An unconfigured machine is an unfinished install, not a crash to retry.
+# `ConditionPathExists` leaves the unit inactive rather than failed, so a
+# half-installed host does not fill the journal with restart attempts.
+ConditionPathExists=/etc/autotrader/autotrader.env
+ConditionPathExists=/opt/autotrader/venv/bin/autotrader
+
+# The ceiling on `Restart=on-failure`. Five failed starts inside ten minutes
+# and systemd stops trying, leaving the unit in `failed` where an operator can
+# see it. Without this, an exit-1 cause that never clears - an unusable
+# configuration, a lock held by a runner nobody remembers starting - would
+# retry every 30 seconds forever.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=autotrader
+Group=autotrader
+WorkingDirectory=/opt/autotrader/app
+
+# Order matters: systemd applies these in sequence and later files win.
+#
+#   autotrader.env          shared, non-secret, and the SAFE DEFAULTS
+#   autotrader.secrets.env  Alpaca paper credentials (0640 root:autotrader)
+#   autotrader.trading.env  the ACTIVATION file
+#
+# The leading `-` marks a file optional. The activation file is absent on a
+# freshly deployed host, and its absence leaves the safe defaults from
+# autotrader.env standing rather than failing the unit. The gate fails closed
+# at the deployment layer for the same reason it fails closed in the code.
+EnvironmentFile=/etc/autotrader/autotrader.env
+EnvironmentFile=-/etc/autotrader/autotrader.secrets.env
+EnvironmentFile=-/etc/autotrader/autotrader.trading.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# `$AUTOTRADER_CRYPTO_ARGS` is deliberately the single-`$` form: systemd splits
+# that on whitespace, which is what turns `--confirm-paper-runtime PAPER` into
+# the two arguments the CLI expects. `${AUTOTRADER_CRYPTO_ARGS}` would pass it
+# as one argument and the CLI would reject it. `${AUTOTRADER_DB}` is braced for
+# the opposite reason: a path is one argument even if someone puts a space in
+# it.
+ExecStart=/opt/autotrader/venv/bin/autotrader crypto-run --db ${AUTOTRADER_DB} $AUTOTRADER_CRYPTO_ARGS
+
+# Restart semantics. The runtime's exit codes are not interchangeable, and
+# treating them as if they were is how a safety halt becomes a retry loop:
+#
+#   0  clean stop, including a clean SIGTERM. Not a failure; nothing to do.
+#   1  controlled refusal or a fatal cycle failure - a held lock, an unusable
+#      configuration, a cycle that died. Some of these are transient (a
+#      provider outage at 03:00), so a bounded retry is worth having.
+#   2  TRADING PAUSED: a submission outcome is UNKNOWN and an order may exist
+#      at the broker. Restarting would ask a process that just refused to keep
+#      trading to try again against state nobody has reconciled.
+#
+# So: retry 1, never retry 2. Exit 2 leaves the unit `failed` and it stays
+# down until someone runs `autotrader reconcile` and starts it by hand.
+#
+# Note that Click - which Typer is built on - also exits 2 on a command-line
+# usage error. That collision is in the safe direction: a malformed ExecStart
+# leaves the service down and visible rather than looping.
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+
+# SIGTERM is the runtime's own shutdown request; it finishes what it is doing
+# and exits 0. The generous stop timeout is for a cycle mid-submission: killing
+# that produces exactly the UNKNOWN state the runtime exists to avoid.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+
+# systemd creates and owns /var/lib/autotrader, so the persistent SQLite
+# directory exists with the right ownership before ExecStart and is not
+# something the deploy script has to get right. It survives redeployments,
+# service restarts, and `systemctl disable`; only `--purge`-style removal
+# clears it. Under ProtectSystem=strict this is also the only writable path.
+StateDirectory=autotrader
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-crypto
+
+[Install]
+WantedBy=multi-user.target

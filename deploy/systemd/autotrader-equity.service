@@ -1,0 +1,92 @@
+# AutoTrader equity runtime - Alpaca PAPER only, ten-symbol universe.
+#
+# Install to /usr/lib/systemd/system/autotrader-equity.service.
+#
+# Requires the `equity-run` command, which arrives with Equity V0.2. Until the
+# combined branch is merged, `systemctl start autotrader-equity` fails on an
+# unknown command; see docs/DEPLOYMENT.md, "What is still pinned to Combined
+# Integration".
+#
+# **This unit is long-running, and there is no timer or cron entry beside it.**
+# The market session is application-owned: `equity-run` reads the broker's own
+# calendar, so it knows about holidays and early closes, and a cycle outside
+# the regular session does nothing at all - no fetch, no strategy, no
+# checkpoint, no order, no provider call. A cron entry firing at 09:30 and a
+# stop at 16:00 would be a second, dumber copy of that logic, in a place that
+# cannot see the calendar, and the two would disagree the first time the NYSE
+# closed early. Leave the process up and let it decide.
+
+[Unit]
+Description=AutoTrader equity runtime (Alpaca PAPER, regular US sessions)
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+ConditionPathExists=/etc/autotrader/autotrader.env
+ConditionPathExists=/opt/autotrader/venv/bin/autotrader
+
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=autotrader
+Group=autotrader
+WorkingDirectory=/opt/autotrader/app
+
+# Same three files, same order, same reason as autotrader-crypto.service: the
+# activation file is last so it can override the safe defaults, and optional so
+# that its absence leaves them in place.
+EnvironmentFile=/etc/autotrader/autotrader.env
+EnvironmentFile=-/etc/autotrader/autotrader.secrets.env
+EnvironmentFile=-/etc/autotrader/autotrader.trading.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# The same database as the crypto runtime, deliberately. One Alpaca paper
+# account, one `client_order_id` space, one audit trail. The two processes do
+# not collide over it: the equity runner takes a `.equity`-scoped lock file
+# (`<db>.equity.runtime.lock`) while the crypto runner keeps the unscoped one
+# (`<db>.runtime.lock`), so each still refuses a second copy of itself without
+# blocking the other product.
+ExecStart=/opt/autotrader/venv/bin/autotrader equity-run --db ${AUTOTRADER_DB} $AUTOTRADER_EQUITY_ARGS
+
+# Identical to the crypto runtime's, for identical reasons: exit 1 is worth a
+# bounded retry, exit 2 is TRADING PAUSED and must not be retried by a machine.
+# See autotrader-crypto.service for the full reasoning.
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+
+StateDirectory=autotrader
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity
+
+[Install]
+WantedBy=multi-user.target

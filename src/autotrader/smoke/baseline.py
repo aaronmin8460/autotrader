@@ -34,6 +34,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from autotrader.execution.models import format_quantity
+from autotrader.execution.paper import broker_symbol_key
 from autotrader.smoke.health import credential_key_names
 from autotrader.smoke.models import SmokeError, SmokeInputError
 
@@ -144,8 +145,18 @@ class Baseline:
 
         Zero rather than `None`: a symbol absent from a broker's position list
         is flat, and the snapshot records exactly what the broker reported.
+
+        Matched per market rather than per spelling. A baseline written from the
+        tracked universe records `BTC/USD`, while a caller holding a broker
+        position snapshot asks about `BTCUSD`; without this, the "before" of a
+        comparison silently reads zero and the smoke's own BUY looks like it was
+        already there.
         """
-        return self.positions.get(symbol.strip().upper(), Decimal(0))
+        wanted = broker_symbol_key(symbol)
+        for recorded, quantity in self.positions.items():
+            if broker_symbol_key(recorded) == wanted:
+                return quantity
+        return Decimal(0)
 
 
 def assert_no_secrets(payload: object) -> None:

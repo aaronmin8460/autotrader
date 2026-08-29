@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+#
+# Deploy a specific AutoTrader commit to this host.
+#
+#   autotrader-deploy <git-ref> [options]
+#
+# **This script cannot start trading, and that is a structural property rather
+# than a promise.** It never writes /etc/autotrader/autotrader.trading.env,
+# never sets AUTOTRADER_PAPER_TRADING_ENABLED, and never passes
+# --confirm-paper-runtime. A host it has just deployed to runs the runtimes
+# with --observe-only: they fetch, validate, evaluate, record and reconcile,
+# and they construct no execution path at all. Turning that into paper trading
+# is a second, separate, deliberate command - see
+# `autotrader-enable-paper-trading` and docs/DEPLOYMENT.md, "Deploy is not
+# activation".
+#
+# It also never touches persistent state or secrets. /var/lib/autotrader and
+# /etc/autotrader/autotrader.secrets.env are read, at most; the SQLite database
+# is not copied, moved, recreated or migrated by anything here. Schema
+# migration is the application's job and happens when a runtime opens the file.
+#
+# Run as root: it writes /opt, /usr/lib/systemd/system, and calls systemctl.
+
+set -euo pipefail
+
+# Paths are overridable so the script can be exercised against a scratch tree.
+# Deployment reads them from the environment only when they are already set,
+# so a real run uses the real locations.
+APP_DIR="${AUTOTRADER_APP_DIR:-/opt/autotrader/app}"
+VENV_DIR="${AUTOTRADER_VENV_DIR:-/opt/autotrader/venv}"
+STATE_DIR="${AUTOTRADER_STATE_DIR:-/var/lib/autotrader}"
+CONFIG_DIR="${AUTOTRADER_CONFIG_DIR:-/etc/autotrader}"
+# Units are installed into the VENDOR directory, not /etc/systemd/system, and
+# the reason is masking. `systemctl mask` disables a unit by symlinking it to
+# /dev/null in the ADMIN directory, which outranks the vendor one - and it
+# refuses to do that at all if a regular file is already sitting at that path.
+# Installing units into /etc therefore makes a trading runtime unmaskable,
+# and installing them there *around* an existing mask is worse: `install`
+# replaces the symlink with a regular file, silently re-arming a service an
+# operator deliberately switched off. Vendor for what the deploy ships, admin
+# for what the operator decides; the two layers never write to each other.
+SYSTEMD_DIR="${AUTOTRADER_SYSTEMD_DIR:-/usr/lib/systemd/system}"
+
+#: Where systemd looks first, and where a mask lives. Never written here.
+ADMIN_SYSTEMD_DIR="${AUTOTRADER_ADMIN_SYSTEMD_DIR:-/etc/systemd/system}"
+SERVICE_USER="${AUTOTRADER_USER:-autotrader}"
+
+TRADING_UNITS=(autotrader-crypto.service autotrader-equity.service)
+DASHBOARD_UNITS=(autotrader-dashboard-api.service autotrader-dashboard-web.service)
+
+DEPLOY_LOG="${STATE_DIR}/deploy-history.log"
+ACTIVATION_FILE="${CONFIG_DIR}/autotrader.trading.env"
+
+RUN_TESTS=0
+NO_RESTART=0
+SKIP_DASHBOARD=0
+NO_FETCH=0
+REQUIRE_OBSERVE_ONLY=0
+DRY_RUN=0
+REF=""
+
+die() { printf 'deploy: %s\n' "$*" >&2; exit 1; }
+have_systemctl() { command -v systemctl >/dev/null 2>&1; }
+note() { printf '\n== %s\n' "$*"; }
+run() {
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    printf '  [dry-run] %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: autotrader-deploy <git-ref> [options]
+
+  <git-ref>                 Commit SHA, tag, or branch to deploy. Resolved to a
+                            SHA and checked out detached, so the deployed tree
+                            is exactly one commit and never drifts.
+
+Options:
+  --run-tests               Run pytest and ruff from the deployed tree before
+                            restarting anything. Refuses the deploy if they fail.
+  --require-observe-only    Refuse to deploy if paper trading is currently
+                            activated on this host. Use for infrastructure
+                            staging, so the first deploys happen with the
+                            execution path switched off.
+  --no-restart              Update files only. Leave every service as it is.
+  --skip-dashboard          Do not touch npm dependencies or the Next.js build.
+  --no-fetch                Do not contact the git remote. The ref must already
+                            exist locally.
+  --dry-run                 Print what would happen. Changes nothing.
+  -h, --help                This text.
+
+Never enables trading. See `autotrader-enable-paper-trading`.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run-tests) RUN_TESTS=1 ;;
+    --require-observe-only) REQUIRE_OBSERVE_ONLY=1 ;;
+    --no-restart) NO_RESTART=1 ;;
+    --skip-dashboard) SKIP_DASHBOARD=1 ;;
+    --no-fetch) NO_FETCH=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *)
+      [ -z "${REF}" ] || die "more than one ref given: '${REF}' and '$1'"
+      REF="$1"
+      ;;
+  esac
+  shift
+done
+
+[ -n "${REF}" ] || { usage >&2; die "no git ref given"; }
+
+# ---------------------------------------------------------------------------
+# Preflight. Everything that can refuse, refuses before anything is changed.
+# ---------------------------------------------------------------------------
+
+note "Preflight"
+
+[ -d "${APP_DIR}/.git" ] || die "${APP_DIR} is not a git checkout. Run the install steps in docs/DEPLOYMENT.md first."
+
+if [ "${REQUIRE_OBSERVE_ONLY}" -eq 1 ] && [ -f "${ACTIVATION_FILE}" ]; then
+  die "--require-observe-only was given but ${ACTIVATION_FILE} exists, so paper trading is activated on this host. Run 'autotrader-enable-paper-trading --disable' first, or drop the flag."
+fi
+
+# A dirty tree means someone edited the deployed code in place. Checking out
+# over it would either fail or silently discard their edit, and neither is a
+# thing a deploy script should decide on its own.
+DIRTY="$(git -C "${APP_DIR}" status --porcelain)"
+if [ -n "${DIRTY}" ]; then
+  printf '%s\n' "${DIRTY}" >&2
+  die "the checkout at ${APP_DIR} has uncommitted changes (above). Refusing to deploy over them."
+fi
+
+if [ "${NO_FETCH}" -eq 0 ]; then
+  run git -C "${APP_DIR}" fetch --prune --tags origin
+fi
+
+# `^{commit}` makes this reject a ref that resolves to a tree or a blob, and
+# `--verify` keeps git from guessing at a near-miss.
+TARGET_SHA="$(git -C "${APP_DIR}" rev-parse --verify --quiet "${REF}^{commit}" || true)"
+[ -n "${TARGET_SHA}" ] || die "'${REF}' does not name a commit reachable from ${APP_DIR}. Fetch it, or check the spelling."
+
+CURRENT_SHA="$(git -C "${APP_DIR}" rev-parse HEAD)"
+printf '  current : %s\n' "${CURRENT_SHA}"
+printf '  target  : %s (%s)\n' "${TARGET_SHA}" "${REF}"
+printf '  state   : %s (preserved, never touched by this script)\n' "${STATE_DIR}"
+printf '  secrets : %s (preserved, never touched by this script)\n' "${CONFIG_DIR}"
+
+if [ -f "${ACTIVATION_FILE}" ]; then
+  printf '  trading : ACTIVATED (%s exists) - this deploy will not change that\n' "${ACTIVATION_FILE}"
+else
+  printf '  trading : observe-only (no activation file) - this deploy will not change that\n'
+fi
+
+# ---------------------------------------------------------------------------
+# Stop what has to be stopped, remembering what was running.
+# ---------------------------------------------------------------------------
+
+WAS_ACTIVE=()
+if [ "${NO_RESTART}" -eq 0 ] && have_systemctl; then
+  note "Stopping services"
+  for unit in "${TRADING_UNITS[@]}" "${DASHBOARD_UNITS[@]}"; do
+    if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+      WAS_ACTIVE+=("${unit}")
+      printf '  was active: %s\n' "${unit}"
+      # SIGTERM, and wait. The runtimes finish the cycle they are in; killing
+      # one mid-submission is how a submission outcome becomes UNKNOWN.
+      run systemctl stop "${unit}"
+    fi
+  done
+  [ "${#WAS_ACTIVE[@]}" -gt 0 ] || printf '  nothing was running\n'
+fi
+
+# ---------------------------------------------------------------------------
+# Application code.
+# ---------------------------------------------------------------------------
+
+note "Checking out ${TARGET_SHA}"
+# Detached, deliberately: the deployed tree is one named commit, not a branch
+# that a later `git pull` somewhere else could move underneath it.
+run git -C "${APP_DIR}" checkout --quiet --detach "${TARGET_SHA}"
+
+note "Python environment"
+if [ ! -x "${VENV_DIR}/bin/python" ]; then
+  printf '  creating %s\n' "${VENV_DIR}"
+  run python3 -m venv "${VENV_DIR}"
+fi
+run "${VENV_DIR}/bin/python" -m pip install --quiet --upgrade pip
+# The dashboard extra is installed unconditionally so the API unit works; the
+# trading runtimes import none of it.
+if [ "${SKIP_DASHBOARD}" -eq 1 ]; then
+  run "${VENV_DIR}/bin/python" -m pip install --quiet --upgrade "${APP_DIR}"
+else
+  run "${VENV_DIR}/bin/python" -m pip install --quiet --upgrade "${APP_DIR}[dashboard]"
+fi
+
+FRONTEND_DIR="${APP_DIR}/dashboard/frontend"
+if [ "${SKIP_DASHBOARD}" -eq 0 ] && [ -f "${FRONTEND_DIR}/package.json" ]; then
+  note "Dashboard frontend"
+  # `npm ci`, not `npm install`: it installs exactly the lockfile and fails if
+  # package.json and the lockfile disagree, so a deploy cannot quietly resolve
+  # a different dependency tree than the one that was tested.
+  run npm --prefix "${FRONTEND_DIR}" ci
+  run npm --prefix "${FRONTEND_DIR}" run build
+elif [ "${SKIP_DASHBOARD}" -eq 1 ]; then
+  printf '\n== Dashboard frontend skipped (--skip-dashboard)\n'
+else
+  printf '\n== Dashboard frontend absent at %s - skipping\n' "${FRONTEND_DIR}"
+fi
+
+# ---------------------------------------------------------------------------
+# Optional verification, from the tree that was just deployed.
+# ---------------------------------------------------------------------------
+
+if [ "${RUN_TESTS}" -eq 1 ]; then
+  note "Tests and checks"
+  run "${VENV_DIR}/bin/python" -m pip install --quiet --upgrade "${APP_DIR}[dev]"
+  run "${VENV_DIR}/bin/python" -m pytest -q "${APP_DIR}/tests"
+  run "${VENV_DIR}/bin/python" -m ruff check "${APP_DIR}"
+  run "${VENV_DIR}/bin/python" -m ruff format --check "${APP_DIR}"
+fi
+
+# ---------------------------------------------------------------------------
+# Configuration and units.
+# ---------------------------------------------------------------------------
+
+note "Configuration"
+run install -d -o root -g root -m 0755 "${CONFIG_DIR}"
+if [ -f "${CONFIG_DIR}/autotrader.env" ]; then
+  printf '  %s/autotrader.env exists - left alone\n' "${CONFIG_DIR}"
+else
+  printf '  installing %s/autotrader.env from the example (safe defaults)\n' "${CONFIG_DIR}"
+  run install -o root -g root -m 0644 \
+    "${APP_DIR}/deploy/env/autotrader.env.example" "${CONFIG_DIR}/autotrader.env"
+fi
+if [ ! -f "${CONFIG_DIR}/autotrader.secrets.env" ]; then
+  printf '  NOTE: %s/autotrader.secrets.env is absent. Create it by hand;\n' "${CONFIG_DIR}"
+  printf '        this script does not write credentials.\n'
+fi
+
+note "systemd units"
+UNITS_CHANGED=0
+if [ -d "${APP_DIR}/deploy/systemd" ]; then
+  for unit_file in "${APP_DIR}"/deploy/systemd/*.service "${APP_DIR}"/deploy/systemd/*.timer; do
+    [ -f "${unit_file}" ] || continue
+    unit_name="$(basename "${unit_file}")"
+    installed="${SYSTEMD_DIR}/${unit_name}"
+
+    # A mask is a standing operator decision that this service must not run.
+    # Deploying into the vendor directory does not reach it, but SYSTEMD_DIR
+    # is overridable, so check rather than assume: writing here would replace
+    # the symlink with a regular file and quietly re-arm the service.
+    if [ -L "${installed}" ] && [ "$(readlink "${installed}")" = "/dev/null" ]; then
+      printf '  %s is MASKED at %s - left alone\n' "${unit_name}" "${installed}"
+      continue
+    fi
+
+    if [ -f "${installed}" ] && cmp -s "${unit_file}" "${installed}"; then
+      continue
+    fi
+    printf '  updating %s\n' "${unit_name}"
+    run install -o root -g root -m 0644 "${unit_file}" "${installed}"
+    UNITS_CHANGED=1
+
+    # A regular file in the admin directory outranks what was just installed.
+    # Left unreported, the host would keep running the old unit while
+    # `git rev-parse` truthfully reported the new SHA - the kind of
+    # disagreement that costs an hour at exactly the wrong moment.
+    shadow="${ADMIN_SYSTEMD_DIR}/${unit_name}"
+    if [ "${SYSTEMD_DIR}" != "${ADMIN_SYSTEMD_DIR}" ] && [ -f "${shadow}" ] && [ ! -L "${shadow}" ]; then
+      printf '  WARNING: %s shadows it and takes precedence. Remove it, or this deploy did nothing for %s.\n' \
+        "${shadow}" "${unit_name}"
+    fi
+  done
+fi
+if [ "${UNITS_CHANGED}" -eq 0 ]; then
+  printf '  no unit changed - no daemon-reload needed\n'
+elif have_systemctl; then
+  printf '  units changed - reloading systemd\n'
+  run systemctl daemon-reload
+else
+  printf '  units changed, but systemctl is unavailable - reload them by hand\n'
+fi
+
+# ---------------------------------------------------------------------------
+# Record, then restart only what was running before.
+# ---------------------------------------------------------------------------
+
+if [ "${DRY_RUN}" -eq 0 ] && [ -d "${STATE_DIR}" ]; then
+  # Append-only. This is the only thing this script ever writes under the
+  # state directory, and rollback reads it to find the previous known-good SHA.
+  printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${TARGET_SHA}" "${REF}" \
+    >>"${DEPLOY_LOG}"
+fi
+
+if [ "${NO_RESTART}" -eq 0 ] && [ "${#WAS_ACTIVE[@]}" -gt 0 ] && have_systemctl; then
+  note "Restarting what was running"
+  for unit in "${WAS_ACTIVE[@]}"; do
+    printf '  starting %s\n' "${unit}"
+    run systemctl start "${unit}"
+  done
+fi
+
+# A service that was stopped before this deploy stays stopped. Starting one
+# because it happens to be installed would be this script deciding to put a
+# trading process back on the air, which is not its call to make.
+
+note "Deployed"
+cat <<SUMMARY
+  ${CURRENT_SHA}
+    -> ${TARGET_SHA}
+
+  Rollback target if this goes wrong:
+    autotrader-rollback ${CURRENT_SHA}
+
+  Trading was NOT enabled by this script. The runtimes are running with
+  whatever posture ${CONFIG_DIR} already described - observe-only unless
+  someone previously ran autotrader-enable-paper-trading.
+
+  Next:
+    autotrader-healthcheck
+SUMMARY

@@ -27,6 +27,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from autotrader.execution.models import format_quantity
+from autotrader.execution.paper import broker_symbol_key
 from autotrader.smoke import broker, cleanup, health, tracking
 from autotrader.smoke.baseline import Baseline
 from autotrader.smoke.gitinfo import GitState
@@ -343,7 +344,13 @@ def _broker_checks(
         symbol: broker.position_for(positions, symbol)
         for symbol in (normalize_smoke_symbol(item) for item in universe)
     }
-    untracked = sorted(set(positions) - set(tracked))
+    # Per market, not per spelling. `positions` is keyed by `broker_symbol_key`
+    # and `tracked` by the universe's canonical names, so a plain set difference
+    # reports BTCUSD as an untracked holding alongside the BTC/USD it *is*.
+    tracked_keys = {broker_symbol_key(symbol) for symbol in tracked}
+    untracked = sorted(
+        position.symbol for key, position in positions.items() if key not in tracked_keys
+    )
     summary = ", ".join(
         f"{symbol}={format_quantity(position.quantity)}"
         for symbol, position in sorted(tracked.items())

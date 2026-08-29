@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""Read-only health check for a deployed AutoTrader host.
+
+**It reads and it reports. It does not fix.** Nothing here writes to the
+database, restarts a unit, or calls reconciliation - and the last of those is
+the one worth being explicit about, because a health check that repaired what
+it found would be an unattended process making trading-safety decisions on a
+schedule, which is exactly the authority the runtime's startup reconciliation
+is careful to take only once, deliberately, with an operator's confirmation
+still required afterwards. When this script says UNRESOLVED, a human runs
+`autotrader reconcile`.
+
+**It is tolerant of a schema it does not recognize.** Every database check
+here probes `sqlite_master` and `PRAGMA table_info` first and reports SKIP for
+anything absent, so this script runs unchanged against the current schema and
+against an older database that no current runtime has opened yet. A health
+check that crashed on an unexpected schema would fail at exactly the moment
+someone was deploying a change and needed it most.
+
+Exit codes: 0 all clear, 1 at least one WARN, 2 at least one FAIL.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sqlite3
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import UTC, datetime
+from pathlib import Path
+
+OK = "OK"
+WARN = "WARN"
+FAIL = "FAIL"
+SKIP = "SKIP"
+
+#: Ordered worst-last so the exit code is a max over what was found.
+_SEVERITY = {SKIP: 0, OK: 0, WARN: 1, FAIL: 2}
+
+TRADING_UNITS = ("autotrader-crypto.service", "autotrader-equity.service")
+DASHBOARD_UNITS = ("autotrader-dashboard-api.service", "autotrader-dashboard-web.service")
+
+#: Three missed 15-minute bars. Long enough not to cry over one slow provider
+#: response, short enough that a wedged runtime is noticed within the hour.
+DEFAULT_MAX_HEARTBEAT_AGE_SECONDS = 2700
+
+
+class Report:
+    """Accumulates check results and prints them as an aligned block."""
+
+    def __init__(self) -> None:
+        self.rows: list[tuple[str, str, str]] = []
+
+    def add(self, status: str, check: str, detail: str) -> None:
+        self.rows.append((status, check, detail))
+
+    def worst(self) -> int:
+        return max((_SEVERITY[status] for status, _, _ in self.rows), default=0)
+
+    def render(self) -> str:
+        width = max((len(check) for _, check, _ in self.rows), default=0)
+        lines = [f"{status:<4}  {check:<{width}}  {detail}" for status, check, detail in self.rows]
+        return "\n".join(lines)
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    """Parse a stored ISO-8601 timestamp, tolerating a trailing `Z`."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _age_seconds(value: str) -> float | None:
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return None
+    return (datetime.now(UTC) - parsed).total_seconds()
+
+
+def _humanize(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f}s ago"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m ago"
+    return f"{seconds / 3600:.1f}h ago"
+
+
+# ---------------------------------------------------------------------------
+# systemd
+# ---------------------------------------------------------------------------
+
+
+def _systemctl_available() -> bool:
+    return shutil.which("systemctl") is not None
+
+
+def _unit_state(unit: str) -> tuple[str, str]:
+    """Return (active-state, load-state) for a unit, without touching it.
+
+    `show` rather than `status`: it is machine-readable, it does not page, and
+    it exits 0 for a unit that does not exist, which lets a host that has only
+    some of these units installed report SKIP instead of FAIL.
+    """
+    result = subprocess.run(
+        ["systemctl", "show", unit, "--property=ActiveState,LoadState,Result", "--no-pager"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    return fields.get("ActiveState", "unknown"), fields.get("LoadState", "unknown")
+
+
+def check_units(report: Report, units: tuple[str, ...], *, required: bool) -> None:
+    if not _systemctl_available():
+        for unit in units:
+            report.add(SKIP, f"unit {unit}", "systemctl not available on this host")
+        return
+    for unit in units:
+        try:
+            active, load = _unit_state(unit)
+        except (subprocess.SubprocessError, OSError) as error:
+            report.add(WARN, f"unit {unit}", f"could not query systemd: {error}")
+            continue
+        if load == "not-found":
+            report.add(SKIP, f"unit {unit}", "not installed on this host")
+        elif load == "masked":
+            # A mask is a deliberate, root-only, reversible act: the unit is
+            # symlinked to /dev/null, so neither an operator typo nor a
+            # dependency of something else can start it. On a crypto-only host
+            # the equity runtime is masked exactly that way, and reporting the
+            # intended configuration as DEGRADED would teach the reader to
+            # ignore this check on the one host it is describing.
+            report.add(OK, f"unit {unit}", f"masked - cannot be started ({active})")
+        elif active == "active":
+            report.add(OK, f"unit {unit}", "active")
+        elif active == "failed":
+            # Worth spelling out: for a trading unit this is very likely exit
+            # 2 held down by RestartPreventExitStatus, which is the system
+            # working, not the system broken.
+            hint = " (if this is a runtime, check for a TRADING PAUSED exit 2)" if required else ""
+            report.add(FAIL, f"unit {unit}", f"failed{hint}")
+        else:
+            report.add(WARN if required else SKIP, f"unit {unit}", active)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard API
+# ---------------------------------------------------------------------------
+
+
+def check_dashboard_api(report: Report, url: str, timeout: float) -> None:
+    request = urllib.request.Request(url, method="GET")  # noqa: S310 - loopback, fixed scheme
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            body = response.read(65536)
+            status = response.status
+    except urllib.error.HTTPError as error:
+        # Reachable, but the route disagreed. A 4xx still proves the process is
+        # up and listening, which is what this check is for.
+        level = OK if error.code < 500 else FAIL
+        report.add(level, "dashboard api", f"HTTP {error.code} from {url}")
+        return
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        report.add(FAIL, "dashboard api", f"unreachable at {url}: {error}")
+        return
+
+    detail = f"HTTP {status}"
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        environment = payload.get("environment")
+        if environment is not None:
+            detail += f", environment={environment}"
+            if str(environment).upper() != "PAPER":
+                report.add(FAIL, "dashboard api", f"{detail} - NOT PAPER")
+                return
+    report.add(OK, "dashboard api", detail)
+
+
+# ---------------------------------------------------------------------------
+# SQLite
+# ---------------------------------------------------------------------------
+
+
+def _open_read_only(path: Path) -> tuple[sqlite3.Connection, str]:
+    """Open the database without any possibility of writing its content.
+
+    `mode=ro` is tried first and is the strongest guarantee, but it cannot
+    always be used: a reader of a WAL database maps and may have to create the
+    `-shm` index, and on an idle host - every runtime stopped, the WAL cleanly
+    checkpointed away - a read-only open has nothing to attach to and fails.
+    The fallback opens read-write and immediately sets `query_only`, which
+    SQLite enforces for the life of the connection. Either way nothing here can
+    change a row; the second mode is reported so the operator knows which one
+    answered.
+    """
+    uri = f"file:{path}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=10.0)
+        connection.execute("SELECT 1").fetchone()
+        return connection, "read-only"
+    except sqlite3.Error:
+        connection = sqlite3.connect(path, timeout=10.0)
+        connection.execute("PRAGMA query_only = ON")
+        return connection, "query_only"
+
+
+def _tables(connection: sqlite3.Connection) -> set[str]:
+    rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    return {row[0] for row in rows}
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def check_database(
+    report: Report,
+    path: Path,
+    *,
+    max_heartbeat_age: int,
+    crypto_state: str,
+) -> None:
+    if not path.is_file():
+        report.add(FAIL, "database file", f"missing: {path}")
+        return
+
+    try:
+        connection, mode = _open_read_only(path)
+    except sqlite3.Error as error:
+        report.add(FAIL, "database open", f"{path}: {error}")
+        return
+
+    try:
+        report.add(OK, "database open", f"{path} ({mode})")
+
+        journal = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        report.add(
+            OK if str(journal).lower() == "wal" else WARN,
+            "journal mode",
+            str(journal),
+        )
+
+        # `quick_check` rather than `integrity_check`: it catches the damage
+        # that matters and does not walk every index on a database a live
+        # runtime is holding.
+        integrity = connection.execute("PRAGMA quick_check(1)").fetchone()[0]
+        report.add(OK if integrity == "ok" else FAIL, "integrity", str(integrity))
+
+        tables = _tables(connection)
+
+        if "schema_metadata" in tables:
+            row = connection.execute(
+                "SELECT schema_version FROM schema_metadata WHERE id = 1"
+            ).fetchone()
+            report.add(OK, "schema version", str(row[0]) if row else "no row")
+        else:
+            report.add(SKIP, "schema version", "schema_metadata not present")
+
+        _check_reconciliation(report, connection, tables)
+        _check_heartbeat(report, connection, tables, max_heartbeat_age, crypto_state)
+        _check_unknown_intents(report, connection, tables)
+        _check_account_safety(report, connection, tables)
+    finally:
+        connection.close()
+
+
+def _check_reconciliation(report: Report, connection: sqlite3.Connection, tables: set[str]) -> None:
+    if "reconciliation_runs" not in tables:
+        report.add(SKIP, "reconciliation", "reconciliation_runs not present")
+        return
+    columns = _columns(connection, "reconciliation_runs")
+    if not {"status", "completed_at"} <= columns:
+        report.add(SKIP, "reconciliation", "reconciliation_runs has an unfamiliar shape")
+        return
+    safe_column = "safe_to_trade" if "safe_to_trade" in columns else None
+    selected = "status, completed_at" + (f", {safe_column}" if safe_column else "")
+    row = connection.execute(
+        f"SELECT {selected} FROM reconciliation_runs ORDER BY id DESC LIMIT 1"  # noqa: S608
+    ).fetchone()
+    if row is None:
+        report.add(WARN, "reconciliation", "no run recorded yet")
+        return
+    status, completed_at = row[0], row[1]
+    age = _age_seconds(completed_at)
+    detail = f"{status}, {_humanize(age) if age is not None else completed_at}"
+    if safe_column:
+        detail += f", safe_to_trade={bool(row[2])}"
+    level = OK if status in {"CLEAN", "REPAIRED"} else FAIL
+    report.add(level, "reconciliation", detail)
+
+
+def _check_heartbeat(
+    report: Report,
+    connection: sqlite3.Connection,
+    tables: set[str],
+    max_heartbeat_age: int,
+    crypto_state: str,
+) -> None:
+    if "runtime_checkpoints" not in tables:
+        report.add(SKIP, "runtime heartbeat", "runtime_checkpoints not present")
+        return
+    rows = connection.execute(
+        "SELECT symbol, updated_at FROM runtime_checkpoints ORDER BY symbol"
+    ).fetchall()
+    if not rows:
+        report.add(WARN, "runtime heartbeat", "no checkpoint recorded yet")
+        return
+    for symbol, updated_at in rows:
+        age = _age_seconds(updated_at)
+        if age is None:
+            report.add(WARN, f"heartbeat {symbol}", f"unparseable timestamp {updated_at!r}")
+            continue
+        # Only the 24/7 crypto symbols are expected to tick continuously. An
+        # equity checkpoint is stale all weekend by design, and this script
+        # deliberately does not reimplement the market calendar to decide
+        # whether that is fine - the runtime owns session logic, and a second
+        # opinion here would be a worse one.
+        continuous = symbol.replace("-", "/").upper() in {"BTC/USD", "ETH/USD"}
+        if not continuous:
+            report.add(OK, f"heartbeat {symbol}", f"{_humanize(age)} (session-gated)")
+        elif crypto_state == "inactive":
+            # Positively known to be stopped, so a stale checkpoint is the
+            # expected consequence of a deliberate act, not a fault.
+            report.add(OK, f"heartbeat {symbol}", f"{_humanize(age)} (runtime stopped)")
+        elif age > max_heartbeat_age:
+            report.add(WARN, f"heartbeat {symbol}", f"stale: {_humanize(age)}")
+        else:
+            report.add(OK, f"heartbeat {symbol}", _humanize(age))
+
+
+def _check_unknown_intents(
+    report: Report, connection: sqlite3.Connection, tables: set[str]
+) -> None:
+    if "order_intents" not in tables:
+        report.add(SKIP, "unknown intents", "order_intents not present")
+        return
+    if "status" not in _columns(connection, "order_intents"):
+        report.add(SKIP, "unknown intents", "order_intents has an unfamiliar shape")
+        return
+    count = connection.execute(
+        "SELECT count(*) FROM order_intents WHERE status = 'UNKNOWN'"
+    ).fetchone()[0]
+    if count:
+        report.add(
+            FAIL,
+            "unknown intents",
+            f"{count} order intent(s) UNKNOWN - an order may exist at the broker; "
+            "run `autotrader reconcile`",
+        )
+    else:
+        report.add(OK, "unknown intents", "none")
+
+
+def _check_account_safety(report: Report, connection: sqlite3.Connection, tables: set[str]) -> None:
+    """Report the shared account-safety record.
+
+    `account_safety_state` is the single-row table schema v6 uses to coordinate
+    the two runtimes over one brokerage account. `state` is `SAFE`,
+    `UNSAFE_UNKNOWN` or `UNSAFE_RECONCILIATION`, and anything but `SAFE` is an
+    account-wide halt: a submission the crypto runtime could not resolve stops
+    the equity runtime too, across processes and across restarts.
+
+    A halt found here is reported, never cleared. Only a full-universe
+    reconciliation may clear one, that is a deliberate act with an operator
+    behind it, and a health check that did it on a timer would be exactly the
+    unattended safety decision the halt exists to prevent.
+
+    The table is still probed rather than assumed, and its absence is SKIP
+    rather than a crash: a host carrying a pre-v6 database that no current
+    runtime has opened yet should still get the rest of this report.
+    """
+    if "account_safety_state" not in tables:
+        report.add(SKIP, "account safety", "no shared safety table on this schema yet")
+        return
+    columns = _columns(connection, "account_safety_state")
+    if not {"state", "reason", "source", "updated_at"} <= columns:
+        report.add(SKIP, "account safety", "account_safety_state has an unfamiliar shape")
+        return
+    row = connection.execute(
+        "SELECT state, reason, source, updated_at FROM account_safety_state WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        # An empty table is not a halt. The row is written the first time
+        # something establishes the account's safety - a reconciliation, a
+        # runtime start - so before that there is genuinely nothing to report.
+        report.add(WARN, "account safety", "account_safety_state present but empty")
+        return
+    state, reason, source, updated_at = row
+    detail = f"{state} ({source}: {reason})"
+    age = _age_seconds(updated_at)
+    if age is not None:
+        detail += f", {_humanize(age)}"
+    report.add(OK if state == "SAFE" else FAIL, "account safety", detail)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="autotrader-healthcheck",
+        description="Read-only health check for a deployed AutoTrader host. Changes nothing.",
+    )
+    parser.add_argument("--db", default="/var/lib/autotrader/autotrader.db")
+    parser.add_argument("--api-url", default="http://127.0.0.1:8000/api/dashboard/overview")
+    parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--max-heartbeat-age",
+        type=int,
+        default=DEFAULT_MAX_HEARTBEAT_AGE_SECONDS,
+        help="Seconds before a 24/7 checkpoint counts as stale (default 2700).",
+    )
+    parser.add_argument("--skip-units", action="store_true", help="Do not query systemd.")
+    parser.add_argument("--skip-api", action="store_true", help="Do not poll the dashboard API.")
+    arguments = parser.parse_args(argv)
+
+    report = Report()
+
+    # "unknown" is not "inactive". Skipping the systemd probe must not quietly
+    # switch off staleness detection: an operator who asked for a data-only
+    # check still wants to be told the 24/7 checkpoint stopped moving.
+    crypto_state = "unknown"
+    if arguments.skip_units:
+        report.add(SKIP, "units", "--skip-units")
+    else:
+        check_units(report, TRADING_UNITS, required=True)
+        check_units(report, DASHBOARD_UNITS, required=False)
+        if _systemctl_available():
+            try:
+                active, load = _unit_state("autotrader-crypto.service")
+                if load != "not-found":
+                    crypto_state = "active" if active == "active" else "inactive"
+            except (subprocess.SubprocessError, OSError):
+                crypto_state = "unknown"
+
+    if arguments.skip_api:
+        report.add(SKIP, "dashboard api", "--skip-api")
+    else:
+        check_dashboard_api(report, arguments.api_url, arguments.timeout)
+
+    check_database(
+        report,
+        Path(arguments.db),
+        max_heartbeat_age=arguments.max_heartbeat_age,
+        crypto_state=crypto_state,
+    )
+
+    print(report.render())
+    worst = report.worst()
+    print()
+    print({0: "HEALTHY", 1: "DEGRADED", 2: "UNHEALTHY"}[worst])
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main())

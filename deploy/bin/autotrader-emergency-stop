@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# Stop all new autonomous trading activity on this host, now.
+#
+#   autotrader-emergency-stop [--disable-boot] [--dry-run]
+#
+# **It stops processes. It does not trade.** Nothing here sells a position,
+# cancels a resting order, or flattens the account, and that is a deliberate
+# refusal rather than a missing feature: an automated unwind is itself
+# automated trading, fired at the exact moment an operator has decided the
+# automation cannot be trusted. If a position needs closing, a human closes it
+# knowing what it is.
+#
+# What it does:
+#   * SIGTERM to the crypto and equity runtimes, which finish the cycle they
+#     are in and exit cleanly, then stop
+#   * optionally disable them, so a reboot does not quietly resume trading
+#
+# What it deliberately leaves alone:
+#   * the dashboard - you want to see the account while deciding what to do
+#   * the database - it is the audit trail of what just happened
+#   * the broker - every position and every accepted order stays exactly as it
+#     is, and the paper account keeps whatever exposure it had
+#
+# Safe to run twice. Safe to run when nothing is running.
+
+set -euo pipefail
+
+TRADING_UNITS=(autotrader-crypto.service autotrader-equity.service)
+
+DISABLE_BOOT=0
+DRY_RUN=0
+
+note() { printf '\n== %s\n' "$*"; }
+run() {
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    printf '  [dry-run] %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: autotrader-emergency-stop [--disable-boot] [--dry-run]
+
+  --disable-boot   Also `systemctl disable` the runtimes, so they do not come
+                   back on reboot. Re-enable with `systemctl enable`.
+  --dry-run        Print what would happen. Changes nothing.
+
+Places no orders. Closes no positions. Cancels nothing at the broker.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --disable-boot) DISABLE_BOOT=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'emergency-stop: unknown option: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if ! command -v systemctl >/dev/null 2>&1; then
+  printf 'emergency-stop: systemctl not available on this host.\n' >&2
+  exit 1
+fi
+
+note "Stopping trading runtimes"
+for unit in "${TRADING_UNITS[@]}"; do
+  if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+    printf '  stopping %s\n' "${unit}"
+    run systemctl stop "${unit}"
+  else
+    printf '  %s was not running\n' "${unit}"
+  fi
+done
+
+if [ "${DISABLE_BOOT}" -eq 1 ]; then
+  note "Disabling at boot"
+  for unit in "${TRADING_UNITS[@]}"; do
+    printf '  disabling %s\n' "${unit}"
+    run systemctl disable "${unit}" >/dev/null 2>&1 || printf '    (was not enabled)\n'
+  done
+fi
+
+note "State after the stop"
+for unit in "${TRADING_UNITS[@]}"; do
+  state="$(systemctl is-active "${unit}" 2>/dev/null || true)"
+  enabled="$(systemctl is-enabled "${unit}" 2>/dev/null || true)"
+  printf '  %-34s %s (%s at boot)\n' "${unit}" "${state:-unknown}" "${enabled:-unknown}"
+done
+
+cat <<'SUMMARY'
+
+  No new orders will be submitted by this host.
+
+  What is still true:
+    * every position the paper account holds is still open
+    * any order the broker already accepted is still working
+    * the dashboard is still up, and still reading
+
+  Before starting anything again, find out what the account actually holds:
+
+    autotrader reconcile --db /var/lib/autotrader/autotrader.db --dry-run
+
+  That reads the broker and writes nothing. If it reports UNRESOLVED, settle
+  it by hand before a runtime starts: UNRESOLVED means an order may exist that
+  local state cannot account for.
+SUMMARY

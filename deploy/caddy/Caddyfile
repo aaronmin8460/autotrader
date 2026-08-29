@@ -1,0 +1,173 @@
+# AutoTrader dashboard — the public HTTPS entry point.
+#
+# Install to /etc/caddy/Caddyfile. `autotrader-publish-web` does that, along
+# with everything else this file assumes: the Caddy package, the systemd
+# drop-in that feeds it the three variables below, and the firewall rules.
+#
+# This file is installed VERBATIM. There is nothing to hand-edit, and that is
+# deliberate — every host-specific value is a `{$VAR}` read from
+# /etc/autotrader/autotrader.web.env, which is 0640 root:caddy and is not in
+# Git. A template you have to edit before it works is a template somebody
+# eventually edits a secret into.
+#
+#   AUTOTRADER_DASHBOARD_DOMAIN         the public hostname
+#   AUTOTRADER_DASHBOARD_USER           the login name
+#   AUTOTRADER_DASHBOARD_PASSWORD_HASH  a bcrypt hash from `caddy hash-password`
+#
+# If any of the three is unset, Caddy substitutes the empty string. An empty
+# hash matches no password, so the failure mode of a half-configured host is
+# "nobody can log in" rather than "anybody can". That is the correct direction
+# to fail, and it is why there is no default written here.
+#
+# ---------------------------------------------------------------------------
+# THE DASHBOARD HAS NO AUTHENTICATION OF ITS OWN
+# ---------------------------------------------------------------------------
+#
+# Every route is a GET and nothing it exposes can place an order, so the risk
+# is disclosure rather than control — but what it discloses is account value,
+# positions, orders and strategy behaviour, in real time, to anyone who finds
+# the hostname. There is no login page behind this proxy to fall back on. The
+# `basic_auth` block below is the entire authentication boundary, and removing
+# it publishes the account.
+{
+	# The admin API is a control endpoint: it can rewrite this configuration
+	# at runtime. Loopback is already its default; stating it makes that a
+	# reviewed decision rather than an inherited one, so that a future edit
+	# has to say out loud that it is opening a control plane to the network.
+	admin 127.0.0.1:2019
+}
+
+{$AUTOTRADER_DASHBOARD_DOMAIN} {
+	encode gzip
+
+	# ---------------------------------------------------------------------
+	# Authentication — first, and before any handler
+	# ---------------------------------------------------------------------
+	#
+	# Caddy orders `basic_auth` ahead of `handle`, `respond` and
+	# `reverse_proxy` regardless of where they appear in this file, so this
+	# covers every path in the site including the ones added later by
+	# somebody who forgets this paragraph exists.
+	basic_auth {
+		{$AUTOTRADER_DASHBOARD_USER} {$AUTOTRADER_DASHBOARD_PASSWORD_HASH}
+	}
+
+	# ---------------------------------------------------------------------
+	# Read-only, enforced at the edge
+	# ---------------------------------------------------------------------
+	#
+	# The dashboard is already GET-only: the API declares six GET routes and
+	# no others, and the frontend serves pages. This block does not add a
+	# guarantee the application lacks — it makes the guarantee independent of
+	# both upstreams, so that a future route that accidentally accepts a POST
+	# is not reachable from the internet on the day it is written.
+	#
+	# HEAD is GET without a body and is what health checks and browsers send.
+	# OPTIONS is absent because the browser is same-origin here and never
+	# preflights: see next.config.mjs on why there is no CORS policy at all.
+	@write not method GET HEAD
+	handle @write {
+		respond "This dashboard is read-only." 405
+	}
+
+	handle {
+		# One upstream, not two. The Next.js server already rewrites
+		# /api/dashboard/* to the FastAPI process on 127.0.0.1:8000, so
+		# proxying the frontend is enough to make the whole dashboard work.
+		#
+		# Do NOT add a second route straight to the API. It would be a path
+		# that reaches the unauthenticated backend, and the moment its
+		# matcher and the `basic_auth` matcher disagree — which is a
+		# one-character mistake — the account data is public.
+		reverse_proxy 127.0.0.1:3000
+	}
+
+	# ---------------------------------------------------------------------
+	# Response headers
+	# ---------------------------------------------------------------------
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+
+		# The dashboard is first-party and self-contained: it loads no script,
+		# style, font or image from anywhere but this origin, and it opens no
+		# socket to anywhere else. Every directive below is therefore 'self'
+		# or 'none' - except one.
+		#
+		# `script-src 'unsafe-inline'` is required, and it was measured rather
+		# than assumed. Next.js App Router bootstraps by emitting the React
+		# Server Component payload as a series of inline `<script>` blocks
+		# (`self.__next_f.push(...)`) with no nonce attribute. Under a policy
+		# without it, Chromium blocks all seven, hydration never starts, and
+		# the page is blank - while curl still reports HTTP 200, which is how
+		# this shipped.
+		#
+		# The two ways to keep inline scripts out of the policy do not apply:
+		#
+		#   * Hashes would have to be regenerated on every frontend build, and
+		#     the payload embeds the build ID, so a stale Caddyfile would blank
+		#     the page again at the next deploy - the same failure, on a delay.
+		#   * A nonce means `middleware.ts` in the frontend, which moves this
+		#     header out of the proxy and into the process that deliberately
+		#     holds no credentials, makes every route dynamic, and requires
+		#     rebuilding the frontend on a host where the npm build is already
+		#     known to be fragile. Trading the dashboard's availability for a
+		#     directive is the wrong trade.
+		#
+		# What the allowance actually costs here is small and worth stating:
+		# the page renders no user-supplied content - every value on it comes
+		# from this operator's own database and broker - it is behind
+		# basic_auth, and it is GET-only at the edge. `unsafe-inline` widens
+		# script injection, and there is no injection vector on this page to
+		# widen. If one is ever added, that is the moment for the nonce.
+		#
+		# Measured, not copied. `'unsafe-eval'` and `style-src 'unsafe-inline'`
+		# were both tested against the real build in Chromium and neither is
+		# needed, so neither is here; `img-src` is 'self' with no `data:`
+		# because the dashboard serves no image at all.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+		-Server
+	}
+
+	# Account state must not be written to the viewing device's disk cache.
+	# Scoped to the API rather than applied site-wide, because the same rule
+	# over /_next/static would re-download an immutable bundle on every page
+	# load to protect content that is a JavaScript file.
+	@account path /api/dashboard/*
+	header @account Cache-Control "no-store"
+
+	log {
+		output file /var/log/caddy/autotrader-dashboard.log
+		format json
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Firewall, when this file is in use
+# ---------------------------------------------------------------------------
+#
+#   ufw default deny incoming
+#   ufw allow OpenSSH
+#   ufw allow 80/tcp       # ACME HTTP-01 and the redirect to HTTPS
+#   ufw allow 443/tcp
+#   ufw enable
+#
+# Nothing else is opened. Specifically:
+#
+#   * 8000 (dashboard API) and 3000 (frontend) stay on loopback. If either is
+#     reachable from outside, the proxy has been bypassed and so has the only
+#     authentication in the system.
+#   * 2019 (the Caddy admin API) stays on loopback, per the global block above.
+#   * the trading runtimes listen on nothing at all. They make outbound HTTPS
+#     calls to the broker and accept no connections; there is no port to
+#     expose and no debug endpoint to forget about.
+#   * SQLite is a file, not a service. It has no port, and it must not be
+#     reached across a network — see docs/DEPLOYMENT.md on why the database
+#     directory must be local disk.
+#
+# If the dashboard is NOT being published, leave 80 and 443 closed. The SSH
+# tunnel in docs/DEPLOYMENT.md needs neither:
+#
+#   ssh -N -L 3000:127.0.0.1:3000 you@your-vps
