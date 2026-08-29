@@ -88,6 +88,7 @@ from autotrader.execution.paper import (
     ExecutionOutcome,
     PaperExecutionResult,
 )
+from autotrader.ml.cli import app as ml_app
 from autotrader.reconciliation import (
     ItemOutcome,
     ReconciliationError,
@@ -200,6 +201,12 @@ def cli() -> None:
     `crypto-run` runs that same pass itself at startup, refusing to submit
     anything unless it comes back safe.
     """
+
+
+# The offline ML data foundation (M1). Attached as a sub-application rather than
+# as loose commands: it owns its own surface, reaches no broker, and activates
+# nothing, so nothing about the trading commands changes when it does.
+app.add_typer(ml_app, name="ml")
 
 
 @app.command()

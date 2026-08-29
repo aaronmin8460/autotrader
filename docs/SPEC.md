@@ -235,6 +235,7 @@ CI1      Combined integration              <- done, schema v6 (CI1)
 D1       Decision Engine V2 + V3           <- component-complete, unwired (D1)
 QR1      Quant research infrastructure     <- done, research only (QR1)
 Phase 10 Deployment                        <- after the combined paper smoke
+M1       ML/data foundation (offline)      <- done (M1, docs/ML_FOUNDATION.md)
 ```
 
 Equity V0.2 is a parallel product rather than a later phase of the crypto one.
@@ -400,6 +401,18 @@ operational database. Adopting a parameter set that a study selected would be a
 further, separate scope change requiring an edit to this document - the sweep
 producing a winner is not that decision, and the winner is not a
 recommendation.
+
+> **Documented scope change (M1, the ML foundation).** The *offline*
+> machine-learning **data** foundation is now in scope: a versioned feature
+> dataset schema, a dataset builder over already-stored bars, a label
+> framework, a temporal split, a probability-prediction contract, calibration
+> interfaces, and a model registry (`autotrader.ml`, docs/ML_FOUNDATION.md).
+> The exclusion above is otherwise unchanged and still binding: no ML-generated
+> signal reaches the strategy layer, the risk engine or the execution boundary,
+> no ML strategy is activated, and the registry has deliberately no
+> `PRODUCTION` stage. `autotrader.ml` is imported by nothing but the CLI, and a
+> test pins that in both directions. Turning a prediction into an order is a
+> separate, deliberate change that has not been made.
 
 **Application surface:** web frontend, Next.js, FastAPI, mobile application,
 TradingView integration, strategy marketplace.

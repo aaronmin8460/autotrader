@@ -1859,7 +1859,13 @@ tests/                      offline tests; no test contacts the network
 data/raw/                   downloaded market data (git-ignored)
 data/processed/             validated market data (git-ignored)
 data/autotrader.db          local operational state (git-ignored)
+src/autotrader/ml/          the offline ML data foundation (M1): the versioned
+                            feature-dataset schema, the dataset builder, the
+                            label framework, the temporal split, the
+                            prediction contract, and the model registry - no
+                            model, no signal, no runtime
 docs/SPEC.md                authoritative scope specification
+docs/ML_FOUNDATION.md       the ML foundation's contracts (M1)
 ```
 
 ## What comes next
@@ -1899,6 +1905,24 @@ would be a separate, documented scope change.
 **Per-book allocation limits** are *not* approved and *not* implemented. If a
 crypto/equity split is ever wanted it is a policy decision, and it belongs in
 `docs/SPEC.md` before it belongs in code.
+
+**The ML/data foundation (M1)** is done, and is data only. `autotrader.ml`
+builds versioned feature datasets from bar files that already exist on disk,
+labels them against an explicit forward interval, and cuts them into temporal
+splits that purge any training row whose outcome was decided inside a later
+window. It also defines the probability-prediction contract a future Decision
+V4 would expose, the calibration interfaces behind it, and an immutable model
+registry.
+
+It does not train a trading model, does not emit a signal, and is not wired
+into either runtime. Nothing outside the CLI imports it, the registry has
+deliberately no `PRODUCTION` stage and no `activate()`, and a test pins both.
+The one rule its label framework will not let you configure away is that a
+decision taken from bar *t* is entered no earlier than bar *t+1* - the same
+no-look-ahead rule the backtester enforces. See
+[docs/ML_FOUNDATION.md](docs/ML_FOUNDATION.md). Choosing V4's actual model is
+an evidence-driven decision that walk-forward results have not been produced
+for yet; the point of this milestone is that they now can be, reproducibly.
 
 **Phase 10 - Deployment** comes after the combined paper smoke: systemd units,
 container images, supervision, and an authentication layer in front of the
