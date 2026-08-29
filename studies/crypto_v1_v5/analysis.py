@@ -31,15 +31,25 @@ from decimal import Decimal
 
 import pandas as pd
 
-from autotrader.research.costs import CRYPTO_COST, ZERO_COST, CostModel
+from autotrader.research.costs import CRYPTO_COST, STRESS_COST, ZERO_COST, CostModel
 from autotrader.research.metrics import CRYPTO_15M, PerformanceMetrics, metrics_for_replay
 from autotrader.research.replay import ReplayConfig, ReplayResult, replay
 from autotrader.research.splits import TimeSplit
 from studies.crypto_v1_v5.adapters import DecisionSeriesEngine
 from studies.crypto_v1_v5.scoring import STUDY_VERSIONS, records_from_frame
 
-#: The two cost assumptions every engine is measured under.
-COST_MODELS: Mapping[str, CostModel] = {"gross": ZERO_COST, "net": CRYPTO_COST}
+#: The cost assumptions every engine is measured under.
+#:
+#: `gross` isolates how much of a result is the strategy and how much is the
+#: fee schedule. `net` is the shipped crypto assumption and is the headline.
+#: `stress` is the shipped punitive model, and it is here because a conclusion
+#: that reverses between `net` and `stress` is a conclusion about a fee
+#: schedule rather than about an engine.
+COST_MODELS: Mapping[str, CostModel] = {
+    "gross": ZERO_COST,
+    "net": CRYPTO_COST,
+    "stress": STRESS_COST,
+}
 
 
 class AnalysisError(Exception):
