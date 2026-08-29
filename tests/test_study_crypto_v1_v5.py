@@ -372,3 +372,40 @@ def test_series_adapter_refuses_a_frame_holding_two_symbols() -> None:
 
     with pytest.raises(Exception, match="2 symbols"):
         series.generate(mixed)
+
+
+def test_audit_splits_declare_the_embargo_the_study_actually_arranged() -> None:
+    """The structural audit must check the real design, not a re-derivation of it.
+
+    `audit_splits` refuses a split set that declares no embargo, because adjacent
+    train and test bars share indicator lookback and label horizon. The study
+    does leave a gap - the label horizon plus a day - so the splits it hands the
+    auditor have to say so, or the audit passes on a structure nobody built.
+    """
+    from studies.crypto_v1_v5.analysis import splits_for_folds
+
+    from autotrader.research.leakage import audit_splits
+
+    bars = wave(2000)
+    folds = [
+        {
+            "fold_id": "W01",
+            "test_start": bars["timestamp"].iloc[800].isoformat(),
+            "test_end": bars["timestamp"].iloc[1200].isoformat(),
+            "is_holdout": False,
+        },
+        {
+            "fold_id": "W02",
+            "test_start": bars["timestamp"].iloc[1201].isoformat(),
+            "test_end": bars["timestamp"].iloc[1900].isoformat(),
+            "is_holdout": True,
+        },
+    ]
+
+    splits = splits_for_folds(bars, folds)
+
+    assert splits
+    for split in splits:
+        assert split.embargo_bars == TRAIN_TEST_GAP_BARS
+        assert split.test_start - split.train_end == TRAIN_TEST_GAP_BARS
+    assert audit_splits(splits, require_disjoint_tests=True).clean

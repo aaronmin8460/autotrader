@@ -37,6 +37,7 @@ from autotrader.research.replay import ReplayConfig, ReplayResult, replay
 from autotrader.research.splits import TimeSplit
 from studies.crypto_v1_v5.adapters import DecisionSeriesEngine
 from studies.crypto_v1_v5.scoring import STUDY_VERSIONS, records_from_frame
+from studies.crypto_v1_v5.walkforward import TRAIN_TEST_GAP_BARS
 
 #: The cost assumptions every engine is measured under.
 #:
@@ -96,13 +97,23 @@ def metrics_of(result: ReplayResult) -> PerformanceMetrics:
 
 
 def splits_for_folds(
-    bars: pd.DataFrame, folds: Sequence[Mapping[str, object]], *, embargo_bars: int = 0
+    bars: pd.DataFrame,
+    folds: Sequence[Mapping[str, object]],
+    *,
+    embargo_bars: int = TRAIN_TEST_GAP_BARS,
 ) -> tuple[TimeSplit, ...]:
     """One `TimeSplit` per out-of-sample window, positioned into `bars`.
 
-    The train range is carried for the record only. Nothing in this study fits
-    anything during replay: V4's models were fitted before scoring began, and
-    V1, V2 and V3 have no fitted parameters at all.
+    The train range and the embargo describe the structure V4 was actually
+    fitted under, so `audit_splits` checks the real design rather than a
+    re-derivation of it. Each window's training data ends `embargo_bars` before
+    the window opens: the label horizon, so no training outcome resolves inside
+    the window being scored, plus a one-day embargo on top of it.
+
+    Declaring the gap is not a formality. The auditor refuses a split set that
+    leaves no embargo precisely because adjacent train and test bars share
+    indicator lookback and label horizon, and a study that quietly passed zero
+    here would be asserting a property it had not arranged.
     """
     timestamps = bars["timestamp"].reset_index(drop=True)
     splits: list[TimeSplit] = []
@@ -114,18 +125,19 @@ def splits_for_folds(
             continue
         start = int(inside.index[0])
         stop = int(inside.index[-1]) + 1
-        if start == 0:
+        train_end = start - embargo_bars
+        if train_end <= 0:
             continue
         splits.append(
             TimeSplit(
                 index=index,
                 train_start=0,
-                train_end=start,
+                train_end=train_end,
                 test_start=start,
                 test_end=stop,
                 embargo_bars=embargo_bars,
                 train_start_timestamp=timestamps.iloc[0],
-                train_end_timestamp=timestamps.iloc[start - 1],
+                train_end_timestamp=timestamps.iloc[train_end - 1],
                 test_start_timestamp=timestamps.iloc[start],
                 test_end_timestamp=timestamps.iloc[stop - 1],
             )
