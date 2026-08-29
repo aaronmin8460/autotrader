@@ -23,12 +23,15 @@ from studies.crypto_v1_v5.analysis import (
     buy_and_hold_return,
     disagreement_summary,
     headline_metrics,
+    open_position_record,
     per_window_metrics,
     portfolio_metrics,
     regime_breakdown,
+    replay_engine,
     representative_disagreements,
     signal_distribution,
     stability,
+    trades_frame,
 )
 from studies.crypto_v1_v5.dataset import load_evaluation_frame
 from studies.crypto_v1_v5.run_scoring import dataset_paths
@@ -75,6 +78,8 @@ def main() -> None:
     benchmark: dict[str, object] = {}
     example_frames: list[pd.DataFrame] = []
     all_frames: dict[str, pd.DataFrame] = {}
+    trade_frames: list[pd.DataFrame] = []
+    open_positions: list[dict] = []
 
     for symbol, path in dataset_paths(Path(args.datasets)).items():
         bars, _ = load_evaluation_frame(Path(path))
@@ -84,6 +89,17 @@ def main() -> None:
 
         all_frames[symbol] = bars
         headline_rows.extend(engine_rows(headline_metrics(bars, decisions), symbol))
+
+        for cost_label, model in COST_MODELS.items():
+            for engine in sorted(decisions["engine"].unique()):
+                result = replay_engine(bars, decisions, engine, cost_model=model)
+                frame = trades_frame(result, engine=engine, symbol=symbol, cost_model=cost_label)
+                if not frame.empty:
+                    trade_frames.append(frame)
+                if cost_label == "net":
+                    open_positions.append(
+                        open_position_record(result, engine=engine, symbol=symbol)
+                    )
 
         symbol_folds = [f for f in folds if f["symbol"] == symbol and f["variant"] == args.variant]
         seen: set[str] = set()
@@ -152,6 +168,9 @@ def main() -> None:
         pd.concat(example_frames, ignore_index=True).to_csv(
             out / "disagreement_examples.csv", index=False
         )
+    if trade_frames:
+        pd.concat(trade_frames, ignore_index=True).to_csv(out / "trades.csv", index=False)
+    pd.DataFrame(open_positions).to_csv(out / "open_positions.csv", index=False)
     (out / "disagreement.json").write_text(json.dumps(disagreement, indent=2))
     (out / "benchmark.json").write_text(json.dumps(benchmark, indent=2, default=str))
     print(f"wrote analysis for variant={args.variant} to {out}")

@@ -397,6 +397,7 @@ __all__ = [
     "disagreement_summary",
     "headline_metrics",
     "metrics_of",
+    "open_position_record",
     "per_window_metrics",
     "pivot_signals",
     "portfolio_metrics",
@@ -407,6 +408,7 @@ __all__ = [
     "signal_distribution",
     "splits_for_folds",
     "stability",
+    "trades_frame",
 ]
 
 
@@ -525,3 +527,55 @@ def portfolio_metrics(
         )
         out[engine] = metrics_for_replay(result, CRYPTO_15M)
     return out
+
+
+def trades_frame(
+    result: ReplayResult, *, engine: str, symbol: str, cost_model: str
+) -> pd.DataFrame:
+    """Every completed round trip, as rows a reader can audit one by one.
+
+    `signal_timestamp` and the fill timestamp are kept apart in the fills the
+    simulator produced, so no-look-ahead is visible in the exported data rather
+    than only in the code that produced it.
+    """
+    rows = [
+        {
+            "symbol": symbol,
+            "engine": engine,
+            "cost_model": cost_model,
+            "entry_timestamp": trade.entry_timestamp,
+            "exit_timestamp": trade.exit_timestamp,
+            "bars_held": trade.exit_bar_index - trade.entry_bar_index,
+            "quantity": float(trade.quantity),
+            "entry_price": float(trade.entry_price),
+            "exit_price": float(trade.exit_price),
+            "gross_pnl": float(trade.gross_pnl),
+            "fees": float(trade.fees),
+            "slippage_cost": float(trade.slippage_cost),
+            "net_pnl": float(trade.net_pnl),
+            "entry_reason": trade.entry_reason,
+            "exit_reason": trade.exit_reason,
+        }
+        for trade in result.trades
+    ]
+    return pd.DataFrame(rows)
+
+
+def open_position_record(result: ReplayResult, *, engine: str, symbol: str) -> dict[str, object]:
+    """The position still open at the end, which is not a trade and is not folded into one.
+
+    An engine that enters and never exits shows a return with no completed round
+    trips, and reporting that profit without saying it is unrealized would let a
+    held position read as a track record.
+    """
+    position = result.open_position
+    return {
+        "symbol": symbol,
+        "engine": engine,
+        "has_open_position": position is not None,
+        "entry_timestamp": None if position is None else str(position.entry_timestamp),
+        "quantity": None if position is None else float(position.quantity),
+        "unrealized_pnl": 0.0 if position is None else float(position.unrealized_pnl),
+        "realized_pnl": float(result.realized_pnl),
+        "completed_trades": result.trade_count,
+    }
