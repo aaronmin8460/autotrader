@@ -755,6 +755,7 @@ def test_the_git_vocabulary_is_small_and_known() -> None:
         "merge",
         "merge-base",
         "push",
+        "rev-list",
         "rev-parse",
         "worktree",
     }
@@ -1107,3 +1108,386 @@ def test_a_stop_raised_by_the_driver_is_keyed_to_the_pipeline(
     stored = pipeline.load_pipeline(paths)
     assert set(stored["stages"]) == {"pipeline"}
     assert stored["hard_stop"]["stage"] == "pipeline"
+
+
+# --------------------------------------------------------------------------
+# The orchestrator's own upgrade is not a stage agent's trespass
+#
+# A stage can take half an hour. On 2026-08-29 the orchestrator was extended,
+# committed, pushed and reinstalled while the V4 agent was building - and the
+# containment guard, whose baseline predated that upgrade, attributed the
+# orchestrator's own branch moving to the V4 agent and hard-stopped a stage
+# that had done nothing wrong.
+#
+# The upgrade is now excused only when it is *proved*: it must land exactly on
+# the revision the running copy was installed from, and be a fast-forward.
+# --------------------------------------------------------------------------
+
+ORCHESTRATOR_BRANCH = "feat/auto-integration-orchestrator"
+ORCHESTRATOR_WORKTREE = "/Volumes/AUTOTRADER_QA/worktrees/auto-integrator"
+OLD_ORCHESTRATOR = "a2170ea9f6faf832be22478c1037a6d1e575b468"
+NEW_ORCHESTRATOR = "c6c6a41ebb8b4a751d7b64bd90f5b51d07ed5642"
+V4_BASE = "3c6f590c084ed8467a3b867edad3524756f2edc6"
+V4_HEAD = "00d318187e7811fc068a63fe894ebed25fc06a4e"
+V4_SCOPE = ("feat/decision-v4", "/Volumes/AUTOTRADER_QA/worktrees/decision-v4")
+
+
+def identity(installed: str | None) -> object:
+    return pipeline.SelfIdentity(
+        branch=ORCHESTRATOR_BRANCH,
+        worktree=ORCHESTRATOR_WORKTREE,
+        installed_commit=installed,
+    )
+
+
+def orchestrator_upgrade_snapshots() -> tuple[dict[str, str], dict[str, str]]:
+    """The exact before/after of the real false positive."""
+    before = {
+        f"refs/heads/{ORCHESTRATOR_BRANCH}": OLD_ORCHESTRATOR,
+        f"refs/remotes/origin/{ORCHESTRATOR_BRANCH}": OLD_ORCHESTRATOR,
+        f"worktree:{ORCHESTRATOR_WORKTREE}": OLD_ORCHESTRATOR,
+        "refs/heads/feat/decision-v4": V4_BASE,
+        "worktree:/Volumes/AUTOTRADER_QA/worktrees/decision-v4": V4_BASE,
+        "refs/heads/main": "2d74fce20f20443210ac832e1bfecfc994545edb",
+    }
+    after = dict(before)
+    after[f"refs/heads/{ORCHESTRATOR_BRANCH}"] = NEW_ORCHESTRATOR
+    after[f"refs/remotes/origin/{ORCHESTRATOR_BRANCH}"] = NEW_ORCHESTRATOR
+    after[f"worktree:{ORCHESTRATOR_WORKTREE}"] = NEW_ORCHESTRATOR
+    after["refs/heads/feat/decision-v4"] = V4_HEAD
+    after["worktree:/Volumes/AUTOTRADER_QA/worktrees/decision-v4"] = V4_HEAD
+    return before, after
+
+
+def test_a_proven_orchestrator_self_upgrade_does_not_hard_stop_a_stage() -> None:
+    """The reproduction: old SHA -> legitimate extension + install -> V4 build."""
+    before, after = orchestrator_upgrade_snapshots()
+
+    breach = pipeline.containment_breach(
+        before,
+        after,
+        allowed=V4_SCOPE,
+        identity=identity(NEW_ORCHESTRATOR),
+        fast_forward=lambda old, new: (old, new) == (OLD_ORCHESTRATOR, NEW_ORCHESTRATOR),
+    )
+
+    assert breach == []
+
+
+def test_without_the_identity_the_same_snapshots_still_read_as_a_breach() -> None:
+    """The old behaviour, kept explicit so the fix is visibly the discriminator."""
+    before, after = orchestrator_upgrade_snapshots()
+
+    breach = pipeline.containment_breach(before, after, allowed=V4_SCOPE)
+
+    assert len(breach) == 3
+    assert all(ORCHESTRATOR_BRANCH in line or "auto-integrator" in line for line in breach)
+
+
+def test_an_orchestrator_move_to_an_uninstalled_revision_is_a_breach() -> None:
+    """A branch that moved with no install behind it is not a self-upgrade."""
+    before, after = orchestrator_upgrade_snapshots()
+
+    breach = pipeline.containment_breach(
+        before,
+        after,
+        allowed=V4_SCOPE,
+        identity=identity("deadbeef" * 5),
+        fast_forward=lambda _old, _new: True,
+    )
+
+    assert len(breach) == 3
+
+
+def test_an_orchestrator_move_that_is_not_a_fast_forward_is_a_breach() -> None:
+    """A rewind or a rewrite is never excused, whatever is installed."""
+    before, after = orchestrator_upgrade_snapshots()
+
+    breach = pipeline.containment_breach(
+        before,
+        after,
+        allowed=V4_SCOPE,
+        identity=identity(NEW_ORCHESTRATOR),
+        fast_forward=lambda _old, _new: False,
+    )
+
+    assert len(breach) == 3
+
+
+def test_an_orchestrator_with_no_recorded_install_excuses_nothing() -> None:
+    before, after = orchestrator_upgrade_snapshots()
+
+    breach = pipeline.containment_breach(
+        before,
+        after,
+        allowed=V4_SCOPE,
+        identity=identity(None),
+        fast_forward=lambda _old, _new: True,
+    )
+
+    assert len(breach) == 3
+
+
+@pytest.mark.parametrize(
+    ("ref", "name"),
+    [
+        ("refs/heads/main", "main"),
+        ("refs/heads/feat/quant-research", "another feature branch"),
+        ("refs/heads/feat/decision-v5", "a later stage's branch"),
+        ("worktree:/Volumes/AUTOTRADER_QA/worktrees/ml-foundation", "another worktree"),
+    ],
+)
+def test_a_stage_agent_touching_anything_else_still_hard_stops(ref: str, name: str) -> None:
+    """The protection is not weakened: only the orchestrator's own is excused."""
+    before, after = orchestrator_upgrade_snapshots()
+    before[ref] = "1" * 40
+    after[ref] = "2" * 40
+
+    breach = pipeline.containment_breach(
+        before,
+        after,
+        allowed=V4_SCOPE,
+        identity=identity(NEW_ORCHESTRATOR),
+        fast_forward=lambda old, new: (old, new) == (OLD_ORCHESTRATOR, NEW_ORCHESTRATOR),
+    )
+
+    assert breach == [f"{ref}: {'1' * 40} -> {'2' * 40}"], name
+
+
+def test_a_stage_agent_committing_on_the_orchestrator_branch_still_hard_stops() -> None:
+    """The agent moving it somewhere other than the installed revision is caught."""
+    before, after = orchestrator_upgrade_snapshots()
+    forged = "f" * 40
+    after[f"refs/heads/{ORCHESTRATOR_BRANCH}"] = forged
+
+    breach = pipeline.containment_breach(
+        before,
+        after,
+        allowed=V4_SCOPE,
+        identity=identity(NEW_ORCHESTRATOR),
+        fast_forward=lambda old, new: (old, new) == (OLD_ORCHESTRATOR, NEW_ORCHESTRATOR),
+    )
+
+    assert breach == [f"refs/heads/{ORCHESTRATOR_BRANCH}: {OLD_ORCHESTRATOR} -> {forged}"]
+
+
+def test_the_identity_only_owns_its_own_refs() -> None:
+    who = identity(NEW_ORCHESTRATOR)
+
+    assert who.owns(f"refs/heads/{ORCHESTRATOR_BRANCH}")
+    assert who.owns(f"refs/remotes/origin/{ORCHESTRATOR_BRANCH}")
+    assert who.owns(f"worktree:{ORCHESTRATOR_WORKTREE}")
+    assert not who.owns("refs/heads/main")
+    assert not who.owns("refs/heads/feat/decision-v4")
+    assert not who.owns("worktree:/Volumes/AUTOTRADER_QA/worktrees/decision-v4")
+
+
+def test_the_identity_is_read_from_the_installed_provenance(
+    workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    install = tmp_path / "install"
+    install.mkdir()
+    (install / "INSTALLED_FROM.json").write_text(
+        json.dumps({"source_branch": ORCHESTRATOR_BRANCH, "source_commit": NEW_ORCHESTRATOR}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline, "INSTALL_DIR", install)
+
+    who = pipeline.orchestrator_identity(paths_for(workspace))
+
+    assert who.branch == ORCHESTRATOR_BRANCH
+    assert who.installed_commit == NEW_ORCHESTRATOR
+    assert who.worktree == str(workspace["host"])
+
+
+def test_a_missing_install_record_yields_an_identity_that_excuses_nothing(
+    workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(pipeline, "INSTALL_DIR", tmp_path / "nowhere")
+
+    who = pipeline.orchestrator_identity(paths_for(workspace))
+
+    assert who.installed_commit is None
+    assert who.branch is None
+
+
+# --------------------------------------------------------------------------
+# Lifting a hard stop without throwing away finished work
+# --------------------------------------------------------------------------
+
+
+def built_stage_worktree(workspace: dict[str, Path], stage) -> tuple[Path, str]:
+    """A stage worktree whose branch already carries a build commit."""
+    where = workspace["qa_root"] / "worktrees" / stage.worktree
+    subprocess.run(["git", "init", "-q", "-b", stage.branch, str(where)], check=True)
+    run_git(where, "config", "user.email", "t@example.invalid")
+    run_git(where, "config", "user.name", "T")
+    (where / "base.txt").write_text("base\n", encoding="utf-8")
+    run_git(where, "add", "base.txt")
+    run_git(where, "commit", "-q", "-m", "base")
+    base = run_git(where, "rev-parse", "HEAD")
+    (where / "built.py").write_text("# the stage's work\n", encoding="utf-8")
+    run_git(where, "add", "built.py")
+    run_git(where, "commit", "-q", "-m", "the build")
+    return where, base
+
+
+def test_clearing_a_stop_resumes_a_built_stage_at_validation(
+    workspace: dict[str, Path],
+) -> None:
+    """The V4 recovery: 32 minutes of committed work is not rebuilt."""
+    paths = paths_for(workspace)
+    stage = pipeline.STAGE_BY_KEY["v4"]
+    _where, base = built_stage_worktree(workspace, stage)
+    pipeline.save_pipeline(
+        paths,
+        {
+            "state": pipeline.HARD_STOP,
+            "hard_stop": {"stage": "v4", "reason": "the agent changed git state"},
+            "stages": {
+                "v4-prep": {"state": "V4_PREP_GREEN", "head_sha": "a" * 40},
+                "v4": {
+                    "state": pipeline.HARD_STOP,
+                    "hard_stop_reason": "the agent changed git state",
+                    "hard_stop_evidence": ["something"],
+                    "base_sha": base,
+                    "repair_attempts": 0,
+                },
+            },
+        },
+    )
+
+    said = pipeline.clear_hard_stop(paths)
+
+    state = pipeline.load_pipeline(paths)
+    assert state["stages"]["v4"]["state"] == "V4_VALIDATING"
+    assert state["stages"]["v4"]["repair_attempts"] == 0
+    assert "hard_stop_reason" not in state["stages"]["v4"]
+    assert "hard_stop" not in state
+    assert state["stages"]["v4-prep"]["state"] == "V4_PREP_GREEN"
+    assert any("resuming at validation" in line for line in said)
+
+
+def test_clearing_a_stop_forgets_a_stage_that_never_built(
+    workspace: dict[str, Path],
+) -> None:
+    paths = paths_for(workspace)
+    pipeline.save_pipeline(
+        paths,
+        {
+            "state": pipeline.HARD_STOP,
+            "hard_stop": {"stage": "v4", "reason": "no worktree"},
+            "stages": {"v4": {"state": pipeline.HARD_STOP, "base_sha": "b" * 40}},
+        },
+    )
+
+    pipeline.clear_hard_stop(paths)
+
+    assert "v4" not in pipeline.load_pipeline(paths)["stages"]
+
+
+def test_clearing_a_stop_prunes_a_record_that_names_no_stage(
+    workspace: dict[str, Path],
+) -> None:
+    """The stray REPAIRING record the earlier driver bug left behind."""
+    paths = paths_for(workspace)
+    pipeline.save_pipeline(
+        paths,
+        {
+            "state": pipeline.HARD_STOP,
+            "stages": {
+                "REPAIRING": {"state": pipeline.HARD_STOP},
+                "v4-prep": {"state": "V4_PREP_GREEN", "head_sha": "a" * 40},
+            },
+        },
+    )
+
+    pipeline.clear_hard_stop(paths)
+
+    stages = pipeline.load_pipeline(paths)["stages"]
+    assert set(stages) == {"v4-prep"}
+
+
+def test_clearing_a_stop_never_touches_a_green_stage(workspace: dict[str, Path]) -> None:
+    paths = paths_for(workspace)
+    pipeline.save_pipeline(
+        paths,
+        {
+            "state": pipeline.HARD_STOP,
+            "stages": {
+                "v4-prep": {
+                    "state": "V4_PREP_GREEN",
+                    "head_sha": "3c6f590c084ed8467a3b867edad3524756f2edc6",
+                    "repair_attempts": 1,
+                }
+            },
+        },
+    )
+
+    pipeline.clear_hard_stop(paths)
+
+    prep = pipeline.load_pipeline(paths)["stages"]["v4-prep"]
+    assert prep["state"] == "V4_PREP_GREEN"
+    assert prep["head_sha"] == "3c6f590c084ed8467a3b867edad3524756f2edc6"
+    assert prep["repair_attempts"] == 1
+
+
+def test_a_resumed_stage_skips_the_build_and_goes_straight_to_validation(
+    workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The state left by clear-hard-stop must not re-invoke the build agent."""
+    paths = paths_for(workspace)
+    stage = pipeline.STAGE_BY_KEY["v4"]
+    _where, base = built_stage_worktree(workspace, stage)
+    calls: list[str] = []
+    monkeypatch.setattr(pipeline, "stage_green_sha", lambda _p, s: None)
+    monkeypatch.setattr(pipeline, "base_sha_for", lambda _p, _s: base)
+    monkeypatch.setattr(pipeline, "prepare_stage", lambda _p, _s, _b: "resuming")
+    monkeypatch.setattr(
+        pipeline,
+        "invoke_agent_guarded",
+        lambda *_a: (
+            calls.append("agent")
+            or pipeline.AgentRun(True, 0, "", "", 0.0, [], Path("p"), Path("o"))
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline, "validate_and_repair", lambda *_a: calls.append("validate") or orch.EXIT_OK
+    )
+    state = {"stages": {"v4": {"state": "V4_VALIDATING", "base_sha": base, "repair_attempts": 0}}}
+
+    pipeline.run_build_stage(paths, state, stage)
+
+    assert calls == ["validate"]
+
+
+def test_the_identity_falls_back_to_the_conventional_install_location(
+    workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A manual run from a worktree is measured against the same pin launchd uses."""
+    monkeypatch.setattr(pipeline, "INSTALL_DIR", tmp_path / "not-installed-here")
+    install = workspace["qa_root"] / "integration-orchestrator"
+    install.mkdir(parents=True, exist_ok=True)
+    (install / "INSTALLED_FROM.json").write_text(
+        json.dumps({"source_branch": ORCHESTRATOR_BRANCH, "source_commit": NEW_ORCHESTRATOR}),
+        encoding="utf-8",
+    )
+
+    who = pipeline.orchestrator_identity(paths_for(workspace))
+
+    assert who.installed_commit == NEW_ORCHESTRATOR
+    assert who.branch == ORCHESTRATOR_BRANCH
+
+
+def test_an_install_record_without_a_commit_is_ignored(
+    workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A half-written record must not become a pin that excuses anything."""
+    empty = tmp_path / "install"
+    empty.mkdir()
+    (empty / "INSTALLED_FROM.json").write_text(json.dumps({"source_branch": "x"}), encoding="utf-8")
+    monkeypatch.setattr(pipeline, "INSTALL_DIR", empty)
+
+    who = pipeline.orchestrator_identity(paths_for(workspace))
+
+    assert who.installed_commit is None

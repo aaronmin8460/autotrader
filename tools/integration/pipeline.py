@@ -46,6 +46,13 @@ orch = _load_orchestrator()
 
 SPEC_DIR = Path(__file__).resolve().parent / "specs"
 
+#: Where the running copy lives. When the LaunchAgent runs the installed copy
+#: this is the install directory, so `INSTALLED_FROM.json` sits beside it and
+#: names the revision this process is actually executing.
+INSTALL_DIR = Path(
+    os.environ.get("AUTOTRADER_INTEGRATION_INSTALL_DIR", str(Path(__file__).resolve().parent))
+)
+
 # ---------------------------------------------------------------------------
 # The state machine
 # ---------------------------------------------------------------------------
@@ -315,19 +322,117 @@ def snapshot_refs(paths: orch.Paths) -> dict[str, str]:
     return seen
 
 
+@dataclass(frozen=True)
+class SelfIdentity:
+    """Who the orchestrator itself is, so its own upgrade is not a stage's fault.
+
+    A stage can take half an hour. The orchestrator's own branch may legitimately
+    move inside that window - somebody commits an improvement to it and
+    reinstalls - and a snapshot taken before the stage began would otherwise
+    attribute that move to the stage's agent.
+
+    `installed_commit` is the pin: the revision the running copy was installed
+    from, read from the install directory rather than from the branch, so a
+    branch that moved without an install is still a breach.
+    """
+
+    branch: str | None
+    worktree: str | None
+    installed_commit: str | None
+
+    def owns(self, ref: str) -> bool:
+        if self.branch and self.branch in ref:
+            return True
+        return bool(self.worktree) and ref == f"worktree:{self.worktree}"
+
+
+def install_records(paths: orch.Paths) -> tuple[Path, ...]:
+    """Where an installed-provenance record may be found, most specific first.
+
+    Beside the running module when the LaunchAgent runs the installed copy, and
+    otherwise at the conventional install location - so a manual invocation from
+    a worktree is measured against the same pin the scheduled one uses.
+    """
+    return (
+        INSTALL_DIR / "INSTALLED_FROM.json",
+        paths.qa_root / "integration-orchestrator" / "INSTALLED_FROM.json",
+    )
+
+
+def orchestrator_identity(paths: orch.Paths) -> SelfIdentity:
+    """Read the running copy's own provenance from where it was installed."""
+    record: dict[str, object] = {}
+    for candidate in install_records(paths):
+        try:
+            loaded = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(loaded, dict) and loaded.get("source_commit"):
+            record = loaded
+            break
+    branch = record.get("source_branch")
+    commit = record.get("source_commit")
+    return SelfIdentity(
+        branch=branch if isinstance(branch, str) and branch else None,
+        worktree=str(paths.git_host),
+        installed_commit=commit if isinstance(commit, str) and commit else None,
+    )
+
+
+def fast_forward_in(paths: orch.Paths):
+    """A predicate answering whether `old` is an ancestor of `new`."""
+
+    def answer(old: str, new: str) -> bool:
+        if not old or not new:
+            return False
+        return orch.git(paths.git_host, "merge-base", "--is-ancestor", old, new).ok
+
+    return answer
+
+
 def containment_breach(
-    before: dict[str, str], after: dict[str, str], allowed: Sequence[str]
+    before: dict[str, str],
+    after: dict[str, str],
+    allowed: Sequence[str],
+    *,
+    identity: SelfIdentity | None = None,
+    fast_forward=None,
 ) -> list[str]:
-    """Refs that changed which this stage had no business changing."""
+    """Refs that changed which this stage had no business changing.
+
+    A ref belonging to the orchestrator itself is excused only when the move is
+    a *proven* self-upgrade: it must land exactly on the revision the running
+    copy was installed from, and it must be a fast-forward. A move to any other
+    revision, a rewind, or a move with no install behind it is still a breach -
+    a stage agent must never be able to touch another worktree or ref.
+    """
     permitted = tuple(allowed)
     moved: list[str] = []
     for name in sorted(set(before) | set(after)):
-        if before.get(name) == after.get(name):
+        was, now = before.get(name), after.get(name)
+        if was == now:
             continue
         if any(token and token in name for token in permitted):
             continue
-        moved.append(f"{name}: {before.get(name, 'absent')} -> {after.get(name, 'absent')}")
+        if (
+            identity is not None
+            and identity.owns(name)
+            and _is_self_upgrade(was, now, identity, fast_forward)
+        ):
+            continue
+        moved.append(f"{name}: {was or 'absent'} -> {now or 'absent'}")
     return moved
+
+
+def _is_self_upgrade(
+    was: str | None, now: str | None, identity: SelfIdentity, fast_forward
+) -> bool:
+    """Is this exactly the orchestrator moving onto the revision it now runs?"""
+    if not was or not now:
+        return False
+    if not identity.installed_commit or now != identity.installed_commit:
+        return False
+    return bool(fast_forward) and bool(fast_forward(was, now))
 
 
 # ---------------------------------------------------------------------------
@@ -950,11 +1055,33 @@ def invoke_agent_guarded(
 ) -> AgentRun | int:
     """Run the agent and prove it changed nothing outside this stage's branch."""
     where = stage_worktree(paths, stage)
+
+    # The orchestrator's own revision is pinned before the stage launches, so
+    # any later argument about what moved has a recorded starting point.
+    launched_at = orchestrator_identity(paths)
+    stage_record(state, stage.key)["orchestrator_at_launch"] = launched_at.installed_commit
+    save_pipeline(paths, state)
+
     before = snapshot_refs(paths)
     run = run_agent(paths, stage, where, prompt, label)
     after = snapshot_refs(paths)
 
-    breach = containment_breach(before, after, allowed=(stage.branch, str(where)))
+    # Re-read after the run: an orchestrator that upgraded itself mid-stage is
+    # compared against the revision now installed, not the one it started on.
+    settled = orchestrator_identity(paths)
+    if settled.installed_commit != launched_at.installed_commit:
+        orch.log(
+            paths,
+            f"[{stage.key}] the orchestrator upgraded itself during this stage: "
+            f"{launched_at.installed_commit} -> {settled.installed_commit}",
+        )
+    breach = containment_breach(
+        before,
+        after,
+        allowed=(stage.branch, str(where)),
+        identity=settled,
+        fast_forward=fast_forward_in(paths),
+    )
     if breach:
         return hard_stop(
             paths,
@@ -1573,6 +1700,70 @@ def label_for(paths: orch.Paths, state: dict[str, object], stage: Stage) -> str:
     return "WAITING"
 
 
+def stage_has_work(paths: orch.Paths, stage: Stage) -> bool:
+    """Has this stage's branch already been built on top of its base?"""
+    where = stage_worktree(paths, stage)
+    if not (where / ".git").exists():
+        return False
+    base = stage_record(load_pipeline(paths), stage.key).get("base_sha")
+    if not isinstance(base, str) or not base:
+        return False
+    counted = orch.git(where, "rev-list", "--count", f"{base}..HEAD")
+    return counted.ok and counted.out.strip() not in ("", "0")
+
+
+def clear_hard_stop(paths: orch.Paths) -> list[str]:
+    """Lift a hard stop without discarding what the stopped stage had finished.
+
+    A stage whose branch already carries its build resumes at validation rather
+    than being rebuilt from scratch - the work is committed, and repeating it
+    would cost the same hours again and consume nothing but goodwill. A stage
+    with nothing on its branch is forgotten entirely so it starts clean.
+
+    Repair budgets are untouched: an infrastructure stop is not a failed repair.
+    """
+    state = load_pipeline(paths)
+    said: list[str] = []
+    halt = state.get("hard_stop")
+    if isinstance(halt, dict) and halt:
+        said.append(f"cleared: {halt.get('stage')} - {halt.get('reason')}")
+    state.pop("hard_stop", None)
+
+    stages = state.get("stages")
+    stages = stages if isinstance(stages, dict) else {}
+    for key in sorted(stages):
+        record = stages[key]
+        if not isinstance(record, dict):
+            continue
+        if key not in ALL_STAGES:
+            # A record keyed by something that was never a stage; nothing reads
+            # it, and leaving it makes the persisted machine harder to follow.
+            del stages[key]
+            said.append(f"pruned a record that names no stage: {key!r}")
+            continue
+        if record.get("state") != HARD_STOP:
+            continue
+        record.pop("hard_stop_reason", None)
+        record.pop("hard_stop_evidence", None)
+        stage = ALL_STAGES[key]
+        if stage.kind != "integration" and stage_has_work(paths, stage):
+            record["state"] = stage.state(VALIDATING)
+            said.append(
+                f"{key}: build is committed, resuming at validation "
+                f"(repairs {record.get('repair_attempts', 0)}/{MAX_REPAIR_ATTEMPTS})"
+            )
+        else:
+            del stages[key]
+            said.append(f"{key}: nothing built yet, will start clean")
+
+    state["stages"] = stages
+    state["state"] = "RESUMED"
+    state["updated_at"] = orch.iso(orch.utc_now())
+    save_pipeline(paths, state)
+    said.append("hard stop cleared; the next step re-evaluates from the remote")
+    return said
+
+
 def command_status(paths: orch.Paths) -> int:
     orch.preflight(paths)
     orch.fetch(paths)
@@ -1702,11 +1893,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return orch.EXIT_OK
         if args.command == "clear-hard-stop":
             orch.preflight(paths)
-            state = load_pipeline(paths)
-            state.pop("hard_stop", None)
-            state["state"] = "RESUMED"
-            save_pipeline(paths, state)
-            print("hard stop cleared; the next step will re-evaluate from the remote")
+            for line in clear_hard_stop(paths):
+                print(line)
             return orch.EXIT_OK
     except orch.Stop as stop:
         print(f"stopped: {stop.reason}", file=sys.stderr)
