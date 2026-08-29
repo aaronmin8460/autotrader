@@ -28,6 +28,7 @@ from autotrader.decision.contract import (
     VERSION_V1,
     VERSION_V2,
     VERSION_V3,
+    VERSION_V4,
     AssetClass,
     DecisionConfigError,
     DecisionEngine,
@@ -256,15 +257,24 @@ def test_every_engine_satisfies_the_shared_protocol(
     assert engine.describe()["engine_version"] == expected_version
 
 
-def test_the_three_versions_are_distinct_identifiers() -> None:
-    assert len({VERSION_V1, VERSION_V2, VERSION_V3}) == 3
+def test_the_four_versions_are_distinct_identifiers() -> None:
+    assert len({VERSION_V1, VERSION_V2, VERSION_V3, VERSION_V4}) == 4
 
 
-def test_v4_and_v5_are_not_implemented_here() -> None:
-    """This branch defines the contract they will consume, and nothing more."""
+def test_v5_is_not_implemented_here() -> None:
+    """The ensemble is still only a contract this package is shaped to serve.
+
+    This began as a V4-and-V5 scope marker on the branch that built V2 and V3.
+    V4 exists now - `decision.v4` is the probability engine and `decision.v4`'s
+    `ProbabilityAssessment` is what an ensemble will read - so the assertion has
+    been narrowed to the half that is still true, rather than deleted. V5 has to
+    reconcile a deterministic score with a calibrated probability, and that is a
+    modelling decision nobody has made yet; a name here claiming otherwise would
+    be the first thing to mislead whoever makes it.
+    """
     from autotrader import decision
 
-    assert not [name for name in dir(decision) if "V4" in name or "V5" in name]
+    assert not [name for name in dir(decision) if "V5" in name]
 
 
 # --------------------------------------------------------------------------

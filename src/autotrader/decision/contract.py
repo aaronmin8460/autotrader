@@ -12,12 +12,13 @@ existing execution, risk and reconciliation layers remain the authority on
 whether a candidate ever becomes an order, and this package cannot reach them.
 
 **Why a versioned contract at all.** V1 is the EMA 20 / EMA 50 crossover that
-has been in the system since C3. V2 is a deterministic multi-factor score and
-V3 combines three timeframes; a V4 probability model and a V5 ensemble are
-anticipated and deliberately not built here. Those five things disagree about
-almost everything internally, and agree about exactly one thing: on a given
-completed bar, for a given symbol, they emit a direction, a bounded score, a
-confidence, and an audit trail explaining both. That agreement is this module.
+has been in the system since C3. V2 is a deterministic multi-factor score, V3
+combines three timeframes, and V4 turns the same measurements into a calibrated
+probability; a V5 ensemble is anticipated and deliberately not built here. Those
+five things disagree about almost everything internally, and agree about exactly
+one thing: on a given completed bar, for a given symbol, they emit a direction, a
+bounded score, a confidence, and an audit trail explaining both. That agreement
+is this module.
 
 **The result is an audit record, not a suggestion.** docs/SPEC.md section 7D
 requires that any order be reconstructible from its inputs. `reasons` carries
@@ -60,12 +61,13 @@ from autotrader.equity import EQUITY_SYMBOLS
 #: a model-training run depend on a broker client library.
 CRYPTO_SYMBOLS: tuple[str, ...] = ("BTC/USD", "ETH/USD")
 
-#: Engine version identifiers. Strings rather than an enum because V4 and V5
-#: are anticipated but unwritten, and an enum member for a version that does
-#: not exist is a promise this branch has no business making.
+#: Engine version identifiers. Strings rather than an enum because V5 is
+#: anticipated but unwritten, and an enum member for a version that does not
+#: exist is a promise this branch has no business making.
 VERSION_V1 = "v1"
 VERSION_V2 = "v2"
 VERSION_V3 = "v3"
+VERSION_V4 = "v4"
 
 #: Inclusive bounds every version's outputs are checked against.
 SCORE_MIN = -1.0
@@ -307,6 +309,7 @@ __all__ = [
     "VERSION_V1",
     "VERSION_V2",
     "VERSION_V3",
+    "VERSION_V4",
     "AssetClass",
     "DecisionConfigError",
     "DecisionEngine",

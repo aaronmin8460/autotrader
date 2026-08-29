@@ -1,10 +1,17 @@
 """M1: the `autotrader ml ...` sub-application.
 
-Five read-or-build commands and nothing else. Every one of them reads files
-that already exist and writes to external storage; none of them fetches market
-data, constructs a broker client, trains a model, or activates anything. The
-`autotrader` application it attaches to owns the commands that can reach a
-broker, and this sub-application deliberately shares none of them.
+Read-or-build commands and nothing else. Every one of them reads files that
+already exist and writes to external storage; none of them fetches market data,
+constructs a broker client, or activates anything. The `autotrader` application
+it attaches to owns the commands that can reach a broker, and this
+sub-application deliberately shares none of them.
+
+`v4-compare` and `v4-train` do fit models, which the first five commands do not.
+That is the only capability added, and it is bounded on both sides: the input is
+a bar file already on disk, and the output is an artifact registered at the
+`experimental` stage. There is no stage that makes a model trade and no command
+here that could turn one on - activation is a deliberate change to a runtime,
+made somewhere else, by someone who has read the evidence `v4-compare` prints.
 
 Kept in its own module rather than added to `autotrader.cli` so that the ML
 foundation owns its own surface: the commands here change when the ML contracts
@@ -52,13 +59,16 @@ app = typer.Typer(
 
 @app.callback()
 def ml() -> None:
-    """Offline ML data foundation: datasets, labels, splits, and the model registry.
+    """Offline ML foundation: datasets, labels, splits, the registry, and V4 training.
 
     Builds versioned feature datasets from bar files that already exist on
-    disk, cuts them into leak-free temporal splits, and inspects the model
-    registry. Nothing here downloads market data, trains a model, or can reach
-    a broker: this is the data layer a future decision model will be built on,
-    not the model and not a strategy.
+    disk, cuts them into leak-free temporal splits, inspects the model
+    registry, and - with v4-compare and v4-train - produces the walk-forward
+    evidence behind V4's model choice and fits the model it selects.
+
+    Nothing here downloads market data, reaches a broker, or activates
+    anything. A trained artifact is registered at the experimental stage;
+    making a model trade is a deliberate change to a runtime, elsewhere.
 
     Heavy output goes to the external workspace named by AUTOTRADER_QA_DATASETS,
     AUTOTRADER_QA_MODELS and AUTOTRADER_QA_REPORTS. Those must be set - there
@@ -435,6 +445,260 @@ def registry_show(
         typer.echo("Stage history:")
         for entry in history:
             typer.echo(f"  {entry.get('at_utc')}  {entry.get('stage')}  {entry.get('reason')}")
+
+
+# --------------------------------------------------------------------------
+# V4: comparing candidates, and training the one that wins
+# --------------------------------------------------------------------------
+
+
+BarsArgument = Annotated[
+    Path, typer.Argument(help="Parquet bar file written by `download` or `equity-download`.")
+]
+SymbolOption = Annotated[str, typer.Option("--symbol", help="The symbol the bar file holds.")]
+SessionsOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--sessions",
+        help=(
+            "JSON session calendar. Required for an equity symbol; refused for a "
+            "crypto pair, which trades continuously."
+        ),
+    ),
+]
+FoldsOption = Annotated[
+    int, typer.Option("--folds", help="Anchored walk-forward folds used to compare candidates.")
+]
+SeedOption = Annotated[
+    int, typer.Option("--seed", help="Recorded with every run, whether or not a family uses it.")
+]
+EmbargoOption = Annotated[
+    int,
+    typer.Option(
+        "--embargo-bars",
+        help="Extra bars dropped before each fold boundary, on top of label purging.",
+    ),
+]
+GitShaOption = Annotated[
+    str | None,
+    typer.Option("--git-sha", help="Commit the code was at. Supplied by the caller; not read."),
+]
+GitBranchOption = Annotated[
+    str | None, typer.Option("--git-branch", help="Branch the code was on, for the record.")
+]
+
+
+def _v4_training_frame(
+    bars_path: Path,
+    symbol: str,
+    sessions: Path | None,
+    horizon_bars: int,
+):
+    """Read stored bars and build the V4 training frame they support."""
+    from autotrader.data.validation import read_bars
+    from autotrader.ml.dataset import DatasetSpec, grid_for_bars
+    from autotrader.ml.v4 import build_training_frame, default_label_spec
+
+    label = default_label_spec(horizon_bars=horizon_bars)
+    frame = read_bars(bars_path)
+    calendar = load_sessions(sessions) if sessions is not None else None
+    grid = grid_for_bars(frame, DatasetSpec(symbol=symbol, label=label), sessions=calendar)
+    return build_training_frame(frame, grid=grid, label=label), grid
+
+
+@app.command(name="v4-compare")
+def v4_compare_command(
+    bars: BarsArgument,
+    symbol: SymbolOption,
+    sessions: SessionsOption = None,
+    horizon_bars: HorizonBars = 4,
+    folds: FoldsOption = 4,
+    embargo_bars: EmbargoOption = 0,
+    seed: SeedOption = 0,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Where to write. Defaults to AUTOTRADER_QA_REPORTS."),
+    ] = None,
+) -> None:
+    """Grade every V4 candidate on anchored walk-forward folds, and record the result.
+
+    This is the command that produces the evidence behind V4's model choice. It
+    fits a null baseline, a regularised logistic regression and a small boosted
+    ensemble on identical folds, grades each on log loss, Brier score, expected
+    calibration error and AUC, and applies the selection rule: beat the base
+    rate materially, then prefer the simplest family that is not materially
+    worse than the best.
+
+    Nothing is registered and nothing is activated. The output is a report.
+    """
+    from autotrader.ml.v4 import compare_candidates, write_comparison
+
+    try:
+        training, _ = _v4_training_frame(bars, symbol, sessions, horizon_bars)
+        comparison = compare_candidates(training, folds=folds, embargo_bars=embargo_bars, seed=seed)
+        path = write_comparison(comparison, root=output_dir)
+    except FileNotFoundError as error:
+        raise _fail(error, ML_UNREADABLE_INPUT_EXIT_CODE) from None
+    except MLError as error:
+        raise _fail(error, ML_REFUSED_EXIT_CODE) from None
+    except Exception as error:  # noqa: BLE001 - an unreadable input is one failure
+        raise _fail(error, ML_UNREADABLE_INPUT_EXIT_CODE) from None
+
+    typer.secho("Walk-forward comparison complete", fg=typer.colors.GREEN)
+    typer.echo("")
+    typer.echo(_field("Symbol", training.symbol))
+    typer.echo(_field("Rows", training.row_count))
+    typer.echo(_field("Labelled rows", training.labelled_row_count))
+    typer.echo(_field("Label", training.label.identifier))
+    typer.echo(_field("Feature schema", training.schema.version))
+    typer.echo(_field("Folds", comparison.fold_count))
+    typer.echo("")
+    typer.echo(f"  {'candidate':<22}{'log loss':>11}{'brier':>10}{'ECE':>9}{'AUC':>9}")
+    for result in comparison.results:
+        metrics = result.mean_metrics
+        typer.echo(
+            f"  {result.candidate.name:<22}"
+            f"{metrics['log_loss']:>11.6f}"
+            f"{metrics['brier_score']:>10.4f}"
+            f"{metrics['expected_calibration_error']:>9.4f}"
+            f"{metrics['roc_auc']:>9.4f}"
+        )
+    typer.echo("")
+    typer.echo(_field("Selected", comparison.chosen.name))
+    typer.echo(_field("Report", path))
+    typer.echo("")
+    typer.echo(comparison.rationale)
+
+
+@app.command(name="v4-train")
+def v4_train_command(
+    bars: BarsArgument,
+    symbol: SymbolOption,
+    model_version: Annotated[
+        str, typer.Option("--model-version", help="The version this artifact is registered under.")
+    ],
+    sessions: SessionsOption = None,
+    horizon_bars: HorizonBars = 4,
+    folds: FoldsOption = 4,
+    embargo_bars: EmbargoOption = 0,
+    seed: SeedOption = 0,
+    train_fraction: Annotated[
+        float, typer.Option("--train-fraction", help="Share of labelled rows used for training.")
+    ] = 0.6,
+    validation_fraction: Annotated[
+        float,
+        typer.Option(
+            "--validation-fraction",
+            help="Share used for validation, which is where the calibration is fitted.",
+        ),
+    ] = 0.2,
+    calibrate: Annotated[
+        bool,
+        typer.Option(
+            "--calibrate/--no-calibrate",
+            help="Fit an isotonic calibration on the validation split.",
+        ),
+    ] = True,
+    models_dir: Annotated[
+        Path | None,
+        typer.Option("--models-dir", help="Where to write. Defaults to AUTOTRADER_QA_MODELS."),
+    ] = None,
+    git_sha: GitShaOption = None,
+    git_branch: GitBranchOption = None,
+    notes: Annotated[str, typer.Option("--notes", help="Free text stored with the artifact.")] = "",
+) -> None:
+    """Select a V4 model from walk-forward evidence, fit it, calibrate it, register it.
+
+    The candidate is chosen by the same comparison `v4-compare` prints, so a
+    training run cannot pick a model the evidence did not support. It is then
+    fitted on the training split, calibrated on the validation split, and
+    evaluated once on the test split, and the artifact records all three.
+
+    The artifact is registered at the `experimental` stage. Registration is not
+    activation: nothing about this command makes a model trade.
+    """
+    from autotrader.ml.dataset import frame_fingerprint
+    from autotrader.ml.experiment import GitProvenance, write_experiment
+    from autotrader.ml.registry import ArtifactStage
+    from autotrader.ml.storage import model_root
+    from autotrader.ml.v4 import (
+        compare_candidates,
+        experiment_for,
+        register_model,
+        train_model,
+        write_comparison,
+    )
+
+    try:
+        training, _ = _v4_training_frame(bars, symbol, sessions, horizon_bars)
+        comparison = compare_candidates(training, folds=folds, embargo_bars=embargo_bars, seed=seed)
+        comparison_path = write_comparison(comparison)
+        split_spec = SplitSpec(
+            train_fraction=train_fraction,
+            validation_fraction=validation_fraction,
+            embargo_bars=embargo_bars,
+        )
+        trained = train_model(
+            training,
+            comparison.chosen,
+            model_version=model_version,
+            split=split_spec,
+            seed=seed,
+            calibrate=calibrate,
+            code_revision={"branch": git_branch, "sha": git_sha},
+            notes=notes,
+        )
+        fingerprint = frame_fingerprint(training.frame)
+        experiment = experiment_for(
+            training,
+            trained,
+            name=f"v4-{training.symbol.replace('/', '_')}",
+            dataset_fingerprint=fingerprint,
+            split=split_spec,
+            git=GitProvenance(branch=git_branch, sha=git_sha),
+            notes=notes,
+        )
+        experiment_path = write_experiment(experiment)
+        base = Path(models_dir) if models_dir is not None else model_root()
+        registered = register_model(
+            trained,
+            training,
+            experiment=experiment,
+            dataset_fingerprint=fingerprint,
+            registry=ModelRegistry(root=base / "registry"),
+            directory=base / "v4",
+            stage=ArtifactStage.EXPERIMENTAL,
+            notes=notes,
+        )
+    except FileNotFoundError as error:
+        raise _fail(error, ML_UNREADABLE_INPUT_EXIT_CODE) from None
+    except MLError as error:
+        raise _fail(error, ML_REFUSED_EXIT_CODE) from None
+    except Exception as error:  # noqa: BLE001 - an unreadable input is one failure
+        raise _fail(error, ML_UNREADABLE_INPUT_EXIT_CODE) from None
+
+    typer.secho("Model trained and registered (experimental)", fg=typer.colors.GREEN)
+    typer.echo("")
+    typer.echo(_field("Model", f"{trained.candidate.name} {model_version}"))
+    typer.echo(_field("Family", trained.artifact.family))
+    typer.echo(_field("Artifact version", registered.metadata.artifact_version[:16]))
+    typer.echo(_field("Stage", registered.stage.value))
+    typer.echo(_field("Feature schema", trained.artifact.feature_version))
+    typer.echo(_field("Label", trained.artifact.label_spec_id))
+    typer.echo(_field("Calibration", trained.artifact.calibration_method))
+    typer.echo(_field("Experiment", experiment.short_id))
+    typer.echo(_field("Train rows", trained.split.train.row_count))
+    typer.echo(_field("Validation rows", trained.split.validation.row_count))
+    typer.echo(_field("Test rows", trained.split.test.row_count))
+    typer.echo("")
+    for name, value in sorted(trained.test_metrics.items()):
+        typer.echo(f"  test {name:<28} {value:.6g}")
+    typer.echo("")
+    typer.echo(_field("Artifact", registered.artifact_path))
+    typer.echo(_field("Experiment record", experiment_path))
+    typer.echo(_field("Comparison", comparison_path))
+    typer.echo("")
+    typer.echo(comparison.rationale)
 
 
 __all__ = [
