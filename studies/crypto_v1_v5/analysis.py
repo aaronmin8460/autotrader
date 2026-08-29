@@ -434,8 +434,10 @@ def representative_disagreements(
         rows.append(
             {
                 "timestamp": moment,
-                left: differing.loc[moment, left],
-                right: differing.loc[moment, right],
+                "left_engine": left,
+                "right_engine": right,
+                "left_signal": differing.loc[moment, left],
+                "right_signal": differing.loc[moment, right],
                 "forward_return_24h": forward,
                 "favoured": (
                     "neither"
