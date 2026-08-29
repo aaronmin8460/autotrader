@@ -29,6 +29,7 @@ from autotrader.decision.contract import (
     VERSION_V2,
     VERSION_V3,
     VERSION_V4,
+    VERSION_V5,
     AssetClass,
     DecisionConfigError,
     DecisionEngine,
@@ -257,24 +258,27 @@ def test_every_engine_satisfies_the_shared_protocol(
     assert engine.describe()["engine_version"] == expected_version
 
 
-def test_the_four_versions_are_distinct_identifiers() -> None:
-    assert len({VERSION_V1, VERSION_V2, VERSION_V3, VERSION_V4}) == 4
+def test_the_five_versions_are_distinct_identifiers() -> None:
+    assert len({VERSION_V1, VERSION_V2, VERSION_V3, VERSION_V4, VERSION_V5}) == 5
 
 
-def test_v5_is_not_implemented_here() -> None:
-    """The ensemble is still only a contract this package is shaped to serve.
+def test_v5_exists_and_is_not_activated_by_existing_here() -> None:
+    """The successor to this file's V4-and-V5 scope marker, narrowed once again.
 
-    This began as a V4-and-V5 scope marker on the branch that built V2 and V3.
-    V4 exists now - `decision.v4` is the probability engine and `decision.v4`'s
-    `ProbabilityAssessment` is what an ensemble will read - so the assertion has
-    been narrowed to the half that is still true, rather than deleted. V5 has to
-    reconcile a deterministic score with a calibrated probability, and that is a
-    modelling decision nobody has made yet; a name here claiming otherwise would
-    be the first thing to mislead whoever makes it.
+    The marker began as "V4 and V5 are unimplemented", was narrowed to V5 alone
+    when the probability engine landed, and is narrowed again now that
+    `decision.v5` is the ensemble. What was ever load-bearing about it is the
+    half that survives: a decision engine existing in this package is not the
+    same as a decision engine being *used*, and no version here has ever been
+    wired into a runtime. The check that nothing outside the package has started
+    preferring V5 lives with the rest of V5's boundary tests, in
+    `test_decision_v5.py`.
     """
     from autotrader import decision
 
-    assert not [name for name in dir(decision) if "V5" in name]
+    assert decision.VERSION_V5 == "v5"
+    assert issubclass(decision.EnsembleV5Engine, object)
+    assert not hasattr(decision, "DEFAULT_ENGINE")
 
 
 # --------------------------------------------------------------------------

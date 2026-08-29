@@ -36,7 +36,7 @@ reduce as an ordinary no-order outcome, so nothing is risked by saying it.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 from autotrader.decision.config import DIRECTIONAL_FACTORS, DecisionThresholds, FactorWeights
 from autotrader.decision.contract import DecisionSignal, MarketRegime
@@ -66,15 +66,41 @@ REASON_LOW_PARTICIPATION = "LOW_PARTICIPATION"
 REASON_BUY = "SCORE_ABOVE_BUY_THRESHOLD"
 REASON_SELL = "SCORE_BELOW_SELL_THRESHOLD"
 
+#: The two token prefixes that mean "this reading could not be produced at all",
+#: as opposed to "it was produced and came out weak".
+#:
+#: The distinction has always been in the vocabulary - too little history and an
+#: undefined feature are the two ways a timeframe goes unscored - and naming the
+#: prefixes makes it usable by a consumer instead of only readable by a person.
+#: An ensemble has to tell "V3 had no answer" from "V3 answered zero", and the
+#: contract already promises reason tokens are stable machine strings for
+#: exactly this purpose.
+UNAVAILABLE_REASON_PREFIXES: tuple[str, ...] = ("INSUFFICIENT_HISTORY", "FEATURE_UNAVAILABLE")
+
 
 def insufficient_history_reason(label: str) -> str:
     """The stable token for "this timeframe has too little history"."""
-    return f"INSUFFICIENT_HISTORY_{label.upper()}"
+    return f"{UNAVAILABLE_REASON_PREFIXES[0]}_{label.upper()}"
 
 
 def feature_unavailable_reason(label: str) -> str:
     """The stable token for "a scored feature is undefined on this bar"."""
-    return f"FEATURE_UNAVAILABLE_{label.upper()}"
+    return f"{UNAVAILABLE_REASON_PREFIXES[1]}_{label.upper()}"
+
+
+def unavailable_reasons(reasons: Iterable[str]) -> tuple[str, ...]:
+    """The tokens in `reasons` that say a reading could not be produced.
+
+    Empty when every reason describes a reading that *was* produced. A consumer
+    combining two engines needs this to be a fact it can read rather than one it
+    infers from a score of zero, because zero is also what a genuinely balanced
+    bar scores and the two mean opposite things about whether to proceed.
+    """
+    return tuple(
+        reason
+        for reason in reasons
+        if any(reason.startswith(prefix) for prefix in UNAVAILABLE_REASON_PREFIXES)
+    )
 
 
 def regime_reason(regime: MarketRegime) -> str:
@@ -276,6 +302,7 @@ __all__ = [
     "REASON_LOW_PARTICIPATION",
     "REASON_REGIME_BLOCKED",
     "REASON_SELL",
+    "UNAVAILABLE_REASON_PREFIXES",
     "agreement",
     "classify_regime",
     "composite_score",
@@ -290,5 +317,6 @@ __all__ = [
     "regime_reason",
     "score_factors",
     "softsign",
+    "unavailable_reasons",
     "volatility_factor",
 ]

@@ -29,11 +29,19 @@ calibrated probability rather than a rule-based score. The model arrives as a
 value - `probability.ProbabilityArtifact` - because this package may not read a
 file; `autotrader.ml.v4` is what fits one and writes it.
 
-V5 (an ensemble) is anticipated and deliberately absent. What it needs in order
-to exist is here: one result shape, one vectorized feature layer, one policy
-object describing the configuration a stored decision was made under, and
-`v4.ProbabilityAssessment`, which exposes V4's probability and provenance so an
-ensemble can combine it with V3's score without reaching inside either.
+``v5`` The ensemble. V3's deterministic score and V4's calibrated probability,
+blended under a named, versioned specification and then attenuated by the market
+regime and by the bar's own volatility - both as multipliers in ``[0, 1]``, so
+context can take conviction away and can never manufacture it. Every decision
+carries an exact decomposition into which input moved it and by how much, and an
+explicit hold band, recorded with the decision, that resolves a boundary score to
+HOLD rather than to whichever side is marginally ahead. `ensemble.py` is the
+specification and the arithmetic; `v5.py` is the engine.
+
+**Nothing here is activated.** No runtime prefers any of these versions, no
+default selects one, and V5 in particular opens no gate: it produces a candidate
+that the risk engine remains the sole authority over. Wiring an engine into a
+runtime is a separate decision that no version in this package makes for itself.
 
 **Boundaries this branch does not cross.** The research backtester belongs to
 the quant-research branch, and V4's *training* - datasets, walk-forward
@@ -61,6 +69,7 @@ from autotrader.decision.contract import (
     VERSION_V2,
     VERSION_V3,
     VERSION_V4,
+    VERSION_V5,
     AssetClass,
     DecisionConfigError,
     DecisionEngine,
@@ -70,6 +79,19 @@ from autotrader.decision.contract import (
     DecisionSignal,
     MarketRegime,
     resolve_asset_class,
+)
+from autotrader.decision.ensemble import (
+    BALANCED_ENSEMBLE,
+    ENSEMBLE_CONTRACT_VERSION,
+    ComponentContribution,
+    ConfidenceMix,
+    EnsembleAttribution,
+    EnsembleBand,
+    EnsembleSpec,
+    EnsembleWeights,
+    RegimeAdjustments,
+    combine_regimes,
+    component_agreement,
 )
 from autotrader.decision.features import (
     FEATURE_COLUMNS,
@@ -105,10 +127,13 @@ from autotrader.decision.v1 import EmaCrossV1Engine, to_legacy_signal
 from autotrader.decision.v2 import MultiFactorV2Engine, TimeframeEvaluation, evaluate_timeframe
 from autotrader.decision.v3 import MultiTimeframeV3Engine
 from autotrader.decision.v4 import ProbabilityAssessment, ProbabilityV4Engine
+from autotrader.decision.v5 import EnsembleAssessment, EnsembleV5Engine
 
 __all__ = [
+    "BALANCED_ENSEMBLE",
     "BASE_TIMEFRAME",
     "CRYPTO_POLICY",
+    "ENSEMBLE_CONTRACT_VERSION",
     "EQUITY_POLICY",
     "FEATURE_COLUMNS",
     "FEATURE_SCHEMA_VERSION",
@@ -122,9 +147,12 @@ __all__ = [
     "VERSION_V2",
     "VERSION_V3",
     "VERSION_V4",
+    "VERSION_V5",
     "AssetClass",
     "AssetClassPolicy",
     "ClassFrequencyEstimator",
+    "ComponentContribution",
+    "ConfidenceMix",
     "DecisionConfigError",
     "DecisionEngine",
     "DecisionError",
@@ -133,6 +161,12 @@ __all__ = [
     "DecisionSignal",
     "DecisionThresholds",
     "EmaCrossV1Engine",
+    "EnsembleAssessment",
+    "EnsembleAttribution",
+    "EnsembleBand",
+    "EnsembleSpec",
+    "EnsembleV5Engine",
+    "EnsembleWeights",
     "FactorWeights",
     "FeatureStandardizer",
     "GradientBoostedEstimator",
@@ -148,6 +182,7 @@ __all__ = [
     "ProbabilityAssessment",
     "ProbabilityModelError",
     "ProbabilityV4Engine",
+    "RegimeAdjustments",
     "TimeframeEvaluation",
     "TimeframePolicy",
     "TimeframeSpec",
@@ -155,6 +190,8 @@ __all__ = [
     "aggregate_bars",
     "align_timeframes",
     "artifact_from_record",
+    "combine_regimes",
+    "component_agreement",
     "compute_features",
     "evaluate_timeframe",
     "policy_for",

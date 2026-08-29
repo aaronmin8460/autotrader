@@ -1959,7 +1959,9 @@ socket and writes nothing - each asserted against the parse tree. The research
 backtester and model training are owned by other branches;
 `features.compute_features` is the vectorized integration point for both, and
 `DecisionResult` is the shape their output should arrive in. V4 (a probability
-model) and V5 (an ensemble) are anticipated and deliberately unimplemented.
+model) and V5 (an ensemble) were anticipated here and were unimplemented at the
+time of this milestone; both exist now, in `docs/DECISION_V4.md` and
+`docs/DECISION_V5.md`, and neither is wired into a runtime either.
 
 ### QR1 - Quant research infrastructure (complete, research only)
 

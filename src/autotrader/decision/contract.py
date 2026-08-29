@@ -13,12 +13,12 @@ whether a candidate ever becomes an order, and this package cannot reach them.
 
 **Why a versioned contract at all.** V1 is the EMA 20 / EMA 50 crossover that
 has been in the system since C3. V2 is a deterministic multi-factor score, V3
-combines three timeframes, and V4 turns the same measurements into a calibrated
-probability; a V5 ensemble is anticipated and deliberately not built here. Those
-five things disagree about almost everything internally, and agree about exactly
-one thing: on a given completed bar, for a given symbol, they emit a direction, a
-bounded score, a confidence, and an audit trail explaining both. That agreement
-is this module.
+combines three timeframes, V4 turns the same measurements into a calibrated
+probability, and V5 is an ensemble of V3 and V4 under a market-regime and
+volatility context. Those five things disagree about almost everything
+internally, and agree about exactly one thing: on a given completed bar, for a
+given symbol, they emit a direction, a bounded score, a confidence, and an audit
+trail explaining both. That agreement is this module.
 
 **The result is an audit record, not a suggestion.** docs/SPEC.md section 7D
 requires that any order be reconstructible from its inputs. `reasons` carries
@@ -29,7 +29,7 @@ the decision exactly, which is what makes `to_dict` worth having.
 
 **Bounds are part of the contract, not a convention.** `score` is in
 ``[-1, +1]`` and `confidence` is in ``[0, 1]`` for every version, checked on
-construction. An ensemble that averages V2 and V4 can only be written if both
+construction. V5 averages V3 and V4, which is only writable because both
 operands are known to live on the same scale, and the cheapest place to
 guarantee that is here.
 
@@ -61,13 +61,15 @@ from autotrader.equity import EQUITY_SYMBOLS
 #: a model-training run depend on a broker client library.
 CRYPTO_SYMBOLS: tuple[str, ...] = ("BTC/USD", "ETH/USD")
 
-#: Engine version identifiers. Strings rather than an enum because V5 is
-#: anticipated but unwritten, and an enum member for a version that does not
-#: exist is a promise this branch has no business making.
+#: Engine version identifiers. Strings rather than an enum because a version is
+#: a value stored in an audit record and read back long after the code that
+#: wrote it: a string survives a record from a release that had one fewer
+#: version, and an enum member does not.
 VERSION_V1 = "v1"
 VERSION_V2 = "v2"
 VERSION_V3 = "v3"
 VERSION_V4 = "v4"
+VERSION_V5 = "v5"
 
 #: Inclusive bounds every version's outputs are checked against.
 SCORE_MIN = -1.0
@@ -258,7 +260,7 @@ def _require_finite_within(value: object, lower: float, upper: float, field: str
 
 @runtime_checkable
 class DecisionEngine(Protocol):
-    """What every version - V1, V2, V3, and the anticipated V4 and V5 - provides.
+    """What every version - V1 through V5 - provides.
 
     Deliberately four members. `decide` is the work; `version` identifies it in
     a stored record; `required_base_bars` lets an integrator size its fetch
@@ -310,6 +312,7 @@ __all__ = [
     "VERSION_V2",
     "VERSION_V3",
     "VERSION_V4",
+    "VERSION_V5",
     "AssetClass",
     "DecisionConfigError",
     "DecisionEngine",
