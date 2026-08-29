@@ -319,3 +319,56 @@ def test_an_empty_out_of_sample_range_is_refused() -> None:
             oos_end=pd.Timestamp("2025-01-01", tz="UTC"),
             dataset_start=pd.Timestamp("2024-01-01", tz="UTC"),
         )
+
+
+def test_series_adapter_keys_decisions_by_symbol_as_well_as_instant() -> None:
+    """A portfolio replay drives one engine over two datasets whose bars share instants.
+
+    Keying on the timestamp alone would hand one symbol's decision to the other
+    symbol's bar, which is the kind of error that produces a plausible combined
+    equity curve for a strategy nobody ran.
+    """
+    moment = pd.Timestamp("2025-01-01", tz="UTC")
+    records = [
+        DecisionRecord(
+            timestamp=moment,
+            symbol=symbol,
+            signal=signal,
+            score=0.0,
+            confidence=0.5,
+            regime="RANGE",
+            reasons=("X",),
+        )
+        for symbol, signal in (("BTC/USD", DecisionSignal.BUY), ("ETH/USD", DecisionSignal.SELL))
+    ]
+    series = DecisionSeriesEngine(records, name="v1", version="v1", warmup_bars=0)
+
+    btc = bars_from_closes([100.0], symbol="BTC/USD")
+    btc.loc[0, "timestamp"] = moment
+    eth = bars_from_closes([100.0], symbol="ETH/USD")
+    eth.loc[0, "timestamp"] = moment
+
+    assert series.generate(btc)[0].action is Action.ENTER_LONG
+    assert series.generate(eth)[0].action is Action.EXIT_LONG
+
+
+def test_series_adapter_refuses_a_frame_holding_two_symbols() -> None:
+    records = [
+        DecisionRecord(
+            timestamp=pd.Timestamp("2025-01-01", tz="UTC"),
+            symbol="BTC/USD",
+            signal=DecisionSignal.BUY,
+            score=0.0,
+            confidence=0.5,
+            regime="RANGE",
+            reasons=("X",),
+        )
+    ]
+    series = DecisionSeriesEngine(records, name="v1", version="v1", warmup_bars=0)
+    mixed = pd.concat(
+        [bars_from_closes([100.0], symbol="BTC/USD"), bars_from_closes([100.0], symbol="ETH/USD")],
+        ignore_index=True,
+    )
+
+    with pytest.raises(Exception, match="2 symbols"):
+        series.generate(mixed)

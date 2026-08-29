@@ -24,6 +24,7 @@ from studies.crypto_v1_v5.analysis import (
     disagreement_summary,
     headline_metrics,
     per_window_metrics,
+    portfolio_metrics,
     regime_breakdown,
     representative_disagreements,
     signal_distribution,
@@ -73,6 +74,7 @@ def main() -> None:
     disagreement: dict[str, object] = {}
     benchmark: dict[str, object] = {}
     example_frames: list[pd.DataFrame] = []
+    all_frames: dict[str, pd.DataFrame] = {}
 
     for symbol, path in dataset_paths(Path(args.datasets)).items():
         bars, _ = load_evaluation_frame(Path(path))
@@ -80,6 +82,7 @@ def main() -> None:
         if decisions.empty:
             continue
 
+        all_frames[symbol] = bars
         headline_rows.extend(engine_rows(headline_metrics(bars, decisions), symbol))
 
         symbol_folds = [f for f in folds if f["symbol"] == symbol and f["variant"] == args.variant]
@@ -124,7 +127,21 @@ def main() -> None:
             "buy_and_hold_return": buy_and_hold_return(bars, start, end),
         }
 
-    pd.DataFrame(headline_rows).to_csv(out / "headline_metrics.csv", index=False)
+    portfolio_rows: list[dict] = []
+    if len(all_frames) > 1:
+        for cost_label, model in COST_MODELS.items():
+            combined = portfolio_metrics(all_frames, decisions_all, cost_model=model)
+            for engine, metrics in combined.items():
+                portfolio_rows.append(
+                    {
+                        "symbol": "PORTFOLIO",
+                        "cost_model": cost_label,
+                        "cost_label": model.label,
+                        "engine": engine,
+                        **metrics.to_json_dict(),
+                    }
+                )
+    pd.DataFrame(headline_rows + portfolio_rows).to_csv(out / "headline_metrics.csv", index=False)
     pd.concat(window_frames, ignore_index=True).to_csv(out / "per_window_metrics.csv", index=False)
     pd.concat(stability_frames, ignore_index=True).to_csv(out / "stability.csv", index=False)
     pd.concat(regime_frames, ignore_index=True).to_csv(out / "regime_breakdown.csv", index=False)

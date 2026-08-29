@@ -377,6 +377,7 @@ __all__ = [
     "metrics_of",
     "per_window_metrics",
     "pivot_signals",
+    "portfolio_metrics",
     "regime_breakdown",
     "replay_engine",
     "representative_disagreements",
@@ -465,3 +466,40 @@ def _favoured(left_signal: str, right_signal: str, forward: float) -> str:
     if left_score == right_score:
         return "neither"
     return "left" if left_score > right_score else "right"
+
+
+def portfolio_metrics(
+    frames: Mapping[str, pd.DataFrame],
+    decisions: pd.DataFrame,
+    *,
+    cost_model: CostModel,
+) -> dict[str, PerformanceMetrics]:
+    """Each engine's combined result across both symbols, as independent sleeves.
+
+    `replay_portfolio` splits the starting capital evenly and replays each
+    symbol on its own, then aggregates the equity curves. Two symbols therefore
+    never compete for the same dollar. That is the research package's stated
+    limitation rather than this study's choice, and it is the reason a combined
+    figure here is the sum of two sleeves and not a simulation of the live
+    runtime's sequential sizing against one shared account.
+    """
+    from autotrader.research.replay import replay_portfolio
+
+    out: dict[str, PerformanceMetrics] = {}
+    for engine in STUDY_VERSIONS:
+        subset = decisions[decisions["engine"] == engine]
+        if subset.empty:
+            continue
+        covered_start = subset["timestamp"].min()
+        covered_end = subset["timestamp"].max()
+        datasets = {
+            symbol: frame[
+                (frame["timestamp"] >= covered_start) & (frame["timestamp"] <= covered_end)
+            ].reset_index(drop=True)
+            for symbol, frame in frames.items()
+        }
+        result = replay_portfolio(
+            datasets, series_engine(subset, engine), ReplayConfig(cost_model=cost_model)
+        )
+        out[engine] = metrics_for_replay(result, CRYPTO_15M)
+    return out

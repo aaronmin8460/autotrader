@@ -189,13 +189,16 @@ class DecisionSeriesEngine:
         self._version = version
         self._warmup = int(warmup_bars)
         self._parameters = dict(parameters or {})
-        self._by_timestamp: dict[pd.Timestamp, DecisionRecord] = {
-            record.timestamp: record for record in records
+        # Keyed by symbol as well as instant, because a portfolio replay drives
+        # one engine across several datasets whose bars share timestamps. Keying
+        # on the instant alone would serve BTC's decision for an ETH bar.
+        self._by_key: dict[tuple[str, pd.Timestamp], DecisionRecord] = {
+            (record.symbol, record.timestamp): record for record in records
         }
-        if len(self._by_timestamp) != len(records):
+        if len(self._by_key) != len(records):
             raise AdapterError(
-                f"{name} was given more than one decision for the same instant; a series "
-                "with two answers for one bar cannot be replayed."
+                f"{name} was given more than one decision for the same symbol and instant; "
+                "a series with two answers for one bar cannot be replayed."
             )
 
     @property
@@ -221,8 +224,15 @@ class DecisionSeriesEngine:
         its own slice of the series rather than the whole of it.
         """
         signals: list[ResearchSignal] = []
+        symbols = pd.unique(bars["symbol"])
+        if len(symbols) != 1:
+            raise AdapterError(
+                f"{self._name} was given a frame holding {len(symbols)} symbols; a replay "
+                "frame holds one."
+            )
+        symbol = str(symbols[0])
         for timestamp in bars["timestamp"]:
-            record = self._by_timestamp.get(pd.Timestamp(timestamp))
+            record = self._by_key.get((symbol, pd.Timestamp(timestamp)))
             if record is None:
                 continue
             signal = record.to_signal()
