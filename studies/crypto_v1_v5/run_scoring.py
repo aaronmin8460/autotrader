@@ -49,6 +49,19 @@ def _run_chunk(chunk: ScoringChunk) -> pd.DataFrame:
     return score_chunk(_BARS[chunk.symbol], chunk, lookback_bars=SHARED_LOOKBACK_BARS)
 
 
+def _checkpoint_path(directory: Path, chunk: ScoringChunk) -> Path:
+    """Where one chunk's result is stored, named by exactly what it covers.
+
+    Symbol, fold and the decision range identify a chunk completely, so a
+    resumed run recognises finished work by name rather than by trusting a
+    separate index that could disagree with the files beside it.
+    """
+    slug = chunk.symbol.replace("/", "_")
+    return directory / (
+        f"{slug}_{chunk.fold_id}_{chunk.first_decision_index}-{chunk.last_decision_index}.parquet"
+    )
+
+
 def dataset_paths(root: Path) -> dict[str, str]:
     return {
         "BTC/USD": str(root / "BTC_USD_15m_2024-01-01_2026-08-28.parquet"),
@@ -93,6 +106,50 @@ def train_all_folds(
                 flush=True,
             )
     (out_dir / "v4_walkforward_folds.json").write_text(json.dumps(records, indent=2, default=str))
+    return trained
+
+
+def load_all_folds(
+    frames: dict[str, pd.DataFrame],
+    *,
+    oos_start: pd.Timestamp,
+    holdout_windows: int,
+    out_dir: Path,
+    variants: Sequence[str],
+) -> dict[tuple[str, str, str], dict]:
+    """Reuse the models a previous run already fitted, instead of fitting them again.
+
+    Training is deterministic here - every seed is zero and `trained_at` is a
+    fixed stamp - so refitting would reproduce these artifacts byte for byte and
+    the only thing it would produce is delay. Reuse is therefore a shortcut past
+    repetition rather than a shortcut past rigour.
+
+    Every artifact named by the plan must be present. A missing one is an error
+    rather than a silent refit, because a run that quietly retrained one fold and
+    reused six would be scoring against a model set nobody can identify.
+    """
+    directory = out_dir / "artifacts"
+    trained: dict[tuple[str, str, str], dict] = {}
+    for symbol, frame in frames.items():
+        plans = plan_folds(
+            oos_start=oos_start,
+            oos_end=frame["timestamp"].iloc[-1],
+            dataset_start=frame["timestamp"].iloc[0],
+            holdout_windows=holdout_windows,
+        )
+        for plan in plans:
+            for variant in variants:
+                path = directory / f"{symbol.replace('/', '_')}_{plan.fold_id}_{variant}.json"
+                if not path.is_file():
+                    raise FileNotFoundError(
+                        f"--reuse-artifacts was given but {path} is missing. Re-run without "
+                        "the flag to fit the models, rather than scoring some folds against "
+                        "stored models and others against fresh ones."
+                    )
+                trained[(symbol, plan.fold_id, variant)] = {
+                    "artifact_record": json.loads(path.read_text())
+                }
+    print(f"reused {len(trained)} stored model artifacts (no retraining)", flush=True)
     return trained
 
 
@@ -143,6 +200,15 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--variants", default="selected,forced")
     parser.add_argument("--score-variants", default="selected")
+    parser.add_argument(
+        "--reuse-artifacts",
+        action="store_true",
+        help=(
+            "Score against the models a previous run already fitted instead of fitting "
+            "them again. Training is deterministic, so this skips repetition rather than "
+            "rigour; every artifact the plan names must already be present."
+        ),
+    )
     args = parser.parse_args()
 
     datasets = Path(args.datasets)
@@ -162,20 +228,28 @@ def main() -> None:
     (out_dir / "dataset_provenance.json").write_text(json.dumps(provenance, indent=2))
     print(f"loaded {len(frames)} datasets", flush=True)
 
-    print("training walk-forward folds...", flush=True)
-    trained = train_all_folds(
-        frames,
-        oos_start=oos_start,
-        holdout_windows=args.holdout_windows,
-        out_dir=out_dir,
-        variants=variants,
-    )
-
-    artifacts_dir = out_dir / "artifacts"
-    artifacts_dir.mkdir(exist_ok=True)
-    for (symbol, fold_id, variant), payload in trained.items():
-        name = f"{symbol.replace('/', '_')}_{fold_id}_{variant}.json"
-        (artifacts_dir / name).write_text(json.dumps(payload["artifact_record"], indent=2))
+    if args.reuse_artifacts:
+        trained = load_all_folds(
+            frames,
+            oos_start=oos_start,
+            holdout_windows=args.holdout_windows,
+            out_dir=out_dir,
+            variants=variants,
+        )
+    else:
+        print("training walk-forward folds...", flush=True)
+        trained = train_all_folds(
+            frames,
+            oos_start=oos_start,
+            holdout_windows=args.holdout_windows,
+            out_dir=out_dir,
+            variants=variants,
+        )
+        artifacts_dir = out_dir / "artifacts"
+        artifacts_dir.mkdir(exist_ok=True)
+        for (symbol, fold_id, variant), payload in trained.items():
+            name = f"{symbol.replace('/', '_')}_{fold_id}_{variant}.json"
+            (artifacts_dir / name).write_text(json.dumps(payload["artifact_record"], indent=2))
 
     for variant in score_variants:
         chunks = build_chunks(
@@ -191,19 +265,37 @@ def main() -> None:
             f"{args.workers} workers",
             flush=True,
         )
+        # Each finished chunk is written before the next is awaited, so an
+        # interruption costs the chunks in flight rather than the whole pass.
+        # The previous run held every result in memory until the variant
+        # finished and lost 100 completed chunks to a shutdown; that is the
+        # entire reason this directory exists.
+        checkpoints = out_dir / "chunks" / variant
+        checkpoints.mkdir(parents=True, exist_ok=True)
+        pending = [chunk for chunk in chunks if not _checkpoint_path(checkpoints, chunk).is_file()]
+        resumed = len(chunks) - len(pending)
+        if resumed:
+            print(f"  resuming: {resumed} chunks already on disk, {len(pending)} to go", flush=True)
+
         started = time.time()
-        collected: list[pd.DataFrame] = []
-        with mp.Pool(processes=args.workers, initializer=_init_worker, initargs=(paths,)) as pool:
-            for done, frame in enumerate(pool.imap_unordered(_run_chunk, chunks), start=1):
-                collected.append(frame)
-                if done % 20 == 0 or done == len(chunks):
-                    elapsed = time.time() - started
-                    rate = done / elapsed
-                    print(
-                        f"    {done}/{len(chunks)} chunks  {elapsed / 60:.1f}m elapsed  "
-                        f"eta {(len(chunks) - done) / rate / 60:.1f}m",
-                        flush=True,
-                    )
+        if pending:
+            with mp.Pool(
+                processes=args.workers, initializer=_init_worker, initargs=(paths,)
+            ) as pool:
+                for done, (chunk, frame) in enumerate(
+                    zip(pending, pool.imap(_run_chunk, pending), strict=False), start=1
+                ):
+                    frame.to_parquet(_checkpoint_path(checkpoints, chunk), index=False)
+                    if done % 20 == 0 or done == len(pending):
+                        elapsed = time.time() - started
+                        rate = done / elapsed
+                        print(
+                            f"    {done}/{len(pending)} chunks  {elapsed / 60:.1f}m elapsed  "
+                            f"eta {(len(pending) - done) / rate / 60:.1f}m",
+                            flush=True,
+                        )
+
+        collected = [pd.read_parquet(_checkpoint_path(checkpoints, chunk)) for chunk in chunks]
         decisions = pd.concat(collected, ignore_index=True)
         decisions = decisions.sort_values(["symbol", "engine", "timestamp"]).reset_index(drop=True)
         target = out_dir / f"decisions_{variant}.parquet"

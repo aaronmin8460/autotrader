@@ -409,3 +409,65 @@ def test_audit_splits_declare_the_embargo_the_study_actually_arranged() -> None:
         assert split.embargo_bars == TRAIN_TEST_GAP_BARS
         assert split.test_start - split.train_end == TRAIN_TEST_GAP_BARS
     assert audit_splits(splits, require_disjoint_tests=True).clean
+
+
+def test_checkpoint_path_identifies_exactly_what_a_chunk_covers(tmp_path) -> None:
+    """A resumed run recognises finished work by name, not by a separate index.
+
+    Symbol, fold and decision range identify a chunk completely. Naming the file
+    after them means the files on disk cannot disagree with an index describing
+    them, because there is no index.
+    """
+    from studies.crypto_v1_v5.run_scoring import _checkpoint_path
+    from studies.crypto_v1_v5.scoring import ScoringChunk
+
+    first = ScoringChunk(
+        symbol="BTC/USD",
+        first_decision_index=2400,
+        last_decision_index=2639,
+        artifact_record={},
+        fold_id="W01",
+    )
+    second = ScoringChunk(
+        symbol="BTC/USD",
+        first_decision_index=2640,
+        last_decision_index=2879,
+        artifact_record={},
+        fold_id="W01",
+    )
+    other_symbol = ScoringChunk(
+        symbol="ETH/USD",
+        first_decision_index=2400,
+        last_decision_index=2639,
+        artifact_record={},
+        fold_id="W01",
+    )
+
+    paths = {_checkpoint_path(tmp_path, chunk) for chunk in (first, second, other_symbol)}
+
+    assert len(paths) == 3
+    assert "/" not in _checkpoint_path(tmp_path, first).name
+
+
+def test_reuse_artifacts_refuses_a_partially_present_model_set(tmp_path) -> None:
+    """Scoring some folds against stored models and others against fresh ones is not a run.
+
+    A missing artifact has to stop the run rather than silently fall back to
+    refitting that one fold, because the result would be scored against a model
+    set nobody could identify afterwards.
+    """
+    import pandas as pd
+    from studies.crypto_v1_v5.run_scoring import load_all_folds
+
+    bars = wave(400)
+    bars["timestamp"] = pd.date_range("2024-01-01", periods=400, freq="15min", tz="UTC")
+    (tmp_path / "artifacts").mkdir()
+
+    with pytest.raises(FileNotFoundError, match="reuse-artifacts"):
+        load_all_folds(
+            {"BTC/USD": bars},
+            oos_start=bars["timestamp"].iloc[200],
+            holdout_windows=1,
+            out_dir=tmp_path,
+            variants=("selected",),
+        )
