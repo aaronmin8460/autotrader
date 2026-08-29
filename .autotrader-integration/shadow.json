@@ -1,0 +1,133 @@
+{
+  "base_sha": "bbc85f130e52422680f3b9c6646ab0f9248af61e",
+  "branch": "feat/decision-shadow",
+  "frontend_validated": false,
+  "generated_at": "2026-08-29T07:23:39+00:00",
+  "generator": "tools/integration/pipeline.py",
+  "head_before_provenance": "002dca6a0b69a5472dab3aba473ecd02f347d1d4",
+  "repair_attempts": 0,
+  "safety_invariants": [
+    {
+      "anchors": 3,
+      "invariant": "broker paper account only",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 4,
+      "invariant": "no live trading path",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 3,
+      "invariant": "UNKNOWN means no retry",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 3,
+      "invariant": "durable intent before submission",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 4,
+      "invariant": "at-most-once submission",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 3,
+      "invariant": "broker truth is authoritative",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 3,
+      "invariant": "reconciliation semantics",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 4,
+      "invariant": "global account safety",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 3,
+      "invariant": "5% per-symbol cap",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 3,
+      "invariant": "30% total exposure cap",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 4,
+      "invariant": "2% UTC-day loss halt",
+      "missing": [],
+      "status": "guarded"
+    },
+    {
+      "anchors": 4,
+      "invariant": "decision layer cannot reach the broker",
+      "missing": [],
+      "status": "guarded"
+    }
+  ],
+  "spec": "shadow-engine.md",
+  "spec_sha256": "9baf5f254d8c02fdc117c850f26adf2ecfdc2ad866ecb53d5b1dbda80cab42dc",
+  "spec_version": "1",
+  "stage": "shadow",
+  "status": "GREEN",
+  "title": "Shadow engine",
+  "validation": [
+    {
+      "command": "/Volumes/AUTOTRADER_QA/worktrees/shadow-engine/.venv/bin/python -m pip install --quiet -e .[dev]",
+      "exit_code": 0,
+      "name": "install dev dependencies",
+      "passed": true
+    },
+    {
+      "command": "/Volumes/AUTOTRADER_QA/worktrees/shadow-engine/.venv/bin/python -m pytest -q",
+      "exit_code": 0,
+      "name": "pytest -q",
+      "passed": true
+    },
+    {
+      "command": "/Volumes/AUTOTRADER_QA/worktrees/shadow-engine/.venv/bin/python -m ruff check .",
+      "exit_code": 0,
+      "name": "ruff check .",
+      "passed": true
+    },
+    {
+      "command": "/Volumes/AUTOTRADER_QA/worktrees/shadow-engine/.venv/bin/python -m ruff format --check .",
+      "exit_code": 0,
+      "name": "ruff format --check .",
+      "passed": true
+    },
+    {
+      "command": "git -C /Volumes/AUTOTRADER_QA/worktrees/shadow-engine diff --check",
+      "exit_code": 0,
+      "name": "git diff --check",
+      "passed": true
+    },
+    {
+      "command": "git -C /Volumes/AUTOTRADER_QA/worktrees/shadow-engine diff --check bbc85f130e52422680f3b9c6646ab0f9248af61e HEAD",
+      "exit_code": 0,
+      "name": "git diff --check bbc85f130e52 HEAD",
+      "passed": true
+    },
+    {
+      "command": "/Volumes/AUTOTRADER_QA/worktrees/shadow-engine/.venv/bin/python -m pytest -q -k test_a_broker_order_needs_a_real_intent or test_a_crash_after_the_claim_but_before_the_intent_does_not_replay_the_bar or test_a_created_intent_with_a_broker_order_is_repaired_not_resubmitted or test_a_duplicate_client_order_id_is_rejected or test_a_duplicate_signal_is_recorded_once_and_does_not_multiply_orders or test_a_green_pass_does_not_override_a_standing_account_halt or test_a_live_base_url_is_refused or test_a_non_durable_intent_can_never_reach_the_broker or test_a_stale_local_order_snapshot_is_repaired_from_broker_truth or test_a_stale_local_position_is_overwritten_by_broker_truth or test_a_submitting_intent_is_treated_as_ambiguous_not_as_unsent or test_a_symbol_over_its_cap_is_reported_as_breached or test_an_ambiguous_submission_is_recorded_unknown_and_never_retried or test_an_unknown_intent_keeps_its_client_order_id_for_recovery or test_better_than_minus_two_percent_does_not_trigger_the_halt or test_broker_position_is_authoritative_over_local_snapshot or test_crypto_and_equity_share_one_global_exposure_limit or test_crypto_cannot_trade_after_equity_unknown_order or test_default_policy_is_exactly_five_thirty_two_percent or test_equity_cannot_trade_after_crypto_unknown_order or test_exactly_minus_two_percent_daily_pnl_rejects_a_buy or test_full_universe_reconciliation_clears_global_halt_only_when_safe or test_full_universe_reconciliation_is_account_authoritative or test_global_exposure_race_cannot_approve_two_orders_from_same_free_capacity or test_live_mode_cannot_be_constructed_from_execution_api or test_no_cli_option_can_request_live_trading or test_only_the_execution_package_imports_a_broker_trading_client or test_reconciliation_reaches_the_broker_only_through_the_execution_boundary or test_strategy_module_imports_no_broker_client or test_the_approved_notional_never_exceeds_the_five_percent_cap_exactly or test_the_daily_halt_is_measured_against_start_of_day_equity_only or test_the_halt_is_not_cleared_by_time_passing or test_the_integrated_system_has_no_live_path or test_the_intent_is_committed_before_the_broker_is_called or test_the_order_api_exists_only_inside_the_paper_execution_boundary or test_the_paper_env_gate_cannot_bypass_a_failed_reconciliation or test_the_real_client_factory_produces_a_provably_paper_client or test_the_source_contains_no_live_trading_path or test_the_trading_client_is_always_constructed_with_paper_true or test_total_exposure_limit_constrains_quantity",
+      "exit_code": 0,
+      "name": "safety regression (critical invariants)",
+      "passed": true
+    }
+  ]
+}
