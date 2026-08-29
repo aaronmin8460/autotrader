@@ -379,8 +379,87 @@ __all__ = [
     "pivot_signals",
     "regime_breakdown",
     "replay_engine",
+    "representative_disagreements",
     "series_engine",
     "signal_distribution",
     "splits_for_folds",
     "stability",
 ]
+
+
+def representative_disagreements(
+    bars: pd.DataFrame,
+    decisions: pd.DataFrame,
+    *,
+    left: str = "v1",
+    right: str = "v5",
+    count: int = 6,
+    forward_bars: int = 96,
+) -> pd.DataFrame:
+    """A deterministic, evenly spaced sample of instants where two engines differed.
+
+    **Chosen by position, never by outcome.** The disagreements are ordered in
+    time and sampled at even intervals, so the sample cannot be steered towards
+    the cases that flatter either engine. The forward return over the next
+    `forward_bars` is attached to each one and reported whatever it says: an
+    example set drawn only from the occasions an engine was right is an
+    advertisement, not evidence.
+
+    The forward return is what the market did next, not what either engine
+    earned. Whether a proposal became a position depends on the state the
+    simulator was in, which is the replay's question rather than this table's.
+    """
+    wide = pivot_signals(decisions)
+    if wide.empty or left not in wide.columns or right not in wide.columns:
+        return pd.DataFrame()
+    differing = wide[wide[left] != wide[right]]
+    if differing.empty:
+        return pd.DataFrame()
+
+    positions = (
+        range(0, len(differing), max(1, len(differing) // count))
+        if len(differing) > count
+        else range(len(differing))
+    )
+    closes = bars.set_index("timestamp")["close"]
+    rows: list[dict[str, object]] = []
+    for position in list(positions)[:count]:
+        moment = differing.index[position]
+        if moment not in closes.index:
+            continue
+        start_index = int(closes.index.get_loc(moment))
+        end_index = min(start_index + forward_bars, len(closes) - 1)
+        entry = float(closes.iloc[start_index])
+        forward = (float(closes.iloc[end_index]) - entry) / entry if entry else float("nan")
+        rows.append(
+            {
+                "timestamp": moment,
+                left: differing.loc[moment, left],
+                right: differing.loc[moment, right],
+                "forward_return_24h": forward,
+                "favoured": (
+                    "neither"
+                    if abs(forward) < 1e-9
+                    else _favoured(
+                        differing.loc[moment, left], differing.loc[moment, right], forward
+                    )
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _favoured(left_signal: str, right_signal: str, forward: float) -> str:
+    """Which of two differing directions the next move actually rewarded."""
+
+    def scored(signal: str) -> float:
+        if signal == "BUY":
+            return forward
+        if signal == "SELL":
+            return -forward
+        return 0.0
+
+    left_score, right_score = scored(left_signal), scored(right_signal)
+    if left_score == right_score:
+        return "neither"
+    return "left" if left_score > right_score else "right"
