@@ -1472,7 +1472,10 @@ def step(paths: orch.Paths) -> int:
         orch.log(paths, f"DEVELOPMENT PIPELINE GREEN; report {report}")
         return orch.EXIT_OK
     except orch.Stop as stop:
-        return hard_stop(paths, state, str(state.get("state", "?")), stop.reason)
+        # Keyed by the pipeline itself: a stop raised out of the driver belongs
+        # to no single stage, and using the current state name as a key would
+        # invent a stage record nothing ever reads.
+        return hard_stop(paths, state, "pipeline", stop.reason)
     finally:
         lock.release()
 

@@ -1091,3 +1091,19 @@ def test_nothing_is_published_while_validation_is_red(
 
     assert published == []
     assert pipeline.stopped(state)
+
+
+def test_a_stop_raised_by_the_driver_is_keyed_to_the_pipeline(
+    workspace: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not to whatever state happened to be current, which is not a stage."""
+    paths = paths_for(workspace)
+    monkeypatch.setattr(
+        pipeline, "advance_v4_prep", lambda *_a: (_ for _ in ()).throw(orch.Stop("boom"))
+    )
+
+    assert pipeline.step(paths) == orch.EXIT_MANUAL_REVIEW
+
+    stored = pipeline.load_pipeline(paths)
+    assert set(stored["stages"]) == {"pipeline"}
+    assert stored["hard_stop"]["stage"] == "pipeline"
