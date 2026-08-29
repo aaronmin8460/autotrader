@@ -1,4 +1,4 @@
-"""The local SQLite operational-state store (schema v6).
+"""The local SQLite operational-state store (schema v7).
 
 This module is **persistence infrastructure and nothing else**. It opens a
 local SQLite database, creates a small fixed schema, and stores a handful of
@@ -44,6 +44,22 @@ in-process pause cannot cross a process boundary or survive a restart. Second,
 each assuming the whole call allowance is theirs is how a retry storm starts.
 Both are additive - one new table each, no existing table touched.
 
+**What v7 changed, and why.** Shadow mode evaluates every decision engine
+version on a bar while exactly one of them is allowed to produce an execution
+candidate, and the four observational answers had nowhere to live.
+`shadow_decisions` is that record: one row per (symbol, bar, engine version),
+carrying the decision, its provenance, and an explicit executed / not-executed
+designation. Additive - one new table, no existing table touched.
+
+Two of its guarantees are in the schema rather than in a caller, because they
+are the whole point of the table. A row may only be marked `EXECUTED` when its
+`engine_version` equals the `execution_version` that was configured, so an
+observational version cannot be recorded as having executed even by a writer
+that bypassed this module; and a partial unique index permits **at most one**
+`EXECUTED` row per (symbol, bar), so five versions deciding on one bar cannot
+become two executions. Neither rule can be honoured by convention alone, which
+is why neither is left to one.
+
 **What is still deliberately absent.** There is no `fills`, `executions`, or
 `broker_accounts` table. Order-level `filled_quantity` carries everything
 reconciliation actually needs, and a fill-level history would be a table this
@@ -81,10 +97,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 #: The schema this module understands. There is no migration *framework*, but
-#: there is an explicit ordered upgrade path - v1 -> v2 -> v3 -> v4 -> v5 -> v6 -
-#: applied in a single transaction by `initialize_database`. A database written
-#: by a **newer** version is refused, never downgraded.
-SCHEMA_VERSION = 6
+#: there is an explicit ordered upgrade path - v1 -> v2 -> v3 -> v4 -> v5 -> v6
+#: -> v7 - applied in a single transaction by `initialize_database`. A database
+#: written by a **newer** version is refused, never downgraded.
+SCHEMA_VERSION = 7
 
 #: The oldest on-disk version this module can still open. Anything below it
 #: predates the migration path and is refused rather than guessed at.
@@ -117,6 +133,7 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "runtime_checkpoints",
     "account_safety_state",
     "api_budget_windows",
+    "shadow_decisions",
 )
 
 #: The tables v2 added on top of v1. Kept separate so the v1 -> v2 migration
@@ -139,6 +156,12 @@ V5_TABLES: tuple[str, ...] = ("runtime_checkpoints",)
 #: state: `account_safety_state` records this system's own halt, and
 #: `api_budget_windows` records this system's own request accounting.
 V6_TABLES: tuple[str, ...] = ("account_safety_state", "api_budget_windows")
+
+#: The table v7 adds on top of v6: the per-version decision record shadow mode
+#: writes. It is an observation log, not a control - nothing reads it to decide
+#: whether an order may be placed, and the risk engine remains the only
+#: authority over that.
+V7_TABLES: tuple[str, ...] = ("shadow_decisions",)
 
 #: Transient names the v2 -> v3 rebuild parks the old tables under. They exist
 #: only inside the migration transaction and are dropped before it commits, so
@@ -287,6 +310,45 @@ API_BUDGET_MARKET_DATA = "MARKET_DATA"
 
 API_BUDGETS: tuple[str, ...] = (API_BUDGET_TRADING, API_BUDGET_MARKET_DATA)
 
+#: The direction vocabulary a recorded decision may take (schema v7).
+#:
+#: The decision layer's three signals, spelled out here rather than imported.
+#: This module imports only the standard library and must keep doing so - a
+#: persistence layer that needed pandas to open a database would be a strange
+#: thing - so the three strings are declared and a test pins them to
+#: `autotrader.decision.contract.DecisionSignal`. `EXIT` is absent on purpose:
+#: that is the C3 strategy's word and it lives in `signals`, whereas a decision
+#: engine speaks `SELL`.
+SHADOW_SIGNALS: tuple[str, ...] = ("BUY", "HOLD", "SELL")
+
+#: Whether a recorded decision was released to the execution path (schema v7).
+#:
+#: `EXECUTED`     this decision was the one execution candidate for its bar. It
+#:                says the candidate was *released*, never that an order exists:
+#:                risk, the account gates and reconciliation all still stand
+#:                between a candidate and a broker, and this table is written
+#:                before any of them are consulted.
+#: `NOT_EXECUTED` every other row. That is the four observational versions, and
+#:                also the configured version on a bar where it named no
+#:                direction - a HOLD releases nothing, so there is nothing to
+#:                designate as executed.
+SHADOW_DESIGNATION_EXECUTED = "EXECUTED"
+SHADOW_DESIGNATION_NOT_EXECUTED = "NOT_EXECUTED"
+
+SHADOW_DESIGNATIONS: tuple[str, ...] = (
+    SHADOW_DESIGNATION_EXECUTED,
+    SHADOW_DESIGNATION_NOT_EXECUTED,
+)
+
+#: How a decision's reason tokens are joined into one stored column.
+#:
+#: A single space, because a reason is a stable machine token - `LOW_CONFIDENCE`,
+#: `TIMEFRAMES_ALIGNED_BULLISH` - and never prose. A token containing whitespace
+#: is refused on write rather than silently split in half on read, so the
+#: round-trip is exact for every token this system can produce and impossible
+#: for one it cannot.
+REASON_SEPARATOR = " "
+
 TIMESTAMP_FORMAT = "YYYY-MM-DDTHH:MM:SS.ffffff+00:00"
 
 
@@ -340,6 +402,30 @@ class UnknownOrderIntentError(StateError):
 
 class UnknownReconciliationRunError(StateError):
     """The referenced `reconciliation_runs.id` does not exist."""
+
+
+class DuplicateShadowDecisionError(StateError):
+    """That engine version has already decided this symbol's bar.
+
+    One completed bar is one decision per version, so a second row for the same
+    (symbol, bar, version) is a replay rather than new information. Refused
+    rather than stored twice: a comparison across versions counts rows, and a
+    duplicated bar would weight it.
+    """
+
+
+class ConflictingExecutedDecisionError(StateError):
+    """A second execution candidate was recorded for one symbol's bar.
+
+    The one that matters. Five versions evaluate a bar and exactly one may be
+    released to the execution path, so a second `EXECUTED` row means something
+    tried to turn one bar into two executions. The write is refused by a unique
+    index, which is to say it is refused whether or not the caller checked.
+    """
+
+
+class UnknownShadowDecisionError(StateError):
+    """The referenced shadow decision does not exist."""
 
 
 class DuplicateBrokerOrderError(StateError):
@@ -577,6 +663,63 @@ def _require_average_price(value: float | None, field: str = "average_price") ->
     if not math.isfinite(price) or price <= 0:
         raise StateInputError(f"{field} must be finite and greater than zero, got {value!r}.")
     return price
+
+
+def _require_within(value: float, lower: float, upper: float, field: str) -> float:
+    """Require a finite number inside an inclusive range.
+
+    NaN is rejected here rather than left to SQL. SQLite stores a NaN as NULL,
+    so a `CHECK (score >= -1.0)` would never see it and the `NOT NULL` that
+    caught it would report a confusing constraint - whereas an unmeasurable
+    score is a caller error worth naming.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StateInputError(f"{field} must be a number, got {type(value).__name__}.")
+    number = float(value)
+    if not math.isfinite(number):
+        raise StateInputError(f"{field} must be finite, got {value!r}.")
+    if not lower <= number <= upper:
+        raise StateInputError(f"{field} must be within [{lower}, {upper}], got {number}.")
+    return number
+
+
+def to_reason_text(values: tuple[str, ...] | list[str], field: str = "reasons") -> str:
+    """Join reason tokens into the one stored form.
+
+    A decision that cannot say why it was reached is not auditable, so an empty
+    sequence is refused. So is a token carrying whitespace: the stored column is
+    separator-joined, and splitting such a token on read would hand back two
+    reasons where one was written. Refusing is the honest answer - every reason
+    this system produces is a single machine token, and one that is not is a bug
+    in whoever produced it rather than something to store approximately.
+    """
+    if isinstance(values, str) or not isinstance(values, (tuple, list)):
+        raise StateInputError(
+            f"{field} must be a tuple or list of tokens, got {type(values).__name__}."
+        )
+    if not values:
+        raise StateInputError(
+            f"{field} must not be empty: a decision that cannot say why it was reached is "
+            "not auditable, and HOLD needs a reason more than BUY does."
+        )
+    tokens: list[str] = []
+    for token in values:
+        text = _require_text(token, f"{field} token")
+        if text.split() != [text]:
+            raise StateInputError(
+                f"{field} token {text!r} contains whitespace. Reasons are stored as a "
+                f"{REASON_SEPARATOR!r}-joined list of machine tokens, and one with a space "
+                "in it would be read back as two."
+            )
+        tokens.append(text)
+    return REASON_SEPARATOR.join(tokens)
+
+
+def from_reason_text(text: object, field: str = "reasons") -> tuple[str, ...]:
+    """Split a stored reason column back into its tokens."""
+    if not isinstance(text, str) or not text.split():
+        raise DatabaseStateError(f"Stored {field} {text!r} holds no reason token.")
+    return tuple(text.split())
 
 
 # --------------------------------------------------------------------------
@@ -828,6 +971,59 @@ class AccountSafetyState:
     def safe_to_trade(self) -> bool:
         """Whether any process may submit a new order. Read this, not `state`."""
         return self.state == ACCOUNT_SAFETY_SAFE
+
+
+@dataclass(frozen=True)
+class ShadowDecision:
+    """What one decision engine version decided about one symbol's bar (schema v7).
+
+    An audit record of a decision, not of an order. Every version that ran on a
+    bar leaves one of these, and `designation` says which single one of them was
+    released to the execution path - `EXECUTED` - and which were purely
+    observational. It is written **before** anything downstream is consulted, so
+    `EXECUTED` means "this was the candidate", never "this became an order".
+
+    `feature_version` and `model_version` are None for an engine that has
+    neither, which is a fact about that engine rather than a missing value: the
+    EMA crossover computes no standardized feature schema and carries no trained
+    model, and inventing version strings for it would falsify its provenance.
+
+    **The linkage that makes a later score possible.** `symbol` and
+    `bar_timestamp` locate the exact bar, so any recorded decision - executed or
+    not - can be scored against the price action that followed it, which is the
+    only outcome an observational decision ever has. `client_order_id` is the
+    additional anchor for the one decision that was released: it names the order
+    intent that carried it, so an executed decision can also be scored against
+    what the broker actually did. It stays None until an intent exists, and the
+    schema refuses to attach one to an observational row.
+    """
+
+    id: int
+    strategy_run_id: int | None
+    bar_timestamp: datetime
+    symbol: str
+    engine_version: str
+    signal: str
+    score: float
+    confidence: float
+    regime: str
+    reasons: tuple[str, ...]
+    feature_version: str | None
+    model_version: str | None
+    execution_version: str
+    designation: str
+    client_order_id: str | None
+    created_at: datetime
+
+    @property
+    def executed(self) -> bool:
+        """Whether this decision was the bar's one execution candidate."""
+        return self.designation == SHADOW_DESIGNATION_EXECUTED
+
+    @property
+    def observational(self) -> bool:
+        """Whether this decision was recorded without being allowed to act."""
+        return not self.executed
 
 
 @dataclass(frozen=True)
@@ -1173,6 +1369,72 @@ _CREATE_API_BUDGET_WINDOWS = """
     )
     """
 
+# --------------------------------------------------------------------------
+# Shadow decisions (schema v7)
+#
+# One row per (symbol, completed bar, engine version). Five versions evaluating
+# one bar leave five rows, of which at most one is designated `EXECUTED`.
+#
+# Three of the constraints below are the load-bearing ones, and all three are in
+# SQL because a rule that only holds when the caller remembers it is not a rule:
+#
+#   `UNIQUE (symbol, bar_timestamp, engine_version)` - a replayed bar cannot
+#   record a version's decision twice, so a comparison across versions counts
+#   bars rather than retries.
+#
+#   `CHECK (designation = 'NOT_EXECUTED' OR engine_version = execution_version)`
+#   - an observational version cannot be stored as having executed. Which
+#   version was allowed to execute is written on every row, so the check is
+#   against the record's own statement of the configuration rather than against
+#   something a reader has to go and look up.
+#
+#   `CHECK (client_order_id IS NULL OR designation = 'EXECUTED')` - an
+#   observational decision cannot be linked to an order, because it never
+#   produced one.
+#
+# The fourth is the partial unique index below the table.
+# --------------------------------------------------------------------------
+
+_CREATE_SHADOW_DECISIONS = """
+    CREATE TABLE shadow_decisions (
+        id                INTEGER PRIMARY KEY,
+        strategy_run_id   INTEGER REFERENCES strategy_runs (id),
+        bar_timestamp     TEXT NOT NULL CHECK (bar_timestamp <> ''),
+        symbol            TEXT NOT NULL CHECK (symbol <> ''),
+        engine_version    TEXT NOT NULL CHECK (engine_version <> ''),
+        signal            TEXT NOT NULL CHECK (signal IN ('BUY', 'HOLD', 'SELL')),
+        score             REAL NOT NULL CHECK (score >= -1.0 AND score <= 1.0),
+        confidence        REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        regime            TEXT NOT NULL CHECK (regime <> ''),
+        reasons           TEXT NOT NULL CHECK (reasons <> ''),
+        feature_version   TEXT,
+        model_version     TEXT,
+        execution_version TEXT NOT NULL CHECK (execution_version <> ''),
+        designation       TEXT NOT NULL CHECK (
+            designation IN ('EXECUTED', 'NOT_EXECUTED')
+        ),
+        client_order_id   TEXT,
+        created_at        TEXT NOT NULL,
+        UNIQUE (symbol, bar_timestamp, engine_version),
+        CHECK (designation = 'NOT_EXECUTED' OR engine_version = execution_version),
+        CHECK (client_order_id IS NULL OR designation = 'EXECUTED')
+    )
+    """
+
+#: **At most one execution per bar, enforced by the database.**
+#:
+#: A partial unique index over (symbol, bar_timestamp) restricted to the
+#: executed rows. Five versions can decide one bar, and the second attempt to
+#: designate one of them as the execution candidate fails - not because the
+#: writer checked, but because there is nowhere for the row to go. This is the
+#: durable half of "evaluating five versions costs one execution decision"; the
+#: in-process half is that only one version is ever offered as a candidate.
+_CREATE_INDEX_SHADOW_DECISIONS_ONE_EXECUTION = """
+    CREATE UNIQUE INDEX idx_shadow_decisions_one_execution
+    ON shadow_decisions (symbol, bar_timestamp)
+    WHERE designation = 'EXECUTED'
+    """
+
 #: A fresh database is built directly from these, at `SCHEMA_VERSION`. It is
 #: never created at v1 and then migrated forward.
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
@@ -1190,10 +1452,12 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     _CREATE_RUNTIME_CHECKPOINTS,
     _CREATE_ACCOUNT_SAFETY_STATE,
     _CREATE_API_BUDGET_WINDOWS,
+    _CREATE_SHADOW_DECISIONS,
     _CREATE_INDEX_SIGNALS,
     _CREATE_INDEX_RISK_EVENTS,
     _CREATE_INDEX_ORDER_INTENTS_STATUS,
     _CREATE_INDEX_RECONCILIATION_EVENTS,
+    _CREATE_INDEX_SHADOW_DECISIONS_ONE_EXECUTION,
 )
 
 # --------------------------------------------------------------------------
@@ -1647,16 +1911,55 @@ def _migrate_v5_to_v6(connection: sqlite3.Connection) -> None:
     connection.execute(_CREATE_API_BUDGET_WINDOWS)
 
 
+def _migrate_v6_to_v7(connection: sqlite3.Connection) -> None:
+    """Add the per-version shadow decision record.
+
+    Purely additive, exactly like v4 -> v5 and v5 -> v6: one new table and its
+    index, no existing table touched, no column widened, no row rewritten. Every
+    order intent, broker snapshot, risk event, daily baseline, runtime
+    checkpoint, reconciliation run, account safety row and API budget window is
+    carried across untouched because nothing here reads or writes them.
+
+    **The table starts empty, and no history is reconstructed into it.** A
+    shadow decision is a record that a specific engine version was run on a
+    specific bar. This database has never run one, and deriving rows from
+    `signals` would be inventing which version decided what - the stored signals
+    were produced by the C3 crossover, not by a versioned engine panel, and
+    labelling them as one version's shadow output would be a fabricated audit
+    trail rather than a migration.
+
+    **It opens nothing.** The table is an observation log with no reader in the
+    execution path: no gate consults it, no runtime prefers a version because of
+    it, and adding it changes what this system trades by nothing at all.
+
+    Runs inside the caller's transaction, so a failure anywhere in the upgrade
+    rolls this table back with the rest of it.
+    """
+    existing = _existing_table_names(connection)
+    conflicting = sorted(table for table in V7_TABLES if table in existing)
+    if conflicting:
+        raise DatabaseStateError(
+            f"Cannot upgrade this database to schema version {SCHEMA_VERSION}: it "
+            f"already contains table(s) {', '.join(conflicting)}. Refusing to "
+            "migrate over an inconsistent database."
+        )
+
+    connection.execute(_CREATE_SHADOW_DECISIONS)
+    connection.execute(_CREATE_INDEX_SHADOW_DECISIONS_ONE_EXECUTION)
+
+
 #: Each supported upgrade, in order: the version it produces and how to get
 #: there. `initialize_database` runs every step above the database's current
-#: version, in one transaction, so v1 -> v6 is v1 -> v2 -> v3 -> v4 -> v5 -> v6
-#: and never a separate shortcut path that could drift from any of them.
+#: version, in one transaction, so v1 -> v7 is
+#: v1 -> v2 -> v3 -> v4 -> v5 -> v6 -> v7 and never a separate shortcut path
+#: that could drift from any of them.
 _MIGRATIONS = (
     (2, _migrate_v1_to_v2),
     (3, _migrate_v2_to_v3),
     (4, _migrate_v3_to_v4),
     (5, _migrate_v4_to_v5),
     (6, _migrate_v5_to_v6),
+    (7, _migrate_v6_to_v7),
 )
 
 
@@ -3198,6 +3501,297 @@ def prune_api_budget_windows(connection: sqlite3.Connection, *, before: datetime
         return int(cursor.rowcount or 0)
 
 
+# --------------------------------------------------------------------------
+# Shadow decisions (schema v7)
+#
+# Persistence only, and observational persistence at that. Writing a decision
+# here is not making one, and designating one `EXECUTED` is not executing it:
+# this module stores what a caller says happened and enforces the two counting
+# rules that make the record trustworthy - one decision per version per bar, and
+# at most one execution candidate per bar. Which engine was allowed to execute
+# is the caller's configuration, and the row records it rather than deciding it.
+# --------------------------------------------------------------------------
+
+_INSERT_SHADOW_DECISION = """
+INSERT INTO shadow_decisions
+    (strategy_run_id, bar_timestamp, symbol, engine_version, signal, score, confidence,
+     regime, reasons, feature_version, model_version, execution_version, designation,
+     client_order_id, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+"""
+_SELECT_SHADOW_DECISION = """
+SELECT id, strategy_run_id, bar_timestamp, symbol, engine_version, signal, score, confidence,
+       regime, reasons, feature_version, model_version, execution_version, designation,
+       client_order_id, created_at
+FROM shadow_decisions
+WHERE symbol = ? AND bar_timestamp = ? AND engine_version = ?
+"""
+_SELECT_SHADOW_DECISIONS = """
+SELECT id, strategy_run_id, bar_timestamp, symbol, engine_version, signal, score, confidence,
+       regime, reasons, feature_version, model_version, execution_version, designation,
+       client_order_id, created_at
+FROM shadow_decisions
+ORDER BY bar_timestamp, symbol, engine_version, id
+"""
+_SELECT_SHADOW_DECISIONS_FOR_SYMBOL = """
+SELECT id, strategy_run_id, bar_timestamp, symbol, engine_version, signal, score, confidence,
+       regime, reasons, feature_version, model_version, execution_version, designation,
+       client_order_id, created_at
+FROM shadow_decisions
+WHERE symbol = ?
+ORDER BY bar_timestamp, engine_version, id
+"""
+_SELECT_SHADOW_EXECUTED_FOR_BAR = """
+SELECT engine_version FROM shadow_decisions
+WHERE symbol = ? AND bar_timestamp = ? AND designation = 'EXECUTED'
+"""
+_UPDATE_SHADOW_DECISION_ORDER = """
+UPDATE shadow_decisions SET client_order_id = ?
+WHERE symbol = ? AND bar_timestamp = ? AND engine_version = ?
+"""
+
+
+def _to_shadow_decision(row: sqlite3.Row) -> ShadowDecision:
+    run_id = row["strategy_run_id"]
+    feature_version = row["feature_version"]
+    model_version = row["model_version"]
+    client_order_id = row["client_order_id"]
+    return ShadowDecision(
+        id=int(row["id"]),
+        strategy_run_id=None if run_id is None else int(run_id),
+        bar_timestamp=from_utc_text(row["bar_timestamp"]),
+        symbol=str(row["symbol"]),
+        engine_version=str(row["engine_version"]),
+        signal=str(row["signal"]),
+        score=float(row["score"]),
+        confidence=float(row["confidence"]),
+        regime=str(row["regime"]),
+        reasons=from_reason_text(row["reasons"]),
+        feature_version=None if feature_version is None else str(feature_version),
+        model_version=None if model_version is None else str(model_version),
+        execution_version=str(row["execution_version"]),
+        designation=str(row["designation"]),
+        client_order_id=None if client_order_id is None else str(client_order_id),
+        created_at=from_utc_text(row["created_at"]),
+    )
+
+
+def record_shadow_decision(
+    connection: sqlite3.Connection,
+    *,
+    bar_timestamp: datetime,
+    symbol: str,
+    engine_version: str,
+    signal: str,
+    score: float,
+    confidence: float,
+    regime: str,
+    reasons: tuple[str, ...] | list[str],
+    execution_version: str,
+    designation: str,
+    strategy_run_id: int | None = None,
+    feature_version: str | None = None,
+    model_version: str | None = None,
+) -> int:
+    """Record one engine version's decision about one symbol's bar.
+
+    Storing a decision is not acting on one, and this function cannot be made to
+    act on one: it writes a row and returns its id. There is no side effect, no
+    broker, and nothing here consults risk or the account gates - a row
+    designated `EXECUTED` records that a candidate was released to the layers
+    that do, and says nothing about what they concluded.
+
+    Three refusals matter, and two of them are the database's rather than this
+    function's, so they hold against a writer that never called it:
+
+    A second decision for the same (symbol, bar, engine version) raises
+    `DuplicateShadowDecisionError`. One bar is one decision per version, and a
+    replayed bar must not double a version's row count.
+
+    A second `EXECUTED` decision for the same (symbol, bar) raises
+    `ConflictingExecutedDecisionError`. This is the rule that keeps five
+    evaluations costing one execution.
+
+    Designating a version other than `execution_version` as executed is refused
+    outright. An observational engine has no route to an executed record even by
+    a caller that passes the wrong pair.
+    """
+    ticker = _require_symbol(symbol)
+    version = _require_text(engine_version, "engine_version")
+    configured = _require_text(execution_version, "execution_version")
+    direction = _require_choice(signal, "signal", SHADOW_SIGNALS)
+    designated = _require_choice(designation, "designation", SHADOW_DESIGNATIONS)
+    regime_text = _require_text(regime, "regime")
+    reason_text = to_reason_text(reasons)
+    numeric_score = _require_within(score, -1.0, 1.0, "score")
+    numeric_confidence = _require_within(confidence, 0.0, 1.0, "confidence")
+    feature_text = _optional_text(feature_version, "feature_version")
+    model_text = _optional_text(model_version, "model_version")
+    bar_text = to_utc_text(bar_timestamp, "bar_timestamp")
+    if designated == SHADOW_DESIGNATION_EXECUTED and version != configured:
+        raise StateInputError(
+            f"Engine version {version!r} cannot be recorded as executed on a bar whose "
+            f"configured execution version is {configured!r}. Exactly one version may "
+            "produce an execution candidate, and it is not this one."
+        )
+    try:
+        with transaction(connection):
+            cursor = connection.execute(
+                _INSERT_SHADOW_DECISION,
+                (
+                    strategy_run_id,
+                    bar_text,
+                    ticker,
+                    version,
+                    direction,
+                    numeric_score,
+                    numeric_confidence,
+                    regime_text,
+                    reason_text,
+                    feature_text,
+                    model_text,
+                    configured,
+                    designated,
+                    _now_text(),
+                ),
+            )
+    except sqlite3.IntegrityError as error:
+        raise _translate_shadow_integrity_error(
+            connection, error, ticker, bar_text, version, strategy_run_id
+        ) from None
+    return int(cursor.lastrowid)
+
+
+def _translate_shadow_integrity_error(
+    connection: sqlite3.Connection,
+    error: sqlite3.IntegrityError,
+    symbol: str,
+    bar_text: str,
+    engine_version: str,
+    strategy_run_id: int | None,
+) -> Exception:
+    """Turn a shadow-insert constraint failure into a specific state error.
+
+    Both unique rules raise `SQLITE_CONSTRAINT_UNIQUE` and SQLite names the
+    *columns* it found the conflict on rather than the index, so the two are told
+    apart by asking the database which rule the row would have broken - the
+    failed insert has already rolled back, and these reads see the committed
+    state that refused it. Parsing the driver's message would work today and
+    quietly stop distinguishing them on a SQLite that words it differently.
+
+    "A second execution was attempted" must not be reported as the far milder
+    "this version already decided that bar", which is why this bothers at all.
+    An unrecognised failure is returned unchanged rather than labelled as either.
+    """
+    if error.sqlite_errorname == "SQLITE_CONSTRAINT_UNIQUE":
+        recorded = connection.execute(
+            _SELECT_SHADOW_DECISION, (symbol, bar_text, engine_version)
+        ).fetchone()
+        if recorded is not None:
+            return DuplicateShadowDecisionError(
+                f"Engine version {engine_version!r} has already decided {symbol} at "
+                f"{bar_text}; refusing to store a second decision for one bar."
+            )
+        executed = connection.execute(
+            _SELECT_SHADOW_EXECUTED_FOR_BAR, (symbol, bar_text)
+        ).fetchone()
+        if executed is not None:
+            return ConflictingExecutedDecisionError(
+                f"{symbol} at {bar_text} already has an execution candidate "
+                f"({str(executed['engine_version'])!r}), so {engine_version!r} cannot be "
+                "recorded as a second one. One completed bar yields at most one "
+                "execution, however many versions decided on it."
+            )
+        return error
+    if error.sqlite_errorname == "SQLITE_CONSTRAINT_FOREIGNKEY":
+        return UnknownStrategyRunError(f"No strategy run with id {strategy_run_id!r}.")
+    if error.sqlite_errorname == "SQLITE_CONSTRAINT_CHECK":
+        return StateInputError(
+            f"The shadow decision for {engine_version!r} on {symbol} at {bar_text} "
+            f"violates a schema constraint: {error}"
+        )
+    return error
+
+
+def link_shadow_decision_order(
+    connection: sqlite3.Connection,
+    *,
+    symbol: str,
+    bar_timestamp: datetime,
+    engine_version: str,
+    client_order_id: str,
+) -> None:
+    """Anchor an executed decision to the order intent it produced.
+
+    The linkage that lets an executed decision be scored against what the broker
+    actually did rather than only against the price action that followed. It is
+    a separate call because the anchor does not exist yet when the decision is
+    recorded: the intent is created downstream, by the execution layer, after
+    risk has sized it - and a decision layer that knew an order id in advance
+    would be a decision layer that had already placed the order.
+
+    Observational decisions cannot be linked. They produced no order, so there
+    is nothing to name, and the schema refuses the write as well as this
+    function does.
+
+    Writing the same `client_order_id` twice is accepted and changes nothing.
+    Writing a *different* one is refused: an executed decision produced one
+    intent, and rewriting which would falsify the record.
+    """
+    ticker = _require_symbol(symbol)
+    version = _require_text(engine_version, "engine_version")
+    order_id = _require_text(client_order_id, "client_order_id")
+    bar_text = to_utc_text(bar_timestamp, "bar_timestamp")
+    with transaction(connection):
+        row = connection.execute(_SELECT_SHADOW_DECISION, (ticker, bar_text, version)).fetchone()
+        if row is None:
+            raise UnknownShadowDecisionError(
+                f"No decision is recorded for {version!r} on {ticker} at {bar_text}."
+            )
+        decision = _to_shadow_decision(row)
+        if decision.observational:
+            raise StateInputError(
+                f"The {version!r} decision for {ticker} at {bar_text} is observational, so "
+                "no order was placed for it and none can be linked to it."
+            )
+        if decision.client_order_id is not None and decision.client_order_id != order_id:
+            raise StateInputError(
+                f"The {version!r} decision for {ticker} at {bar_text} is already linked to "
+                f"{decision.client_order_id!r}; refusing to relink it to {order_id!r}."
+            )
+        connection.execute(_UPDATE_SHADOW_DECISION_ORDER, (order_id, ticker, bar_text, version))
+
+
+def get_shadow_decision(
+    connection: sqlite3.Connection,
+    *,
+    symbol: str,
+    bar_timestamp: datetime,
+    engine_version: str,
+) -> ShadowDecision | None:
+    """One version's decision about one bar, or None when it was never recorded."""
+    row = connection.execute(
+        _SELECT_SHADOW_DECISION,
+        (
+            _require_symbol(symbol),
+            to_utc_text(bar_timestamp, "bar_timestamp"),
+            _require_text(engine_version, "engine_version"),
+        ),
+    ).fetchone()
+    return None if row is None else _to_shadow_decision(row)
+
+
+def list_shadow_decisions(
+    connection: sqlite3.Connection, *, symbol: str | None = None
+) -> list[ShadowDecision]:
+    """Recorded decisions, oldest bar first, optionally for one symbol."""
+    if symbol is None:
+        rows = connection.execute(_SELECT_SHADOW_DECISIONS)
+    else:
+        rows = connection.execute(_SELECT_SHADOW_DECISIONS_FOR_SYMBOL, (_require_symbol(symbol),))
+    return [_to_shadow_decision(row) for row in rows]
+
+
 __all__ = [
     "ACCOUNT_SAFETY_SAFE",
     "ACCOUNT_SAFETY_STATES",
@@ -3209,11 +3803,13 @@ __all__ = [
     "AccountSafetyState",
     "ApiBudgetWindow",
     "BUSY_TIMEOUT_MS",
+    "ConflictingExecutedDecisionError",
     "DEFAULT_DATABASE_PATH",
     "DailyRiskBaseline",
     "DatabaseStateError",
     "DuplicateBrokerOrderError",
     "DuplicateOrderIntentError",
+    "DuplicateShadowDecisionError",
     "DuplicateSignalError",
     "INTENT_STATUS_CONFIRMED_NOT_SUBMITTED",
     "INTENT_STATUS_CREATED",
@@ -3232,6 +3828,7 @@ __all__ = [
     "RECONCILIATION_STATUS_FAILED",
     "RECONCILIATION_STATUS_REPAIRED",
     "RECONCILIATION_STATUS_UNRESOLVED",
+    "REASON_SEPARATOR",
     "REQUIRED_TABLES",
     "RUN_MODES",
     "RUN_STATUSES",
@@ -3243,7 +3840,12 @@ __all__ = [
     "RiskEvent",
     "RuntimeCheckpoint",
     "SCHEMA_VERSION",
+    "SHADOW_DESIGNATIONS",
+    "SHADOW_DESIGNATION_EXECUTED",
+    "SHADOW_DESIGNATION_NOT_EXECUTED",
+    "SHADOW_SIGNALS",
     "SIGNAL_TYPES",
+    "ShadowDecision",
     "StateError",
     "StateInputError",
     "StoredBrokerOrder",
@@ -3256,17 +3858,21 @@ __all__ = [
     "TIMESTAMP_FORMAT",
     "UnknownOrderIntentError",
     "UnknownReconciliationRunError",
+    "UnknownShadowDecisionError",
     "UnknownStrategyRunError",
     "UnsupportedSchemaVersionError",
     "V2_TABLES",
     "V3_TABLES",
     "V4_TABLES",
     "V5_TABLES",
+    "V6_TABLES",
+    "V7_TABLES",
     "connect",
     "consume_api_budget",
     "ensure_daily_risk_baseline",
     "finish_strategy_run",
     "from_decimal_text",
+    "from_reason_text",
     "from_risk_date_text",
     "from_utc_text",
     "get_api_budget_window",
@@ -3279,9 +3885,11 @@ __all__ = [
     "get_reconciliation_run",
     "get_runtime_checkpoint",
     "get_schema_version",
+    "get_shadow_decision",
     "get_strategy_run",
     "initialize_database",
     "latest_reconciliation_run",
+    "link_shadow_decision_order",
     "list_broker_orders",
     "list_daily_risk_baselines",
     "list_order_intents",
@@ -3290,6 +3898,7 @@ __all__ = [
     "list_reconciliation_runs",
     "list_risk_events",
     "list_runtime_checkpoints",
+    "list_shadow_decisions",
     "list_signals",
     "list_strategy_runs",
     "list_system_events",
@@ -3299,11 +3908,13 @@ __all__ = [
     "record_reconciliation_event",
     "record_reconciliation_run",
     "record_risk_event",
+    "record_shadow_decision",
     "record_signal",
     "record_strategy_run",
     "record_system_event",
     "set_account_safety_state",
     "to_decimal_text",
+    "to_reason_text",
     "to_risk_date_text",
     "to_utc_text",
     "transaction",

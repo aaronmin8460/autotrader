@@ -256,7 +256,7 @@ full-universe reconciliation does.
 ### 4. Schema version
 
 `preflight._database_checks` blocks unless the database's `schema_metadata`
-version equals `state.SCHEMA_VERSION` (6 after Combined Integration). It reads
+version equals `state.SCHEMA_VERSION` (7 after decision shadow mode). It reads
 the constant, so a schema bump needs no edit here — but the harness will (correctly) refuse a
 database that has not been migrated yet, and will not migrate it. Run any writing
 `autotrader` command first.

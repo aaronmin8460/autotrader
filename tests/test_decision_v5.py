@@ -1173,20 +1173,74 @@ def test_nothing_outside_the_decision_package_has_started_preferring_v5() -> Non
     crypto and equity runtimes still call `autotrader.strategies.ema_cross`
     directly, and activating an engine is a decision this milestone does not
     make on anybody's behalf.
+
+    `autotrader.shadow` is exempt from this token scan and from nothing else. It
+    names V5 because it *observes* V5 - recording what an engine would have
+    decided is the precise opposite of preferring it - and it names the other
+    four in the same breath. That exemption is worth nothing on its own, so the
+    test immediately below holds the shadow package to the symmetry it claims.
     """
     import autotrader
+    from autotrader import shadow as shadow_package
     from autotrader.decision import v5 as v5_module
     from test_runtime import code_without_prose
 
     decision_root = Path(v5_module.__file__).parent
+    shadow_root = Path(shadow_package.__file__).parent
     source_root = Path(autotrader.__file__).resolve().parent
 
     for path in sorted(source_root.rglob("*.py")):
         if decision_root in path.parents or path.parent == decision_root:
             continue
+        if shadow_root in path.parents or path.parent == shadow_root:
+            continue
         code = code_without_prose(path.read_text(encoding="utf-8"))
         for token in ("decision.v5", "EnsembleV5Engine", "EnsembleSpec", "BALANCED_ENSEMBLE"):
             assert token not in code, f"{path.relative_to(source_root)} names {token}"
+
+
+def test_the_shadow_package_observes_v5_without_preferring_it() -> None:
+    """CRITICAL. The one exemption above, held to exactly what it claims.
+
+    Three things have to hold for "observes" to be an honest description.
+    Every version is in the panel, so V5 is one of five rather than a favourite.
+    Nothing picks an execution version by default, so V5 cannot become the one
+    that trades by omission. And V5 is named no more often than V1 is, so a
+    future edit that quietly built the panel around the ensemble would show up
+    here rather than in production.
+    """
+    import inspect
+
+    from autotrader.decision.contract import VERSION_V1, VERSION_V2, VERSION_V3, VERSION_V4
+    from autotrader.shadow import panel as shadow_panel_module
+    from autotrader.shadow.panel import EnginePanel
+    from autotrader.shadow.versions import PANEL_VERSIONS, panel_for_symbol
+    from test_runtime import code_without_prose
+
+    assert PANEL_VERSIONS == (VERSION_V1, VERSION_V2, VERSION_V3, VERSION_V4, VERSION_V5)
+
+    for callable_object in (EnginePanel.__init__, panel_for_symbol):
+        parameter = inspect.signature(callable_object).parameters["execution_version"]
+        assert parameter.default is inspect.Parameter.empty, "V5 must not be a default"
+
+    shadow_root = Path(shadow_panel_module.__file__).parent
+    code = "\n".join(
+        code_without_prose(path.read_text(encoding="utf-8"))
+        for path in sorted(shadow_root.rglob("*.py"))
+    )
+    assert code.count("VERSION_V5") == code.count("VERSION_V1")
+    mentions = {
+        name: code.count(name)
+        for name in (
+            "EmaCrossV1Engine",
+            "MultiFactorV2Engine",
+            "MultiTimeframeV3Engine",
+            "ProbabilityV4Engine",
+            "EnsembleV5Engine",
+        )
+    }
+    assert all(count > 0 for count in mentions.values()), mentions
+    assert len(set(mentions.values())) == 1, f"V5 is not named like its peers: {mentions}"
 
 
 def test_the_runtimes_still_call_the_crossover_they_always_did() -> None:

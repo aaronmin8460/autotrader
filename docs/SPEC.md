@@ -222,7 +222,7 @@ Phase 2  Data Validation                   <- done, migrated to crypto (C2)
 Phase 3  Strategy                          <- done, unchanged by the pivot (C3)
 Phase 4  Backtesting                       <- done, migrated to crypto (C4)
 Phase 5  Risk Engine                       <- done, migrated to crypto (C5)
-Phase 6  SQLite Operational State          <- done, schema v6 (C6 + C8 + C9 + CI1)
+Phase 6  SQLite Operational State          <- done, schema v7 (C6 + C8 + C9 + CI1 + D3)
 Phase 7  Alpaca Paper Trading              <- done, migrated to crypto (C7)
 --- Crypto Pivot V0.2 complete ---
 Phase 8  Reconciliation / Crash Recovery   <- done (C8)
@@ -233,6 +233,7 @@ C10      Failure injection / hardening     <- done (C10)
 Dash     Read-only operations dashboard    <- done, V0.2 (CI1)
 CI1      Combined integration              <- done, schema v6 (CI1)
 D1       Decision Engine V2 + V3           <- component-complete, unwired (D1)
+D3       Decision shadow mode              <- component-complete, unwired, schema v7
 QR1      Quant research infrastructure     <- done, research only (QR1)
 Phase 10 Deployment                        <- after the combined paper smoke
 M1       ML/data foundation (offline)      <- done (M1, docs/ML_FOUNDATION.md)
@@ -899,6 +900,7 @@ that at the source level.
 | `runtime_checkpoints` | The newest completed bar a runtime durably claimed, per symbol (v5) | `symbol` PRIMARY KEY; `last_processed_bar_timestamp` non-empty; monotonic - an older claim updates nothing |
 | `account_safety_state` | The one durable answer to whether **any** service may submit (v6) | single row pinned by `CHECK (id = 1)`; `state` in `SAFE`/`UNSAFE_UNKNOWN`/`UNSAFE_RECONCILIATION`; `reason` and `source` non-empty; `client_order_id` carries the recovery anchor for an ambiguous halt |
 | `api_budget_windows` | API calls this system made, per budget per window, across both runtimes (v6) | `(budget, window_start)` PRIMARY KEY; `budget` in `TRADING`/`MARKET_DATA`; `call_count >= 0` |
+| `shadow_decisions` | What each decision engine version decided about one completed bar, and which single one was released to execute (v7) | `(symbol, bar_timestamp, engine_version)` UNIQUE; `signal` in `BUY`/`HOLD`/`SELL`; `score` in `[-1, 1]`; `confidence` in `[0, 1]`; `designation` in `EXECUTED`/`NOT_EXECUTED`; **`EXECUTED` requires `engine_version = execution_version`**; **at most one `EXECUTED` row per `(symbol, bar_timestamp)`**, by partial unique index; `client_order_id` only on an `EXECUTED` row |
 
 **Exact decimal quantities.** Every broker-critical quantity column -
 `positions.quantity`, `order_intents.requested_quantity`,
@@ -989,6 +991,16 @@ reports `UNSAFE_RECONCILIATION` for it. Writing `SAFE` there would be a
 migration asserting something it never checked, about an account it has never
 read - which is the one claim a migration must never invent. The startup
 reconciliation every runtime already runs is what turns it green.
+
+**v6 -> v7 is purely additive too.** One new table, `shadow_decisions`, plus the
+partial unique index that limits it to one execution candidate per bar; the same
+byte-identical assertion covers it. It starts **empty** and nothing is
+backfilled into it: a shadow row asserts that a specific engine version was run
+on a specific bar, this database has never run one, and deriving rows from
+`signals` would label the C3 crossover's output as some version's shadow output.
+The step **opens nothing** - no gate reads the table, no default execution
+version exists, and the account safety row is untouched, so a migrated database
+trades exactly what it traded before.
 
 A database written by a **newer** version is refused and left untouched; one
 older than v1 has no path and is refused too. WAL and foreign keys survive
@@ -1769,7 +1781,7 @@ independent when a single account holds both books.
 | --- | --- |
 | Crypto | BTC/USD, ETH/USD, 24/7, 15m, GTC market, fractional |
 | Equity | SPY QQQ IWM AAPL MSFT NVDA AMZN GOOGL META TSLA, regular session, 15m, DAY market, whole shares |
-| Account | one Alpaca **paper** account, one SQLite file, schema v6 |
+| Account | one Alpaca **paper** account, one SQLite file, schema v7 |
 | Runtimes | two processes, two runtime locks, one shared account execution lock |
 | Risk | unchanged: 5% per symbol, 30% total, 2% UTC daily loss. **No per-book cap.** |
 | Dashboard | V0.2, read-only, GET-only |
@@ -1962,6 +1974,13 @@ backtester and model training are owned by other branches;
 model) and V5 (an ensemble) were anticipated here and were unimplemented at the
 time of this milestone; both exist now, in `docs/DECISION_V4.md` and
 `docs/DECISION_V5.md`, and neither is wired into a runtime either.
+
+`autotrader.shadow` (D3, `docs/DECISION_SHADOW.md`) is the one thing that runs
+all five together. It records what every version would have decided about a
+completed bar while exactly one explicitly configured version may produce an
+execution candidate, and it does not change that none of them is wired into a
+runtime: it holds no default execution version, nothing outside it imports it,
+and its own import graph reaches neither the execution layer nor a broker.
 
 ### QR1 - Quant research infrastructure (complete, research only)
 
