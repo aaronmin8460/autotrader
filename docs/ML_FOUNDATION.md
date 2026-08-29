@@ -212,9 +212,17 @@ Cuts are along the time axis. There is no shuffle parameter.
 
 ```python
 Prediction(
-    model_version, artifact_version, feature_schema_version, label_spec_id,
-    symbol, asset_class, timestamp, knowable_at,
-    probability_down, probability_up, probability_neutral,   # neutral: None if binary
+    model_version,
+    artifact_version,
+    feature_schema_version,
+    label_spec_id,
+    symbol,
+    asset_class,
+    timestamp,
+    knowable_at,
+    probability_down,
+    probability_up,
+    probability_neutral,  # neutral: None if binary
     calibrated_confidence,
 )
 ```

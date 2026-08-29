@@ -422,10 +422,10 @@ An engine supplies four things and nothing else:
 
 ```python
 class DecisionEngine(Protocol):
-    name: str            # stable identifier, used in reports
-    version: str         # so V2 and V3 results never merge
+    name: str  # stable identifier, used in reports
+    version: str  # so V2 and V3 results never merge
     parameters: Mapping  # recorded with every result
-    warmup_bars: int     # bars needed before output means anything
+    warmup_bars: int  # bars needed before output means anything
 
     def generate(self, bars: pd.DataFrame) -> Sequence[ResearchSignal]: ...
 ```
