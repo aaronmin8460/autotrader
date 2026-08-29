@@ -13,6 +13,7 @@ set -u
 QA_ROOT="${AUTOTRADER_QA:-/Volumes/AUTOTRADER_QA}"
 INSTALL_DIR="${QA_ROOT}/integration-orchestrator"
 ORCHESTRATOR="${INSTALL_DIR}/orchestrator.py"
+PIPELINE="${INSTALL_DIR}/pipeline.py"
 LOG_DIR="${QA_ROOT}/logs/integration-orchestrator"
 
 # The external workspace must be a real mounted APFS volume. A path that merely
@@ -23,6 +24,7 @@ if ! /sbin/mount | grep -q " on ${QA_ROOT} (apfs"; then
 fi
 
 [ -f "${ORCHESTRATOR}" ] || exit 0
+[ -f "${PIPELINE}" ] || exit 0
 
 # The orchestrator needs 3.11 or newer. macOS ships 3.9 at /usr/bin/python3, so
 # an explicit search beats whatever `python3` happens to resolve to.
@@ -61,5 +63,9 @@ export PLAYWRIGHT_BROWSERS_PATH="${QA_ROOT}/caches/playwright"
 mkdir -p "${TMPDIR}" "${npm_config_cache}" "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}" \
          "${PYTHONPYCACHEPREFIX}" 2>/dev/null
 
+# One entry point, one lock. The pipeline runs the v4-prep integration itself
+# and then advances the development stages, so there is no second watcher and
+# no way for two invocations to overlap.
+#
 # Bulk output belongs on the external volume, never on the internal disk.
-exec "${PYTHON}" "${ORCHESTRATOR}" run-once >>"${LOG_DIR}/launchd-run.log" 2>&1
+exec "${PYTHON}" "${PIPELINE}" step >>"${LOG_DIR}/launchd-run.log" 2>&1

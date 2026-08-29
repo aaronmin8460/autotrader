@@ -50,9 +50,11 @@ fi
 # ---------------------------------------------------------------------------
 
 mkdir -p "${INSTALL_DIR}"
-for name in orchestrator.py bootstrap.sh integration-ctl.sh; do
+for name in orchestrator.py pipeline.py bootstrap.sh integration-ctl.sh; do
     cp "${HERE}/${name}" "${INSTALL_DIR}/${name}"
 done
+rm -rf "${INSTALL_DIR}/specs"
+cp -R "${HERE}/specs" "${INSTALL_DIR}/specs"
 chmod +x "${INSTALL_DIR}/bootstrap.sh" "${INSTALL_DIR}/integration-ctl.sh"
 
 cat > "${INSTALL_DIR}/INSTALLED_FROM.json" <<JSON
@@ -114,7 +116,7 @@ chmod +x "${QA_ROOT}/integration-status.sh"
 
 echo "installed ${LABEL}"
 echo "  from      ${SOURCE_BRANCH} ${SOURCE_COMMIT}"
-echo "  runs      ${INSTALL_DIR}/orchestrator.py"
+echo "  runs      ${INSTALL_DIR}/pipeline.py step"
 echo "  via       ${BOOTSTRAP}"
 echo "  agent     ${PLIST}"
 echo "  operator  ${QA_ROOT}/integration-status.sh"

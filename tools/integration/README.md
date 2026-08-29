@@ -43,6 +43,16 @@ argument vectors the module can actually construct, not against its prose:
 - broker credentials are stripped from the validation environment, so a
   validation run cannot reach a broker even by accident
 
+## Beyond v4-prep
+
+This orchestrator's job ends at a green `integration/v4-prep`. The autonomous
+development pipeline that carries it through V4, V5, shadow mode and a final
+development candidate is `pipeline.py`, documented in
+[PIPELINE.md](PIPELINE.md). It reuses everything here - the lock, the paths,
+the readiness protocol, the validation, the reporting - and the LaunchAgent now
+runs `pipeline.py step`, which performs this integration itself before
+advancing any later stage. There is still one watcher and one lock.
+
 ## The readiness protocol
 
 | branch | marker |

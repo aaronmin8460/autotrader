@@ -4,10 +4,13 @@
 # A thin wrapper: every decision lives in orchestrator.py, and this file only
 # spells the commands so nobody has to remember them.
 #
-#   integration-ctl.sh status         what the three branches and the
-#                                     integration branch currently look like
-#   integration-ctl.sh check          fetch and report readiness only
-#   integration-ctl.sh run-once       integrate now if all three are READY
+#   integration-ctl.sh status         every pipeline stage, gate and revision
+#   integration-ctl.sh check          fetch and report source readiness only
+#   integration-ctl.sh prep-status    the v4-prep integration on its own
+#   integration-ctl.sh step           advance the pipeline now
+#   integration-ctl.sh run-once       run the v4-prep integration only
+#   integration-ctl.sh agent-check    prove the coding agent runs unattended
+#   integration-ctl.sh clear-stop     resume after a person resolved a stop
 #   integration-ctl.sh enable         start the five-minute LaunchAgent
 #   integration-ctl.sh disable        stop it
 #   integration-ctl.sh log            tail the orchestrator log
@@ -20,6 +23,7 @@ LABEL="com.autotrader.integration-orchestrator"
 QA_ROOT="${AUTOTRADER_QA:-/Volumes/AUTOTRADER_QA}"
 INSTALL_DIR="${QA_ROOT}/integration-orchestrator"
 ORCHESTRATOR="${INSTALL_DIR}/orchestrator.py"
+PIPELINE="${INSTALL_DIR}/pipeline.py"
 LOG_DIR="${QA_ROOT}/logs/integration-orchestrator"
 PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 DOMAIN="gui/$(id -u)"
@@ -54,10 +58,21 @@ orchestrate() {
     exec "${PYTHON}" "${ORCHESTRATOR}" "$@"
 }
 
+pipeline() {
+    require_volume
+    [ -f "${PIPELINE}" ] || die "pipeline is not installed at ${PIPELINE}"
+    PYTHON="$(find_python)" || die "no python 3.11 or newer found"
+    exec "${PYTHON}" "${PIPELINE}" "$@"
+}
+
 case "${1:-status}" in
-    status)    orchestrate status ;;
-    check)     orchestrate check ;;
-    run-once)  orchestrate run-once ;;
+    status)      pipeline status ;;
+    step)        pipeline step ;;
+    agent-check) pipeline agent-check ;;
+    clear-stop)  pipeline clear-hard-stop --confirm ;;
+    prep-status) orchestrate status ;;
+    check)       orchestrate check ;;
+    run-once)    orchestrate run-once ;;
     watch)     shift; orchestrate watch "$@" ;;
     enable)
         [ -f "${PLIST}" ] || die "no LaunchAgent installed at ${PLIST}"
@@ -88,13 +103,14 @@ case "${1:-status}" in
         ;;
     report)
         require_volume
-        latest="$(ls -1t "${QA_ROOT}"/reports/v4-prep-integration-*.md 2>/dev/null | head -1)"
+        latest="$(ls -1t "${QA_ROOT}"/reports/development-pipeline-*.md \
+                          "${QA_ROOT}"/reports/v4-prep-integration-*.md 2>/dev/null | head -1)"
         [ -n "${latest}" ] || die "no integration report has been written yet."
         echo "=== ${latest} ==="
         cat "${latest}"
         ;;
     *)
-        sed -n '2,20p' "$0"
+        sed -n '2,24p' "$0"
         exit 2
         ;;
 esac

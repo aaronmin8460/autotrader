@@ -300,6 +300,7 @@ def run(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
     timeout: int = 600,
+    stdin_text: str | None = None,
 ) -> Ran:
     """Run a command, capturing both streams. Never raises on a bad exit."""
     try:
@@ -307,6 +308,7 @@ def run(
             list(argv),
             cwd=None if cwd is None else str(cwd),
             env=env,
+            input=stdin_text,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1244,36 +1246,46 @@ def run_once(paths: Paths, *, force: bool = False) -> int:
         return EXIT_LOCK_HELD
 
     try:
-        base = remote_sha(paths.git_host, BASE_BRANCH)
-        if base is None:
-            raise Stop(f"{REMOTE}/{BASE_BRANCH} does not exist", code=EXIT_ERROR)
-        attempt = freeze(readiness, base)
-        log(paths, f"all sources READY; base {BASE_BRANCH} frozen at {base[:12]}")
-        try:
-            note = prepare_worktree(paths, attempt)
-            log(paths, note)
-            merge_sources(paths, attempt)
-            if validate(paths, attempt):
-                write_provenance(paths, attempt)
-                publish(paths, attempt)
-                attempt.outcome = "GREEN"
-                attempt.detail = "all merges clean, all validation green, branch published"
-            else:
-                attempt.outcome = "VALIDATION_FAILED"
-                attempt.detail = (
-                    "one or more checks failed against the merged tree; "
-                    "nothing was committed as ready and nothing was pushed"
-                )
-        except Stop as stop:
-            if attempt.outcome == "INCOMPLETE":
-                attempt.outcome = "STOPPED"
-            attempt.detail = attempt.detail or stop.reason
-            finish(paths, attempt)
-            return EXIT_OK if attempt.outcome == "ALREADY_COMPLETE" else stop.code
-        finish(paths, attempt)
-        return EXIT_OK if attempt.green else EXIT_MANUAL_REVIEW
+        return integrate_locked(paths, readiness)
     finally:
         lock.release()
+
+
+def integrate_locked(paths: Paths, readiness: list[BranchReadiness]) -> int:
+    """Perform the integration itself. The caller must already hold the lock.
+
+    Separated from `run_once` so a longer pipeline can take the lock once and
+    keep it across several stages, rather than releasing and retaking it
+    between steps that must not interleave.
+    """
+    base = remote_sha(paths.git_host, BASE_BRANCH)
+    if base is None:
+        raise Stop(f"{REMOTE}/{BASE_BRANCH} does not exist", code=EXIT_ERROR)
+    attempt = freeze(readiness, base)
+    log(paths, f"all sources READY; base {BASE_BRANCH} frozen at {base[:12]}")
+    try:
+        note = prepare_worktree(paths, attempt)
+        log(paths, note)
+        merge_sources(paths, attempt)
+        if validate(paths, attempt):
+            write_provenance(paths, attempt)
+            publish(paths, attempt)
+            attempt.outcome = "GREEN"
+            attempt.detail = "all merges clean, all validation green, branch published"
+        else:
+            attempt.outcome = "VALIDATION_FAILED"
+            attempt.detail = (
+                "one or more checks failed against the merged tree; "
+                "nothing was committed as ready and nothing was pushed"
+            )
+    except Stop as stop:
+        if attempt.outcome == "INCOMPLETE":
+            attempt.outcome = "STOPPED"
+        attempt.detail = attempt.detail or stop.reason
+        finish(paths, attempt)
+        return EXIT_OK if attempt.outcome == "ALREADY_COMPLETE" else stop.code
+    finish(paths, attempt)
+    return EXIT_OK if attempt.green else EXIT_MANUAL_REVIEW
 
 
 # ---------------------------------------------------------------------------
