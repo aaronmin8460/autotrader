@@ -23,11 +23,14 @@ computed from the broker's calendar - `regular_session_bar_starts` on each real
 session - so "missing" means missing against the exchange's own schedule and not
 against a 26-bar-a-day assumption that an early close would break.
 
-**Bars are raw, and that is a recorded fact rather than a preference.** The
-shipped request sets no `adjustment`, so the provider serves unadjusted prices.
-For SPY and QQQ over this window that is checked to be harmless - neither split -
-and the dividend steps that remain are measured and reported. It is *not*
-harmless for the ten-symbol universe; see `docs` in the pilot report.
+**Bars are split-adjusted, and that is a decision rather than a default.** The
+market-data boundary serves `raw` unless asked, which is right for a live
+runtime and wrong for a study: a ten-for-one split is a -90% step in a raw
+series, and every trailing indicator reads it as a return. For SPY and QQQ the
+choice is provably immaterial - neither split in this window, and the two frames
+are byte-identical - so the pilot's numbers are the same either way. It is the
+default here because the ten-symbol universe contains four symbols that did
+split. Dividends are left unadjusted on purpose; see `RESEARCH_ADJUSTMENT`.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+from alpaca.data.enums import Adjustment
 
 from autotrader.data.validation import EQUITY_UNIVERSE_LABEL, validate_frame
 from autotrader.equity import EQUITY_SYMBOLS, EQUITY_TIMEFRAME, MARKET_TIMEZONE_NAME
@@ -59,6 +63,25 @@ UNDEFINED_VWAP_SENTINEL = 0.0
 
 #: The base bar interval. Every count in this module is against this grid.
 BAR_INTERVAL = pd.Timedelta("15min")
+
+#: How corporate actions are applied to every bar this study reads.
+#:
+#: Split-adjusted, always. The market-data boundary defaults to `raw` because
+#: raw prices are the ones an order fills at and the ones reconciliation
+#: compares against - the right default for a live runtime, and the wrong one
+#: for a multi-year study. A ten-for-one split is a -90% step in a raw series,
+#: which every trailing indicator and the V4 label horizon read as a return.
+#:
+#: For SPY and QQQ the choice is provably immaterial: neither split in the
+#: pilot window, and the split-adjusted frames are byte-identical to the raw
+#: ones (same sha256, both symbols). It is stated and defaulted here anyway,
+#: because the ten-symbol universe contains four symbols that did split and a
+#: harness that only happens to be correct on two symbols is not a harness.
+#:
+#: Dividends are deliberately *not* adjusted: `ALL` back-adjusts historical
+#: prices for distributions, which moves them away from what could actually
+#: have been traded. The residual dividend step stays in the data, visible.
+RESEARCH_ADJUSTMENT: Adjustment | None = Adjustment.SPLIT
 
 #: How many calendar days one download request covers. The provider paginates
 #: internally, but a multi-year single request is one long-lived HTTP call with
@@ -183,12 +206,17 @@ def download_raw(
     *,
     client: object | None = None,
     progress: object | None = None,
+    adjustment: Adjustment | None = RESEARCH_ADJUSTMENT,
 ) -> dict[str, pd.DataFrame]:
-    """Fetch raw bars for every symbol over the range, in resumable chunks.
+    """Fetch bars for every symbol over the range, in resumable chunks.
 
     Returns the provider's rows unmodified apart from the canonical schema the
     market-data boundary already applies - extended-hours candles included, so
     the count of what was dropped later is a measured number.
+
+    `adjustment` defaults to `RESEARCH_ADJUSTMENT`, not to the market-data
+    boundary's own default: a study that reads years of history must not read a
+    split as a ninety-percent fall.
     """
     from autotrader.equity.data import create_client, fetch_bars_for_symbols, to_request_window
 
@@ -196,7 +224,7 @@ def download_raw(
     collected: dict[str, list[pd.DataFrame]] = {symbol: [] for symbol in symbols}
     for chunk_start, chunk_end in _chunks(start, end):
         window_start, window_end = to_request_window(chunk_start, chunk_end)
-        frames = fetch_bars_for_symbols(data_client, symbols, window_start, window_end)
+        frames = fetch_bars_for_symbols(data_client, symbols, window_start, window_end, adjustment)
         for symbol, frame in frames.items():
             if not frame.empty:
                 collected[symbol].append(frame)
@@ -366,6 +394,7 @@ def build_evaluation_frame(
     end: date,
     raw_digest: str,
     retrieved_at: datetime,
+    adjustment: str = "split",
 ) -> tuple[pd.DataFrame, DatasetProvenance]:
     """Reduce one symbol's raw download to its evaluation frame, with provenance."""
     deduped, duplicates = drop_duplicate_bars(raw)
@@ -382,9 +411,9 @@ def build_evaluation_frame(
         provider="alpaca",
         feed=FEED.value,
         asset_class="us_equity",
-        # Recorded because it is a decision, not a default nobody made: the
-        # shipped request sets no adjustment, so the provider serves raw.
-        adjustment="raw",
+        # Recorded because two frames built under different adjustments must
+        # not be silently compared, however alike they look.
+        adjustment=adjustment,
         timeframe=EQUITY_TIMEFRAME,
         session_policy="regular-session-only (09:30-16:00 America/New_York, broker calendar)",
         date_timezone=MARKET_TIMEZONE_NAME,
@@ -424,6 +453,7 @@ def write_provenance(provenance: DatasetProvenance, path: Path) -> None:
 __all__ = [
     "BAR_INTERVAL",
     "CHUNK_DAYS",
+    "RESEARCH_ADJUSTMENT",
     "UNDEFINED_VWAP_SENTINEL",
     "DatasetError",
     "DatasetProvenance",
