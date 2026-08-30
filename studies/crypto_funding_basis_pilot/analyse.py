@@ -147,7 +147,10 @@ def verdict(records: list[dict]) -> dict:
     era_2024_delta = float(np.mean([w["delta_forced"] for w in era_2024])) if era_2024 else 0.0
 
     # Drop-one attacks: does the thesis survive losing its best contributor?
-    by_delta = sorted(windows, key=lambda w: w["delta_forced"])
+    # "Strongest" means the largest improvement over baseline - the window
+    # doing the most to carry the result - so the attack removes the maximum,
+    # not the minimum.
+    by_delta = sorted(windows, key=lambda w: w["delta_forced"], reverse=True)
     strongest_window = by_delta[0]["window"] if by_delta else None
     without_strongest = [w for w in windows if w["window"] != strongest_window]
     drop_window_delta = (
@@ -158,7 +161,7 @@ def verdict(records: list[dict]) -> dict:
     for record in records:
         symbol_deltas[record["symbol"]].append(record["delta_forced"])
     symbol_means = {s: float(np.mean(v)) for s, v in symbol_deltas.items()}
-    strongest_symbol = min(symbol_means, key=symbol_means.get) if symbol_means else None
+    strongest_symbol = max(symbol_means, key=symbol_means.get) if symbol_means else None
     without_symbol = [r for r in records if r["symbol"] != strongest_symbol]
     drop_symbol_delta = (
         float(np.mean([w["delta_forced"] for w in window_level(without_symbol)]))
