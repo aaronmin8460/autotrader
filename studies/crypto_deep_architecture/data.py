@@ -48,6 +48,12 @@ GRID_END = datetime(2026, 8, 28, 23, 45, tzinfo=UTC)
 #: per-window figure here is comparable against the recorded V1-V5 benchmarks.
 #: Each value is (first feature timestamp, last feature timestamp), inclusive.
 WINDOWS: dict[str, tuple[str, str]] = {
+    # P1-P3 are 2024 pre-windows: never part of the prior studies' scoring
+    # range and never used for selection here. They exist solely as extra
+    # out-of-sample attack windows for rule families that need no training.
+    "P1": ("2024-04-01", "2024-06-30 23:45"),
+    "P2": ("2024-07-01", "2024-09-30 23:45"),
+    "P3": ("2024-10-01", "2024-12-31 23:45"),
     "W01": ("2025-01-01", "2025-03-31 23:45"),
     "W02": ("2025-04-01", "2025-06-30 23:45"),
     "W03": ("2025-07-01", "2025-09-30 23:45"),
