@@ -44,6 +44,13 @@ DATASET_FILES: dict[str, tuple[str, str]] = {
 GRID_START = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
 GRID_END = datetime(2026, 8, 28, 23, 45, tzinfo=UTC)
 
+#: The 2021-2023 extension era, downloaded for the extended-history attack.
+#: Files are digest-verified against the metadata sidecars written at
+#: download time; the 2024-26 originals are a different directory entirely.
+EXTENDED_DIR = Path("/Volumes/AUTOTRADER_QA/datasets/crypto-historical-extended")
+EXTENDED_GRID_START = datetime(2021, 1, 1, 0, 0, tzinfo=UTC)
+EXTENDED_GRID_END = datetime(2023, 12, 31, 23, 45, tzinfo=UTC)
+
 #: The prior studies' quarterly out-of-sample windows, reused verbatim so every
 #: per-window figure here is comparable against the recorded V1-V5 benchmarks.
 #: Each value is (first feature timestamp, last feature timestamp), inclusive.
@@ -54,6 +61,16 @@ WINDOWS: dict[str, tuple[str, str]] = {
     "P1": ("2024-04-01", "2024-06-30 23:45"),
     "P2": ("2024-07-01", "2024-09-30 23:45"),
     "P3": ("2024-10-01", "2024-12-31 23:45"),
+    # X01-X09 are the extended-history attack windows (2021-Q4 .. 2023-Q4).
+    "X01": ("2021-10-01", "2021-12-31 23:45"),
+    "X02": ("2022-01-01", "2022-03-31 23:45"),
+    "X03": ("2022-04-01", "2022-06-30 23:45"),
+    "X04": ("2022-07-01", "2022-09-30 23:45"),
+    "X05": ("2022-10-01", "2022-12-31 23:45"),
+    "X06": ("2023-01-01", "2023-03-31 23:45"),
+    "X07": ("2023-04-01", "2023-06-30 23:45"),
+    "X08": ("2023-07-01", "2023-09-30 23:45"),
+    "X09": ("2023-10-01", "2023-12-31 23:45"),
     "W01": ("2025-01-01", "2025-03-31 23:45"),
     "W02": ("2025-04-01", "2025-06-30 23:45"),
     "W03": ("2025-07-01", "2025-09-30 23:45"),
@@ -146,6 +163,38 @@ def load_symbol_frame(symbol: str, grid: BarGrid | None = None) -> SymbolFrame:
     """
     bars = load_bars(symbol)
     the_grid = grid if grid is not None else shared_grid()
+    observations = build_observations(bars, the_grid, symbol)
+    features = compute_features(observations, has_session_gaps=the_grid.has_session_gaps)
+    return SymbolFrame(symbol=symbol, observations=observations, features=features, grid=the_grid)
+
+
+def extended_grid() -> BarGrid:
+    """The continuous 15-minute grid of the 2021-2023 extension era."""
+    return crypto_grid(EXTENDED_GRID_START, EXTENDED_GRID_END)
+
+
+def load_extended_symbol_frame(symbol: str, grid: BarGrid | None = None) -> SymbolFrame:
+    """The extension era's observations and M1 features, digest-verified.
+
+    The parquet's SHA-256 must match the metadata sidecar written at download
+    time, so a silently substituted or truncated file fails loudly.
+    """
+    import json
+
+    slug = symbol.replace("/", "_")
+    path = EXTENDED_DIR / f"{slug}_15m_2021-01-01_2023-12-31.parquet"
+    sidecar = EXTENDED_DIR / f"{slug}_15m_2021-01-01_2023-12-31.metadata.json"
+    if not path.exists() or not sidecar.exists():
+        raise StudyDataError(f"Extended dataset for {symbol} is not downloaded yet.")
+    recorded = json.loads(sidecar.read_text())["sha256"]
+    _verify_digest(path, recorded)
+    bars = pd.read_parquet(path)
+    # The provider treats the request end as inclusive, so the file carries
+    # one bar at the exclusive boundary (2024-01-01 00:00). It is off this
+    # era's grid and is dropped rather than silently reindexed away.
+    the_grid = grid if grid is not None else extended_grid()
+    timestamps = pd.to_datetime(bars["timestamp"], utc=True)
+    bars = bars.loc[timestamps <= pd.Timestamp(EXTENDED_GRID_END)].reset_index(drop=True)
     observations = build_observations(bars, the_grid, symbol)
     features = compute_features(observations, has_session_gaps=the_grid.has_session_gaps)
     return SymbolFrame(symbol=symbol, observations=observations, features=features, grid=the_grid)

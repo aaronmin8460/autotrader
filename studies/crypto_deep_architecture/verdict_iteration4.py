@@ -20,7 +20,8 @@ CELLS = Path("/Volumes/AUTOTRADER_QA/reports/crypto-deep-architecture/iteration4
 def load() -> pd.DataFrame:
     rows = []
     for path in sorted(glob(str(CELLS / "*.json"))):
-        rec = json.load(open(path))
+        with open(path) as handle:
+            rec = json.load(handle)
         for gate, payload in rec["gates"].items():
             for cost, result in payload["costs"].items():
                 rows.append(

@@ -32,6 +32,8 @@ from autotrader.research.costs import cost_model_for
 from studies.crypto_deep_architecture.data import (
     WINDOWS,
     exact_break_even,
+    extended_grid,
+    load_extended_symbol_frame,
     load_symbol_frame,
     shared_grid,
     window_mask,
@@ -54,6 +56,7 @@ OUTPUT_DIR = Path("/Volumes/AUTOTRADER_QA/reports/crypto-deep-architecture/itera
 
 SYMBOLS = ("BTC/USD", "ETH/USD")
 FOLDS = ("P3", "W01", "W02", "W03", "W04", "W05")
+FOLDS_EXTENDED = tuple(f"X{i:02d}" for i in range(1, 10))
 COST_MODELS = ("frictionless", "crypto-taker", "stress")
 HORIZON = 96
 FIT_FRACTION = 0.7
@@ -226,17 +229,32 @@ def main() -> None:
         choices=("full", "base13"),
         help="base13 ablates the extension features (journal-declared attack)",
     )
+    parser.add_argument(
+        "--era",
+        default="modern",
+        choices=("modern", "extended"),
+        help="extended scores the frozen candidate on the 2021-2023 attack era",
+    )
     args = parser.parse_args()
 
     if args.features == "base13":
         global ALL_FEATURES
         ALL_FEATURES = tuple(FEATURE_NAMES)
-    cells_dir = OUTPUT_DIR / ("cells" if args.features == "full" else "cells_base13")
+    suffix = "" if args.features == "full" else "_base13"
+    if args.era == "extended":
+        suffix = "_extended" + suffix
+    cells_dir = OUTPUT_DIR / f"cells{suffix}"
     cells_dir.mkdir(parents=True, exist_ok=True)
-    grid = shared_grid()
-    frames = {s: load_symbol_frame(s, grid) for s in SYMBOLS}
+    if args.era == "extended":
+        grid = extended_grid()
+        frames = {s: load_extended_symbol_frame(s, grid) for s in SYMBOLS}
+        default_folds = FOLDS_EXTENDED
+    else:
+        grid = shared_grid()
+        frames = {s: load_symbol_frame(s, grid) for s in SYMBOLS}
+        default_folds = FOLDS
 
-    windows = (args.window,) if args.window else FOLDS
+    windows = (args.window,) if args.window else default_folds
     families = (args.family,) if args.family else FAMILIES
 
     for symbol in SYMBOLS:
