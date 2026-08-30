@@ -359,3 +359,87 @@ def test_probes_land_inside_the_scored_region():
 
 def test_probe_placement_is_empty_when_nothing_could_be_scored():
     assert scored_probe_indices(3000, lookback_bars=3000) == ()
+
+
+# --------------------------------------------------------------------------
+# Execution semantics across the overnight gap
+# --------------------------------------------------------------------------
+
+
+def test_a_signal_on_the_last_bar_fills_at_the_next_session_open():
+    """The one execution rule equities have and crypto does not.
+
+    A proposal on the 15:45 bar has no later bar that day. The simulator fills
+    on the *following* bar's open, which is the next session's opening print -
+    so the fill crosses the overnight gap at whatever price the market reopened
+    at. That is what a regular-hours strategy actually gets; the alternative is
+    to invent a fill after the close.
+    """
+    from decimal import Decimal
+
+    from studies.equity_v1_v5.adapters import DecisionRecord, DecisionSeriesEngine
+
+    from autotrader.data.validation import EQUITY_UNIVERSE_LABEL
+    from autotrader.decision.contract import DecisionSignal
+    from autotrader.equity import EQUITY_SYMBOLS
+    from autotrader.research.costs import ZERO_COST
+    from autotrader.research.replay import ReplayConfig, replay
+
+    monday = full_winter_session(date(2025, 1, 6))
+    tuesday = full_winter_session(date(2025, 1, 7))
+    frame = bars_for([monday, tuesday])
+    # A visible overnight gap: Tuesday reopens well above Monday's close.
+    tuesday_rows = frame["timestamp"] >= pd.Timestamp("2025-01-07T00:00:00Z")
+    for column in ("open", "high", "low", "close", "vwap"):
+        frame.loc[tuesday_rows, column] = frame.loc[tuesday_rows, column] + 10.0
+
+    last_monday_bar = frame.loc[~tuesday_rows, "timestamp"].iloc[-1]
+    first_tuesday_bar = frame.loc[tuesday_rows, "timestamp"].iloc[0]
+    records = [
+        DecisionRecord(
+            timestamp=pd.Timestamp(last_monday_bar),
+            symbol="SPY",
+            signal=DecisionSignal.BUY,
+            score=1.0,
+            confidence=1.0,
+            regime="TRENDING",
+            reasons=("TEST",),
+        )
+    ]
+    engine = DecisionSeriesEngine(records, name="test", version="t", warmup_bars=0)
+    result = replay(
+        frame,
+        engine,
+        ReplayConfig(
+            initial_cash=Decimal("100000"),
+            cost_model=ZERO_COST,
+            supported_symbols=EQUITY_SYMBOLS,
+            universe_label=EQUITY_UNIVERSE_LABEL,
+        ),
+    )
+    assert len(result.fills) == 1
+    fill = result.fills[0]
+    assert fill.signal_timestamp == pd.Timestamp(last_monday_bar)
+    assert fill.timestamp == pd.Timestamp(first_tuesday_bar)
+    # The fill took the gap: it is the next session's open, not Monday's close.
+    expected = frame.loc[frame["timestamp"] == first_tuesday_bar, "open"].iloc[0]
+    assert float(fill.reference_price) == pytest.approx(expected)
+
+
+def test_cost_models_are_ordered_and_the_equity_model_charges_no_commission():
+    """Zero-cost is an upper bound, stress is a lower one, and equity sits between."""
+    from decimal import Decimal
+
+    from autotrader.research.costs import EQUITY_COST, STRESS_COST, ZERO_COST, Side
+
+    assert EQUITY_COST.fee_rate == Decimal("0")
+    assert ZERO_COST.frictionless
+    reference = Decimal("100")
+    buys = [
+        model.fill_price(reference, Side.BUY) for model in (ZERO_COST, EQUITY_COST, STRESS_COST)
+    ]
+    assert buys[0] < buys[1] < buys[2]
+    sells = [
+        model.fill_price(reference, Side.SELL) for model in (ZERO_COST, EQUITY_COST, STRESS_COST)
+    ]
+    assert sells[0] > sells[1] > sells[2]
