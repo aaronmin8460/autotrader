@@ -55,11 +55,7 @@ def build(output: Path, symbols: list[str]) -> str:
                 str(fact["label"]),
                 str(fact["day"]),
                 "yes" if fact["is_session"] else "no",
-                (
-                    f"{fact['open_local']}-{fact['close_local']}"
-                    if fact["is_session"]
-                    else "-"
-                ),
+                (f"{fact['open_local']}-{fact['close_local']}" if fact["is_session"] else "-"),
                 str(fact["utc_offset_hours"] or "-"),
                 str(fact["scheduled_bars"]),
                 str(fact["observed_bars"]),
@@ -107,8 +103,7 @@ def build(output: Path, symbols: list[str]) -> str:
         parts.append("### Reproducibility\n\n" + table(["Symbol", "Check", "Result"], rows))
 
     header = (
-        f"<!-- generated {datetime.now(UTC).isoformat()} by "
-        "studies.equity_v1_v5.build_report -->\n"
+        f"<!-- generated {datetime.now(UTC).isoformat()} by studies.equity_v1_v5.build_report -->\n"
     )
     return header + "\n\n".join(parts) + "\n"
 

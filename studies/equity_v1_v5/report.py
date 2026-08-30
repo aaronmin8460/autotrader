@@ -23,7 +23,7 @@ METRIC_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("win_rate", "Win%", "pct"),
     ("profit_factor", "PF", "num"),
     ("turnover", "Turnover", "num"),
-    ("exposure_fraction", "Exposure", "pct"),
+    ("exposure", "Exposure", "pct"),
     ("cost_drag", "CostDrag", "pct"),
 )
 
@@ -234,7 +234,7 @@ def metrics_table(
                 bucket["worst_dd"] = min(
                     bucket["worst_dd"], float(metrics.get("max_drawdown") or 0.0)
                 )
-                bucket["exposure"] += float(metrics.get("exposure_fraction") or 0.0)
+                bucket["exposure"] += float(metrics.get("exposure") or 0.0)
                 bucket["cost"] += float(metrics.get("cost_drag") or 0.0)
                 bucket["windows"] += 1
         for name, bucket in totals.items():
