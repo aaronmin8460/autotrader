@@ -220,9 +220,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--window", default=None)
     parser.add_argument("--family", default=None, choices=FAMILIES)
+    parser.add_argument(
+        "--features",
+        default="full",
+        choices=("full", "base13"),
+        help="base13 ablates the extension features (journal-declared attack)",
+    )
     args = parser.parse_args()
 
-    cells_dir = OUTPUT_DIR / "cells"
+    if args.features == "base13":
+        global ALL_FEATURES
+        ALL_FEATURES = tuple(FEATURE_NAMES)
+    cells_dir = OUTPUT_DIR / ("cells" if args.features == "full" else "cells_base13")
     cells_dir.mkdir(parents=True, exist_ok=True)
     grid = shared_grid()
     frames = {s: load_symbol_frame(s, grid) for s in SYMBOLS}
