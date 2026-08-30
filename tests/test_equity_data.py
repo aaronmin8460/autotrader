@@ -11,11 +11,12 @@ import json
 import socket
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 from alpaca.common.exceptions import APIError
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.models.bars import Bar
 from alpaca.data.requests import StockBarsRequest
 
@@ -534,3 +535,77 @@ def test_a_session_built_from_broker_shaped_values_round_trips() -> None:
     )
 
     assert session == ORDINARY
+
+
+# --------------------------------------------------------------------------
+# Corporate-action adjustment
+# --------------------------------------------------------------------------
+
+
+def test_default_request_sends_no_adjustment_field():
+    """The default is exactly what this module did before the parameter existed.
+
+    `None` means the request carries no `adjustment`, which the provider reads
+    as `raw`. Pinned because raw prices are the ones an order fills at and the
+    reconciliation path compares against them; changing this default silently
+    would change what the live runtime trades on.
+    """
+    start = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
+    end = datetime(2026, 1, 5, 21, 0, tzinfo=UTC)
+    request = equity_data.build_bars_request("SPY", start, end)
+    assert equity_data.DEFAULT_ADJUSTMENT is None
+    assert request.adjustment is None
+
+
+def test_a_caller_may_ask_for_split_adjusted_bars():
+    """What a historical study must pass.
+
+    A raw series steps by about ninety percent across a ten-for-one split, and
+    every trailing indicator reads that step as a return. A multi-year study
+    therefore asks for split-adjusted prices explicitly.
+    """
+    start = datetime(2024, 6, 6, 13, 30, tzinfo=UTC)
+    end = datetime(2024, 6, 12, 20, 0, tzinfo=UTC)
+    request = equity_data.build_bars_request("NVDA", start, end, Adjustment.SPLIT)
+    assert request.adjustment is Adjustment.SPLIT
+
+
+def test_metadata_records_the_adjustment_that_produced_the_file():
+    """Two files built under different adjustments must not look identical."""
+    raw = equity_data.build_metadata(
+        symbol="SPY",
+        timeframe="15m",
+        start=date(2026, 1, 2),
+        end=date(2026, 1, 30),
+        row_count=1,
+        parquet_filename="SPY_15m_2026-01-02_2026-01-30.parquet",
+        retrieved_at=datetime(2026, 8, 29, tzinfo=UTC),
+    )
+    split = equity_data.build_metadata(
+        symbol="SPY",
+        timeframe="15m",
+        start=date(2026, 1, 2),
+        end=date(2026, 1, 30),
+        row_count=1,
+        parquet_filename="SPY_15m_2026-01-02_2026-01-30.parquet",
+        retrieved_at=datetime(2026, 8, 29, tzinfo=UTC),
+        adjustment=Adjustment.SPLIT,
+    )
+    assert raw["adjustment"] == "raw"
+    assert split["adjustment"] == "split"
+
+
+def test_fetch_passes_the_adjustment_through_to_the_request():
+    """The parameter must reach the provider, not stop at the boundary."""
+    seen: list[object] = []
+
+    class RecordingClient:
+        def get_stock_bars(self, request):
+            seen.append(request.adjustment)
+            return SimpleNamespace(data={"SPY": []})
+
+    start = datetime(2026, 1, 5, 14, 30, tzinfo=UTC)
+    end = datetime(2026, 1, 5, 21, 0, tzinfo=UTC)
+    equity_data.fetch_bars_for_symbols(RecordingClient(), ["SPY"], start, end)
+    equity_data.fetch_bars_for_symbols(RecordingClient(), ["SPY"], start, end, Adjustment.SPLIT)
+    assert seen == [None, Adjustment.SPLIT]

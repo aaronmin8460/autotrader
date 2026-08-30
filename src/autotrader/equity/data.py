@@ -52,7 +52,7 @@ from pathlib import Path
 
 import pandas as pd
 from alpaca.common.exceptions import APIError
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.models.bars import Bar
 from alpaca.data.requests import StockBarsRequest
@@ -81,6 +81,26 @@ FEED = DataFeed.IEX
 #: The bar timeframe, as the SDK's own type. Built once: it is a value, and
 #: rebuilding it per request would only create ways for two of them to differ.
 TIMEFRAME = TimeFrame(15, TimeFrameUnit.Minute)
+
+#: How corporate actions are applied to the prices this module returns.
+#:
+#: `None` sends no `adjustment` field, which the provider reads as `raw` -
+#: unadjusted prices, exactly what this module returned before the parameter
+#: existed. It stays the default because raw prices are the ones an order
+#: actually fills at, and the reconciliation path compares stored fills against
+#: what the broker reported; a back-adjusted price would not match.
+#:
+#: **A raw series is wrong across a split, and a caller reading history must say
+#: so.** A ten-for-one split appears in raw bars as a single-bar fall of about
+#: ninety percent, which is not a return and which every trailing indicator will
+#: read as one: measured on the shipped path, NVDA's 2024-06-10 split shows a
+#: -89.9% step between two consecutive sessions. Over a lookback of a couple of
+#: hundred bars the live runtime is exposed to that for a few sessions a year
+#: per symbol; over a multi-year research window it is a fabricated crash inside
+#: the sample. So a historical study must pass `Adjustment.SPLIT` (or `ALL`),
+#: and this constant exists to make that an explicit decision at each call site
+#: rather than a default nobody chose.
+DEFAULT_ADJUSTMENT: Adjustment | None = None
 
 _DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -189,7 +209,10 @@ def create_client() -> StockHistoricalDataClient:
 
 
 def build_bars_request(
-    symbols: str | list[str], start: datetime, end: datetime
+    symbols: str | list[str],
+    start: datetime,
+    end: datetime,
+    adjustment: Adjustment | None = DEFAULT_ADJUSTMENT,
 ) -> StockBarsRequest:
     """Build the 15-minute IEX stock-bars request for one or many symbols.
 
@@ -197,6 +220,11 @@ def build_bars_request(
     UTC on the request object, so passing aware datetimes is what keeps the
     window unambiguous. Unlike the crypto endpoint, the feed *is* a request
     field here.
+
+    `adjustment` selects how corporate actions are applied, and `None` - the
+    default - sends no adjustment field, which is what this module has always
+    done and what the provider reads as `raw`. See `DEFAULT_ADJUSTMENT` for why
+    that default is kept and when a caller must override it.
     """
     return StockBarsRequest(
         symbol_or_symbols=symbols,
@@ -204,6 +232,7 @@ def build_bars_request(
         start=start,
         end=end,
         feed=FEED,
+        adjustment=adjustment,
     )
 
 
@@ -227,6 +256,7 @@ def fetch_bars_for_symbols(
     symbols: Iterable[str],
     start: datetime,
     end: datetime,
+    adjustment: Adjustment | None = DEFAULT_ADJUSTMENT,
 ) -> dict[str, pd.DataFrame]:
     """Request bars for several symbols at once, canonical frame per symbol.
 
@@ -239,7 +269,9 @@ def fetch_bars_for_symbols(
     tickers = [normalize_symbol(symbol) for symbol in symbols]
     if not tickers:
         raise EquityDataError("At least one symbol is required.")
-    request = build_bars_request(tickers if len(tickers) > 1 else tickers[0], start, end)
+    request = build_bars_request(
+        tickers if len(tickers) > 1 else tickers[0], start, end, adjustment
+    )
     try:
         barset = client.get_stock_bars(request)
     except APIError as exc:
@@ -255,10 +287,11 @@ def fetch_bars(
     symbol: str,
     start: datetime,
     end: datetime,
+    adjustment: Adjustment | None = DEFAULT_ADJUSTMENT,
 ) -> pd.DataFrame:
     """Request one symbol's bars and return them in the canonical schema."""
     ticker = normalize_symbol(symbol)
-    return fetch_bars_for_symbols(client, [ticker], start, end)[ticker]
+    return fetch_bars_for_symbols(client, [ticker], start, end, adjustment)[ticker]
 
 
 # --------------------------------------------------------------------------
@@ -297,16 +330,20 @@ def build_metadata(
     row_count: int,
     parquet_filename: str,
     retrieved_at: datetime,
+    adjustment: Adjustment | None = DEFAULT_ADJUSTMENT,
 ) -> dict[str, object]:
     """Build the reproducibility sidecar. Never include credentials or account data.
 
     `date_timezone` records that the requested dates are exchange days rather
-    than UTC days, which is the one thing about an equity dataset that cannot
-    be recovered from the rows themselves.
+    than UTC days, and `adjustment` records how corporate actions were applied.
+    Both are things about an equity dataset that cannot be recovered from the
+    rows themselves - and a file that does not say which adjustment produced it
+    cannot be compared with one that used another.
     """
     return {
         "provider": PROVIDER,
         "asset_class": "us_equity",
+        "adjustment": "raw" if adjustment is None else adjustment.value,
         "feed": FEED.value,
         "symbol": normalize_symbol(symbol),
         "timeframe": timeframe,
@@ -338,6 +375,7 @@ def download_bars(
     end: str,
     output_dir: Path,
     client: StockHistoricalDataClient | None = None,
+    adjustment: Adjustment | None = DEFAULT_ADJUSTMENT,
 ) -> EquityDownloadResult:
     """Download one symbol's bars and write the Parquet file plus its sidecar."""
     resolved_symbol = normalize_symbol(symbol)
@@ -346,7 +384,7 @@ def download_bars(
     request_start, request_end = to_request_window(start_date, end_date)
 
     data_client = create_client() if client is None else client
-    frame = fetch_bars(data_client, resolved_symbol, request_start, request_end)
+    frame = fetch_bars(data_client, resolved_symbol, request_start, request_end, adjustment)
     if frame.empty:
         raise EquityDataError(
             f"Alpaca returned no {resolved_timeframe} bars for {resolved_symbol} between "
@@ -367,6 +405,7 @@ def download_bars(
             row_count=len(frame),
             parquet_filename=parquet_path.name,
             retrieved_at=datetime.now(UTC),
+            adjustment=adjustment,
         ),
         metadata_path,
     )
@@ -384,6 +423,7 @@ def download_bars(
 
 __all__ = [
     "CANONICAL_COLUMNS",
+    "DEFAULT_ADJUSTMENT",
     "EQUITY_SYMBOLS",
     "EQUITY_TIMEFRAME",
     "FEED",
