@@ -25,10 +25,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from studies.equity_v1_v5.windows import EMBARGO_BARS, SCORING_WINDOWS, ScoringWindow
-
 from autotrader.ml.labels import LabelSpec
 from autotrader.ml.v4 import DEFAULT_HORIZON_BARS, default_label_spec
+from studies.equity_v1_v5.windows import EMBARGO_BARS, SCORING_WINDOWS, ScoringWindow
 
 #: The predeclared candidate horizons, in 15-minute regular-session bars.
 #: 4 is the shipped default; 8, 16 and 26 are roughly two hours, four hours and

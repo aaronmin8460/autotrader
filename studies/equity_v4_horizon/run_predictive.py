@@ -30,6 +30,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+
 from studies.equity_v1_v5.calendar import read_snapshot
 from studies.equity_v4_horizon.checkpoint import cell_path, is_complete, write_cell
 from studies.equity_v4_horizon.evaluation import (

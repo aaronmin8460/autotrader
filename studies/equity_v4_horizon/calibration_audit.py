@@ -24,7 +24,6 @@ from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
-from studies.equity_v4_horizon.horizons import MIN_EXTREME_SUPPORT
 
 from autotrader.decision.probability import (
     V4_FEATURE_COLUMNS,
@@ -34,6 +33,7 @@ from autotrader.decision.probability import (
 )
 from autotrader.ml.labels import DIRECTION_UP
 from autotrader.ml.v4 import TrainedModel, evaluate_probabilities
+from studies.equity_v4_horizon.horizons import MIN_EXTREME_SUPPORT
 
 #: A calibrated probability at or beyond these bounds is "extreme" for the
 #: audit: close enough to certainty that its provenance must be shown.

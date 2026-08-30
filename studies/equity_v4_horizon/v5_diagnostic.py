@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 
 import pandas as pd
+
+from autotrader.decision.probability import ProbabilityArtifact, artifact_from_record
 from studies.equity_v1_v5.adapters import DecisionRecord
 from studies.equity_v1_v5.scoring import (
     COST_MODELS,
@@ -43,8 +45,6 @@ from studies.equity_v1_v5.scoring import (
 from studies.equity_v1_v5.windows import ScoringWindow
 from studies.equity_v4_horizon.checkpoint import read_cell
 from studies.equity_v4_horizon.horizons import require_study_horizon
-
-from autotrader.decision.probability import ProbabilityArtifact, artifact_from_record
 
 #: How many sampled bars must reproduce exactly before a stored pilot V5
 #: series is accepted in place of a fresh scoring pass.

@@ -32,14 +32,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pandas as pd
-from studies.equity_v1_v5.calendar import SnapshotCalendar
-from studies.equity_v1_v5.windows import EMBARGO_BARS, ScoringWindow
-from studies.equity_v4_horizon.calibration_audit import audit_calibration
-from studies.equity_v4_horizon.horizons import (
-    STUDY_SEED,
-    label_spec_for,
-    outer_gap_bars,
-)
 
 from autotrader.decision.features import FEATURE_SCHEMA_VERSION
 from autotrader.decision.probability import (
@@ -63,6 +55,14 @@ from autotrader.ml.v4 import (
     fit_standardizer,
     select_candidate,
     train_model,
+)
+from studies.equity_v1_v5.calendar import SnapshotCalendar
+from studies.equity_v1_v5.windows import EMBARGO_BARS, ScoringWindow
+from studies.equity_v4_horizon.calibration_audit import audit_calibration
+from studies.equity_v4_horizon.horizons import (
+    STUDY_SEED,
+    label_spec_for,
+    outer_gap_bars,
 )
 
 #: The smallest training frame worth fitting on, unchanged from the pilot.

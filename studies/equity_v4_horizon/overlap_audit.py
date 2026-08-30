@@ -18,6 +18,7 @@ import json
 import time
 from pathlib import Path
 
+from autotrader.ml.splits import SplitSpec, assert_no_leakage, temporal_split, walk_forward_folds
 from studies.equity_v1_v5.calendar import read_snapshot
 from studies.equity_v1_v5.windows import EMBARGO_BARS
 from studies.equity_v4_horizon.horizons import (
@@ -35,8 +36,6 @@ from studies.equity_v4_horizon.run_predictive import (
     log,
 )
 from studies.equity_v4_horizon.walkforward import training_frame_for
-
-from autotrader.ml.splits import SplitSpec, assert_no_leakage, temporal_split, walk_forward_folds
 
 
 def audit_symbol(symbol: str, *, dataset_root: Path, output_root: Path, stage: str) -> Path:
