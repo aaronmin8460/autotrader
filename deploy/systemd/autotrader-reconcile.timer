@@ -1,0 +1,41 @@
+# Hourly reconciliation of the crypto operational store.
+#
+# Install to /usr/lib/systemd/system/autotrader-reconcile.timer, then:
+#   systemctl enable --now autotrader-reconcile.timer
+#
+# CADENCE. Hourly, not faster. The staleness this bounds is a bookkeeping
+# staleness, not a risk one: exposure caps are enforced against positions read
+# from the broker on every submission, so a stale local snapshot never sizes an
+# order. What goes stale is the audit trail and the freshness of the evidence
+# behind Account Safety. An hour is short enough that the 2026-08-31 failure -
+# three days of unsettled fills - cannot recur unnoticed, and long enough that
+# a system making a few dozen provider calls per hour does not double that
+# figure to watch itself.
+#
+# PHASE. Deliberately off the quarter-hour. Both runtimes wake at :00, :15, :30
+# and :45 plus five seconds and may submit within the following second, and
+# reconciliation's one precondition is that it does not run while a submission
+# is in flight - an intent created seconds ago, whose order has not yet reached
+# the broker, is exactly the case its "confirmed absent" branch must never see.
+# Starting at :07:30 with at most a minute of jitter keeps every run more than
+# six minutes clear of a boundary in both directions. The bounded re-check
+# inside the engine is the second line of defence, not the first.
+#
+# NO OVERLAP. systemd will not start a second instance of a oneshot service
+# while one is still running; a trigger that arrives during a slow pass is
+# dropped and logged rather than queued.
+
+[Unit]
+Description=Hourly AutoTrader reconciliation (crypto operational store)
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+
+[Timer]
+OnCalendar=*-*-* *:07:30
+RandomizedDelaySec=60
+# Run once on the next boot if the machine was down when a trigger was due.
+# A pass that was missed is a pass whose findings are still outstanding.
+Persistent=true
+Unit=autotrader-reconcile.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,92 @@
+# AutoTrader recurring reconciliation - crypto operational store, PAPER only.
+#
+# Install to /usr/lib/systemd/system/autotrader-reconcile.service, alongside
+# autotrader-reconcile.timer. Started by the timer; `systemctl start
+# autotrader-reconcile` runs one on demand.
+#
+# WHY THIS EXISTS. The runtime records a submission the moment the broker
+# accepts it and then moves on; settlement is reconciliation's job. Until
+# 2026-08-31 the only thing that ever ran a pass was a service start, so a host
+# that stayed up for three days carried a three-day-old book: eleven orders the
+# broker had filled were still recorded `pending_new`, the local positions
+# snapshot was inverted with respect to the broker, and the heartbeat kept
+# printing `reconciliation_status=CLEAN` because it was echoing a run from
+# 2026-08-28. Risk sizing was never affected - it reads positions from the
+# broker - but Account Safety was reporting from stale evidence, which is the
+# one number that gates whether anything may submit at all.
+#
+# WHAT IT MAY DO. Reconciliation reads the broker and rewrites local rows to
+# match it. It cannot submit, cancel, or replace an order: the module imports
+# no submission function, no order-request type and no client factory that
+# builds a request, and a source-level test asserts each of those identifiers
+# is absent from its executable code. A recurring pass therefore cannot place a
+# duplicate order no matter how often it runs.
+#
+# THE V6 PIN. ExecStart names /opt/autotrader/venv deliberately. That venv is
+# the same build autotrader-crypto.service runs, and its installed package
+# declares SCHEMA_VERSION = 6. Every command in this repository calls
+# `initialize_database()` first, which migrates upward automatically - so a v7
+# checkout pointed at this database would take it to schema 7, and the running
+# crypto service would then refuse to open its own store on its next cycle.
+# The equity paper store has its own reconcile unit against its own venv.
+
+[Unit]
+Description=AutoTrader reconciliation - crypto operational store (Alpaca PAPER)
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+ConditionPathExists=/etc/autotrader/autotrader.env
+ConditionPathExists=/opt/autotrader/venv/bin/autotrader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=autotrader
+Group=autotrader
+WorkingDirectory=/opt/autotrader/app
+
+# The credentials file is optional in the same sense as it is for the runtimes:
+# a host that has none fails the pass visibly rather than failing the unit at
+# load. The activation file is deliberately NOT read - reconciliation needs
+# neither the environment gate nor a confirmation token, because there is
+# nothing here to confirm.
+EnvironmentFile=/etc/autotrader/autotrader.env
+EnvironmentFile=-/etc/autotrader/autotrader.secrets.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+ExecStart=/opt/autotrader/venv/bin/autotrader reconcile --db ${AUTOTRADER_DB}
+
+# Fail visibly. The CLI exits 0 on CLEAN or REPAIRED, 1 when the pass FAILED
+# and nothing is known, and 2 when it completed but something is UNRESOLVED -
+# meaning an order may exist at the broker and a human must settle it. Both
+# non-zero codes leave this unit `failed`, where `systemctl --failed` and the
+# next timer's status line will show it. Nothing retries: a pass that could not
+# establish broker truth will not establish it thirty seconds later, and the
+# next scheduled run is the retry.
+TimeoutStartSec=300
+
+StateDirectory=autotrader
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-reconcile
