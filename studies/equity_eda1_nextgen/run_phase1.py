@@ -31,7 +31,6 @@ from studies.equity_deep_arch.run_eda1 import default_datasets, default_decision
 from studies.equity_deep_arch.state import (
     ParticipationSpec,
     participation_series,
-    per_bar_participation,
     session_closes,
 )
 from studies.equity_eda1_nextgen import REPORT_ROOT
@@ -103,9 +102,7 @@ def build_challenger(
                 raise SystemExit(f"No state for session {day} (bar {ts}).")
             by_bar[pd.Timestamp(ts)] = by_session[day]
         if isinstance(spec, RefinedSpec):
-            challenger[symbol] = participation_overlay(
-                stored, by_bar, architecture=f"P1_{name}"
-            )
+            challenger[symbol] = participation_overlay(stored, by_bar, architecture=f"P1_{name}")
         else:
             challenger[symbol] = freeze_overlay(stored, by_bar, architecture=f"P1_{name}")
     return challenger, flips
@@ -247,9 +244,7 @@ def run_perturb(datasets: Path, decisions: Path, output: Path, winner: str) -> N
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--stage", required=True, choices=("wiring", "variants", "lite", "perturb")
-    )
+    parser.add_argument("--stage", required=True, choices=("wiring", "variants", "lite", "perturb"))
     parser.add_argument("--winner", default=None)
     parser.add_argument("--datasets", type=Path, default=default_datasets())
     parser.add_argument("--decisions", type=Path, default=default_decisions())

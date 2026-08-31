@@ -19,7 +19,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -74,7 +73,9 @@ def _score_cell(task: tuple[str, str]) -> str:
     insufficient = sum(
         1
         for record in records
-        if any("INSUFFICIENT" in reason or "FEATURE_UNAVAILABLE" in reason for reason in record.reasons)
+        if any(
+            "INSUFFICIENT" in reason or "FEATURE_UNAVAILABLE" in reason for reason in record.reasons
+        )
     )
     stored = decisions_to_frame(records)
     stored["symbol"] = symbol
@@ -84,8 +85,7 @@ def _score_cell(task: tuple[str, str]) -> str:
     tmp.rename(target)
     flag = f" INSUFFICIENT={insufficient}" if insufficient else ""
     return (
-        f"{symbol}/{window_name}: {len(records)} bars in "
-        f"{time.perf_counter() - started:.0f}s{flag}"
+        f"{symbol}/{window_name}: {len(records)} bars in {time.perf_counter() - started:.0f}s{flag}"
     )
 
 
@@ -134,9 +134,7 @@ def run_wiring(sample_windows: tuple[str, ...] = ("w05",)) -> None:
 def run_drive(symbols: list[str], workers: int) -> None:
     tasks = [(symbol, window.name) for symbol in symbols for window in FULL_WINDOWS]
     pending = [
-        task
-        for task in tasks
-        if not (DECISIONS_DIR / f"{task[0]}_{task[1]}_V3.parquet").exists()
+        task for task in tasks if not (DECISIONS_DIR / f"{task[0]}_{task[1]}_V3.parquet").exists()
     ]
     print(f"{len(pending)} cells to score across {len(symbols)} symbols", flush=True)
     results: list[str] = []

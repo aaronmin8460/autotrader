@@ -10,7 +10,8 @@ everything (component isolation); defensive sessions hold
 Usage:
     python -m studies.equity_eda1_nextgen.run_phase234 --stage base --universe u30
     python -m studies.equity_eda1_nextgen.run_phase234 --stage selection --universe u30
-    python -m studies.equity_eda1_nextgen.run_phase234 --stage allocators --universe u30 --rule <winner>
+    python -m studies.equity_eda1_nextgen.run_phase234 --stage allocators \\
+        --universe u30 --rule <winner>
     python -m studies.equity_eda1_nextgen.run_phase234 --stage bridge
 """
 
@@ -195,9 +196,7 @@ class UniverseContext:
         self.frames = {s: region_frame(f) for s, f in self.frames_full.items()}
         self.participate = participation_map()
         self.sessions = region_sessions_of(self.frames_full["SPY"])
-        self.stance = {
-            symbol: load_stance(symbol, self.frames[symbol]) for symbol in self.universe
-        }
+        self.stance = {symbol: load_stance(symbol, self.frames[symbol]) for symbol in self.universe}
         self.closes = close_table(self.frames_full)
         self.states = spy_states()
         self.reserved = min(1.0 / len(self.universe), PER_SYMBOL_CAP)
@@ -310,8 +309,7 @@ def run_selection(universe_name: str) -> None:
     for rule_name, membership in selection_rules(context).items():
         top_n = int(rule_name.rsplit("top", 1)[1])
         weights = {
-            session: equal_weights(membership[session], top_n)
-            for session in context.sessions
+            session: equal_weights(membership[session], top_n) for session in context.sessions
         }
         started = time.perf_counter()
         payload[rule_name] = context.evaluate(rule_name, weights, membership)
@@ -331,7 +329,6 @@ def inverse_vol_weights(
     returns = context.closes.pct_change()
     vol = returns.rolling(63).std().shift(1)
     marks = rebalance_sessions(context.sessions)
-    at_mark: dict[date, dict[str, float]] = {}
     current: dict[str, float] = {}
     result: dict[date, dict[str, float]] = {}
     for session in context.sessions:
@@ -348,8 +345,7 @@ def inverse_vol_weights(
                 if total > 0:
                     budget = min(1.0, slots * PER_SYMBOL_CAP)
                     weights = {
-                        s: min(budget * share / total, PER_SYMBOL_CAP)
-                        for s, share in inv.items()
+                        s: min(budget * share / total, PER_SYMBOL_CAP) for s, share in inv.items()
                     }
             current = weights
         result[session] = current
@@ -378,9 +374,7 @@ def run_allocators(universe_name: str, rule_name: str) -> None:
     payload["AL_A_equal_active"] = context.evaluate("AL_A", weights_a, membership)
 
     # AL-B reserved-slot: 1/top_n capped, idle when fewer eligible.
-    weights_b = {
-        session: equal_weights(membership[session], top_n) for session in context.sessions
-    }
+    weights_b = {session: equal_weights(membership[session], top_n) for session in context.sessions}
     payload["AL_B_reserved"] = context.evaluate("AL_B", weights_b, membership)
 
     # AL-C inverse-volatility.

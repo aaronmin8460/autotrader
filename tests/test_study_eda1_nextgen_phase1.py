@@ -8,8 +8,6 @@ from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 import pytest
-
-from autotrader.decision.contract import DecisionSignal
 from studies.equity_deep_arch.state import (
     ParticipationSpec,
     StateInputError,
@@ -27,6 +25,8 @@ from studies.equity_eda1_nextgen.refined_states import (
     state_flip_count,
 )
 from studies.equity_v1_v5.adapters import DecisionRecord
+
+from autotrader.decision.contract import DecisionSignal
 
 
 def closes_frame(values: list[float]) -> pd.DataFrame:
@@ -180,9 +180,7 @@ class TestFreezeSemantics:
         assert all(record.signal is DecisionSignal.HOLD for record in overlaid)
 
     def test_freeze_defensive_follows_source_stance(self) -> None:
-        records = records_for(
-            [DecisionSignal.BUY, DecisionSignal.HOLD, DecisionSignal.SELL]
-        )
+        records = records_for([DecisionSignal.BUY, DecisionSignal.HOLD, DecisionSignal.SELL])
         states = {record.timestamp: DEFENSIVE for record in records}
         overlaid = freeze_overlay(records, states, architecture="T")
         assert [r.signal for r in overlaid] == [

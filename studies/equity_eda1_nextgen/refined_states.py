@@ -71,7 +71,9 @@ class RefinedSpec:
         if self.k_enter < 1 or self.k_exit < 1:
             raise StateInputError("k_enter and k_exit must be >= 1.")
         if self.lag_sessions < 1:
-            raise StateInputError("lag_sessions must be >= 1 (a session never reads its own close).")
+            raise StateInputError(
+                "lag_sessions must be >= 1 (a session never reads its own close)."
+            )
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -104,7 +106,9 @@ class FreezeSpec:
                 f"drawdown {self.drawdown_threshold}, calm {self.calm_threshold}."
             )
         if self.lag_sessions < 1:
-            raise StateInputError("lag_sessions must be >= 1 (a session never reads its own close).")
+            raise StateInputError(
+                "lag_sessions must be >= 1 (a session never reads its own close)."
+            )
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -141,12 +145,8 @@ def refined_participation_series(closes: pd.DataFrame, spec: RefinedSpec) -> pd.
         if j < 0 or pd.isna(sma[j]):
             state, enter_run, exit_run = False, 0, 0
         else:
-            raw_enter = (
-                values[j] > spec.enter_sma_ratio * sma[j] and drawdown[j] > spec.enter_dd
-            )
-            raw_exit = (
-                values[j] <= spec.exit_sma_ratio * sma[j] or drawdown[j] <= spec.exit_dd
-            )
+            raw_enter = values[j] > spec.enter_sma_ratio * sma[j] and drawdown[j] > spec.enter_dd
+            raw_exit = values[j] <= spec.exit_sma_ratio * sma[j] or drawdown[j] <= spec.exit_dd
             if not state:
                 enter_run = enter_run + 1 if raw_enter else 0
                 exit_run = 0
@@ -168,9 +168,12 @@ def freeze_state_series(closes: pd.DataFrame, spec: FreezeSpec) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for i in range(len(closes)):
         j = i - spec.lag_sessions
-        if j < 0 or pd.isna(sma[j]):
-            label = DEFENSIVE
-        elif values[j] <= sma[j] or drawdown[j] <= spec.drawdown_threshold:
+        below_trend_or_deep = (
+            (pd.isna(sma[j]) or values[j] <= sma[j] or drawdown[j] <= spec.drawdown_threshold)
+            if j >= 0
+            else True
+        )
+        if j < 0 or below_trend_or_deep:
             label = DEFENSIVE
         elif drawdown[j] > spec.calm_threshold:
             label = STRONG

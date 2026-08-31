@@ -8,7 +8,6 @@ from decimal import Decimal
 
 import pandas as pd
 import pytest
-
 from studies.equity_eda1_nextgen.selection import (
     above_sma,
     build_membership,
@@ -27,7 +26,8 @@ ZERO_COST = COST_MODELS[0]
 
 def bars(symbol: str, prices: list[float], start_hour: int = 14) -> pd.DataFrame:
     stamps = [
-        pd.Timestamp(datetime(2024, 6, 3, start_hour, 30, tzinfo=UTC)) + pd.Timedelta(minutes=15 * i)
+        pd.Timestamp(datetime(2024, 6, 3, start_hour, 30, tzinfo=UTC))
+        + pd.Timedelta(minutes=15 * i)
         for i in range(len(prices))
     ]
     return pd.DataFrame(
@@ -142,9 +142,7 @@ class TestSelection:
         sessions = [date(2024, 1, 1) + timedelta(days=i) for i in range(45)]
         marks = rebalance_sessions(sessions)
         assert marks == [sessions[0], sessions[21], sessions[42]]
-        membership = build_membership(
-            sessions, {sessions[0]: ("AAA",), sessions[21]: ("BBB",)}
-        )
+        membership = build_membership(sessions, {sessions[0]: ("AAA",), sessions[21]: ("BBB",)})
         assert membership[sessions[5]] == ("AAA",)
         assert membership[sessions[21]] == ("BBB",)
         assert membership[sessions[40]] == ("BBB",)

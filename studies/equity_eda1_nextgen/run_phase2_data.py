@@ -32,13 +32,13 @@ from studies.equity_10_full.split_audit import (
 )
 from studies.equity_deep_arch.evaluate import write_json
 from studies.equity_eda1_nextgen import NEXTGEN_DATASETS, REPORT_ROOT
+from studies.equity_eda1_nextgen.fetch import download_raw_any
 from studies.equity_eda1_nextgen.universe import (
     DOWNLOAD_SYMBOLS,
     MAX_MISSING_FRACTION,
     build_manifests,
     liquidity_metric,
 )
-from studies.equity_eda1_nextgen.fetch import download_raw_any
 from studies.equity_v1_v5.calendar import read_snapshot, snapshot_path
 from studies.equity_v1_v5.dataset import (
     DatasetError,
@@ -107,6 +107,7 @@ def build_research_frame(raw: pd.DataFrame, calendar, *, symbol: str, raw_digest
     )
     return frame, provenance
 
+
 FROZEN_DATASETS = Path("/Volumes/AUTOTRADER_QA/datasets/equity-historical")
 
 
@@ -140,7 +141,12 @@ def build_symbol_any(datasets: Path, symbol: str, calendar) -> dict[str, object]
                 f"{symbol}: stored frame digest does not match its provenance sidecar."
             )
         _log(f"{symbol}: session frame exists, {len(frame)} rows, verified — skipping.")
-        return {"symbol": symbol, "rows": len(frame), "frame_sha256": digest, "provenance": "cached"}
+        return {
+            "symbol": symbol,
+            "rows": len(frame),
+            "frame_sha256": digest,
+            "provenance": "cached",
+        }
 
     started = time.perf_counter()
     _log(f"{symbol}: downloading {DATA_START}..{DATA_END} split-adjusted…")
@@ -152,8 +158,7 @@ def build_symbol_any(datasets: Path, symbol: str, calendar) -> dict[str, object]
     frame, provenance = build_research_frame(raw, calendar, symbol=symbol, raw_digest=raw_digest)
     if not provenance.validation_ok:
         raise ValueError(
-            f"{symbol}: evaluation frame failed validation: "
-            f"{list(provenance.validation_issues)}"
+            f"{symbol}: evaluation frame failed validation: {list(provenance.validation_issues)}"
         )
     frame.to_parquet(session_file, engine="pyarrow", index=False)
     write_provenance(provenance, sidecar)
@@ -236,9 +241,7 @@ def run_manifest(datasets: Path) -> None:
         first_bar = str(frame["timestamp"].iloc[0])
         missing_fraction = max(0.0, 1.0 - len(frame) / expected_bars)
         if days[0] > date_type(2021, 1, 5) or days[-1] < date_type(2026, 8, 27):
-            reasons.append(
-                f"listing/coverage gap: sessions span {days[0]}..{days[-1]}"
-            )
+            reasons.append(f"listing/coverage gap: sessions span {days[0]}..{days[-1]}")
         if missing_fraction >= MAX_MISSING_FRACTION:
             reasons.append(f"missing-bar fraction {missing_fraction:.4f} >= 0.01")
         eligibility[symbol] = {
@@ -263,11 +266,7 @@ def run_manifest(datasets: Path) -> None:
     }
 
     manifests = build_manifests(
-        {
-            symbol: row
-            for symbol, row in eligibility.items()
-            if symbol not in CONTEXT_ONLY
-        }
+        {symbol: row for symbol, row in eligibility.items() if symbol not in CONTEXT_ONLY}
     )
     payload = {
         "built_at_utc": datetime.now(UTC).isoformat(),

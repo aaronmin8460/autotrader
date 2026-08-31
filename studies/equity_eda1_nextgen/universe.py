@@ -109,8 +109,24 @@ STOCK_POOL: tuple[str, ...] = (
 #: financials is applied throughout — a disclosed static simplification).
 SECTOR_OF: dict[str, str] = {
     # technology
-    **{s: "XLK" for s in ("AAPL", "MSFT", "NVDA", "AVGO", "AMD", "CRM", "ORCL", "ADBE",
-                          "INTC", "QCOM", "TXN", "CSCO", "IBM")},
+    **{
+        s: "XLK"
+        for s in (
+            "AAPL",
+            "MSFT",
+            "NVDA",
+            "AVGO",
+            "AMD",
+            "CRM",
+            "ORCL",
+            "ADBE",
+            "INTC",
+            "QCOM",
+            "TXN",
+            "CSCO",
+            "IBM",
+        )
+    },
     # communication services
     **{s: "XLC" for s in ("META", "GOOGL", "NFLX", "DIS", "CMCSA", "VZ")},
     # consumer discretionary
