@@ -622,16 +622,17 @@ def test_gitinfo_never_names_an_autotrader_command() -> None:
 
 
 def test_the_generated_command_is_data_and_never_reaches_a_process() -> None:
-    """`paper-submit` appears in exactly the modules that print it.
+    """`paper-submit` and `equity-submit` appear in exactly the modules that print them.
 
-    It is a string built for a human. The modules that build or display it are
-    also the modules proven above to have no way to start a process, so there
-    is nowhere for it to go except the terminal.
+    They are strings built for a human. The modules that build or display them
+    are also the modules proven above to have no way to start a process, so
+    there is nowhere for them to go except the terminal.
     """
-    producing = {name for name, source in package_source().items() if "paper-submit" in source}
-    assert producing <= {"cleanup.py", "cli.py", "__init__.py"}, producing
-    for name in producing:
-        assert "subprocess" not in package_code()[name]
+    for command in ("paper-submit", "equity-submit"):
+        producing = {name for name, source in package_source().items() if command in source}
+        assert producing <= {"cleanup.py", "cli.py", "__init__.py"}, (command, producing)
+        for name in producing:
+            assert "subprocess" not in package_code()[name]
 
 
 def declared_cli_options() -> set[str]:

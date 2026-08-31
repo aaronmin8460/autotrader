@@ -186,6 +186,17 @@ def resolve_reference_price(
     return None, "unavailable"
 
 
+def _submit_program(symbol: str) -> str:
+    """The CLI command that owns `symbol`'s book.
+
+    `paper-submit` accepts only the crypto pairs and `equity-submit` only the
+    equity tickers, so a generated line naming the wrong program would be one
+    the operator types and watches fail. Routing by book keeps every printed
+    command runnable as printed.
+    """
+    return "autotrader paper-submit" if is_crypto_symbol(symbol) else "autotrader equity-submit"
+
+
 def build_cleanup_command(
     symbol: str, quantity: Decimal, *, database: Path | str | None = None
 ) -> str:
@@ -197,9 +208,10 @@ def build_cleanup_command(
     needs are shown alongside by the caller, because a command that looks
     ready-to-run should not hide the two gates that still stand in front of it.
     """
+    ticker = normalize_smoke_symbol(symbol)
     parts = [
-        "autotrader paper-submit",
-        f"--symbol {normalize_smoke_symbol(symbol)}",
+        _submit_program(ticker),
+        f"--symbol {ticker}",
         "--side SELL",
         f"--qty {format_quantity(quantity)}",
         "--confirm-paper PAPER",
@@ -219,9 +231,10 @@ def build_dry_run_command(
     would happen, and stops - so it is the honest way to check a size before
     committing to one.
     """
+    ticker = normalize_smoke_symbol(symbol)
     parts = [
-        "autotrader paper-submit",
-        f"--symbol {normalize_smoke_symbol(symbol)}",
+        _submit_program(ticker),
+        f"--symbol {ticker}",
         f"--side {side.strip().upper()}",
         f"--qty {format_quantity(quantity)}",
         "--dry-run",

@@ -1355,10 +1355,52 @@ def source_modules() -> list[Path]:
 
 
 def test_nothing_outside_the_shadow_package_imports_it() -> None:
-    """CRITICAL. No runtime constructs a panel; no gate reads a shadow decision."""
+    """CRITICAL. No trading runtime constructs a panel; no gate reads a shadow decision.
+
+    One narrow exemption: `equity/shadow.py`, the V3 live-shadow runtime, is
+    the observational service this package was built for and may import it.
+    The exemption is paired with the test below, which holds that module to
+    the property that justifies it - no execution layer, no broker SDK, no
+    gateway, anywhere in its code.
+    """
+    exempt = ("equity", "shadow.py")
     for path in source_modules():
+        if path.parts[-2:] == exempt:
+            continue
         code = code_without_prose(path.read_text(encoding="utf-8"))
         assert "autotrader.shadow" not in code, f"{path.name} imports the shadow package"
+
+
+def test_the_equity_shadow_runtime_earns_its_exemption() -> None:
+    """CRITICAL. The one module allowed to import this package cannot reach a broker.
+
+    Checked against the stripped source, so a docstring mentioning an order
+    does not count and an import hiding in a function body does. The names
+    banned here are the execution layer's entry points and the broker SDK -
+    the exact things whose absence makes "the shadow has no path to an order"
+    a fact about the import graph rather than a promise.
+    """
+    path = Path(state.__file__).parent.parent / "equity" / "shadow.py"
+    code = code_without_prose(path.read_text(encoding="utf-8"))
+    forbidden = (
+        "autotrader.execution",
+        "autotrader.risk",
+        "autotrader.account",
+        "autotrader.reconciliation",
+        "autotrader.runtime.execution",
+        "alpaca",
+        "TradingClient",
+        "submit_order",
+        "execute_paper_order",
+        "execute_equity_paper_order",
+        "ExecutionGateway",
+        "create_paper_trading_client",
+        "close_position",
+        "cancel_order",
+        "replace_order",
+    )
+    for name in forbidden:
+        assert name not in code, f"equity/shadow.py names {name}"
 
 
 def test_the_crypto_runtime_still_evaluates_the_existing_strategy() -> None:

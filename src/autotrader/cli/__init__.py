@@ -80,8 +80,18 @@ from autotrader.equity.runtime import (
 )
 from autotrader.equity.runtime import PROCESSING_ORDER as EQUITY_PROCESSING_ORDER
 from autotrader.equity.session import SessionError, is_market_open
+from autotrader.equity.shadow import (
+    DEFAULT_SHADOW_LOOKBACK_BARS,
+    EQUITY_SHADOW_LOCK_SCOPE,
+    MAX_SHADOW_LOOKBACK_BARS,
+    MIN_SHADOW_LOOKBACK_BARS,
+    EquityShadowConfig,
+    EquityShadowRuntime,
+    ShadowEquityBars,
+    ShadowIntegrityError,
+)
 from autotrader.execution import paper as paper_execution
-from autotrader.execution.equity import AlpacaMarketCalendar
+from autotrader.execution.equity import AlpacaMarketCalendar, execute_equity_paper_order
 from autotrader.execution.models import ExecutionError, format_quantity, parse_quantity
 from autotrader.execution.paper import (
     AmbiguousSubmissionError,
@@ -173,6 +183,23 @@ CRYPTO_RUN_PAUSED_EXIT_CODE = 2
 #: look like a failure to whatever supervises it.
 EQUITY_RUN_REFUSED_EXIT_CODE = 1
 EQUITY_RUN_PAUSED_EXIT_CODE = 2
+
+#: `equity-submit` exit codes, deliberately identical in shape and meaning to
+#: `paper-submit`'s. A closed regular session is a controlled refusal (1): the
+#: order was never sent and never queued, so nothing is ambiguous about it.
+EQUITY_SUBMIT_REFUSED_EXIT_CODE = PAPER_SUBMIT_REFUSED_EXIT_CODE
+EQUITY_SUBMIT_UNKNOWN_EXIT_CODE = PAPER_SUBMIT_UNKNOWN_EXIT_CODE
+
+#: `equity-shadow` exit codes. 0 is a clean stop - a shadow that found the
+#: market shut and observed nothing did exactly its job. 1 is a controlled
+#: refusal or a fatal failure. There is deliberately no code 2: nothing the
+#: shadow runs can submit, so no outcome of it can be UNKNOWN.
+EQUITY_SHADOW_REFUSED_EXIT_CODE = 1
+
+#: Where the shadow keeps its own state, away from the trading database. The
+#: two must not share a file: they would share the per-symbol bar claims, and
+#: the shadow refuses any database that has ever held an order intent.
+EQUITY_SHADOW_DATABASE_PATH = Path("data/autotrader-shadow.db")
 
 #: Width of the label column in the backtest report.
 _LABEL_WIDTH = 23
@@ -1305,6 +1332,330 @@ def equity_run(
         typer.echo("")
         typer.secho("RUNTIME STOPPED ON A FATAL ERROR", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=EQUITY_RUN_REFUSED_EXIT_CODE)
+
+
+def _echo_equity_submit_preview(result: PaperExecutionResult, *, dry_run: bool) -> None:
+    """Print the pre-submission preview for one equity order.
+
+    The crypto preview's shape with the crypto-only lines removed: an equity
+    asset carries no broker-published minimum, so the whole-share floor is this
+    system's policy and is stated by the risk message when it bites. No
+    credential, no authorization header, and no account number appears here.
+    """
+    decision = result.risk_decision
+    typer.echo("AUTO TRADER - PAPER EQUITY ORDER")
+    typer.echo("")
+    typer.echo(_field("Environment", "PAPER ONLY"))
+    typer.echo(_field("Trading", "US EQUITY, REGULAR SESSION ONLY"))
+    typer.echo(_field("Symbol", result.symbol))
+    typer.echo(_field("Side", result.side.value))
+    typer.echo(_field("Requested Qty", format_quantity(result.requested_quantity)))
+    typer.echo(_field("Reference Price", _money(result.reference_price)))
+    typer.echo("")
+    typer.echo(_field("Account Equity", _money(result.account.equity)))
+    typer.echo(_field("Account Cash", _money(result.account.cash)))
+    typer.echo(_field("UTC Day Baseline", _money(result.daily_baseline_equity)))
+    daily_pnl = Decimal(str(result.account.equity)) - result.daily_baseline_equity
+    typer.echo(_field("Daily P&L", _money(daily_pnl)))
+    typer.echo("")
+    typer.echo(_field("Risk Decision", "APPROVED" if decision.approved else "REJECTED"))
+    typer.echo(_field("Risk Reason", decision.reason_code))
+    typer.echo(_field("Approved Qty", format_quantity(decision.approved_quantity)))
+    if result.intent is not None:
+        typer.echo(_field("Broker Qty", format_quantity(result.intent.approved_quantity)))
+        typer.echo(_field("Client Order ID", result.intent.client_order_id))
+    if dry_run:
+        typer.echo("")
+        typer.echo("DRY RUN - no order was submitted and nothing was persisted.")
+
+
+@app.command(name="equity-submit")
+def equity_submit(
+    symbol: str = typer.Option(
+        ...,
+        "--symbol",
+        help=f"Equity ticker to trade. One of: {', '.join(EQUITY_SYMBOLS)}.",
+    ),
+    side: str = typer.Option(..., "--side", help="BUY or SELL. Long only; no shorts."),
+    qty: str = typer.Option(
+        ...,
+        "--qty",
+        help=(
+            "Whole shares to request, as a decimal number (e.g. 1). The approved "
+            "quantity is floored to whole shares; below one share is refused."
+        ),
+    ),
+    confirm_paper: str = typer.Option(
+        "",
+        "--confirm-paper",
+        help=(
+            f"Type {paper_execution.CONFIRMATION_TOKEN} exactly to confirm a real paper "
+            "submission. Not required for --dry-run."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Evaluate everything and print the preview, but never submit.",
+    ),
+    database: Annotated[
+        Path,
+        typer.Option("--db", help="Local operational-state database."),
+    ] = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Submit one MARKET order for one equity to the Alpaca **PAPER** account.
+
+    `paper-submit`'s equity counterpart, running the same execution boundary
+    the equity runtime uses (`execute_equity_paper_order`): the same risk
+    engine, the same durable intent before any broker call, the same
+    at-most-once submission, and one gate the crypto path does not have - the
+    broker's own clock must say the **regular session is open**, or nothing is
+    submitted and nothing is queued for a later session.
+
+    There is no live mode: the trading client is constructed with `paper=True`
+    hardcoded, and no flag, option, or environment variable selects anything
+    else.
+
+    A real submission needs **both** gates, independent and closed by default:
+
+    \b
+      1. AUTOTRADER_PAPER_TRADING_ENABLED=true in the environment
+      2. --confirm-paper PAPER on the command line
+
+    `--dry-run` needs neither and works while the market is closed: it reads
+    the account, positions, the asset's broker metadata, and the current IEX
+    price, runs the risk engine, prints the preview, and stops without
+    persisting an intent or submitting. Running it first is the intended way
+    to check an order.
+
+    Exits 0 when the order was submitted, already existed, or a dry run
+    completed; 1 on a controlled refusal - including a closed session and a
+    risk rejection; and 2 when the outcome is UNKNOWN, meaning an order may
+    exist at the broker and must be reconciled before anything else is sent.
+    """
+    if not dry_run:
+        try:
+            paper_execution.require_paper_trading_enabled()
+            paper_execution.require_confirmation(confirm_paper)
+        except ExecutionError as error:
+            typer.secho(str(error), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=EQUITY_SUBMIT_REFUSED_EXIT_CODE) from None
+
+    try:
+        quantity = parse_quantity(qty, "--qty")
+    except ExecutionError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SUBMIT_REFUSED_EXIT_CODE) from None
+
+    try:
+        initialize_database(database)
+    except StateError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SUBMIT_REFUSED_EXIT_CODE) from None
+
+    with connect(database) as connection:
+        try:
+            result = execute_equity_paper_order(
+                connection,
+                symbol=symbol,
+                side=side,
+                requested_quantity=quantity,
+                dry_run=dry_run,
+                now=datetime.now(UTC),
+            )
+        except AmbiguousSubmissionError as error:
+            # Its own exit code: an order may exist at the broker, which is a
+            # different situation from "nothing happened".
+            typer.secho(str(error), fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(code=EQUITY_SUBMIT_UNKNOWN_EXIT_CODE) from None
+        except (ExecutionError, StateError, EquityError) as error:
+            typer.secho(str(error), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=EQUITY_SUBMIT_REFUSED_EXIT_CODE) from None
+
+    _echo_equity_submit_preview(result, dry_run=dry_run)
+
+    if result.outcome is ExecutionOutcome.REJECTED_BY_RISK:
+        typer.echo("")
+        typer.secho("REJECTED BY RISK ENGINE", fg=typer.colors.RED)
+        typer.echo(result.message)
+        typer.echo("No order was created and no broker request was made.")
+        raise typer.Exit(code=EQUITY_SUBMIT_REFUSED_EXIT_CODE)
+
+    if result.outcome is ExecutionOutcome.DRY_RUN:
+        return
+
+    snapshot = result.broker_order
+    typer.echo("")
+    if result.outcome is ExecutionOutcome.DUPLICATE:
+        typer.secho("ALREADY SUBMITTED", fg=typer.colors.YELLOW)
+        typer.echo("The broker already had an order under this client order ID.")
+    else:
+        typer.secho("SUBMITTED TO PAPER ACCOUNT", fg=typer.colors.GREEN)
+    if snapshot is not None:
+        typer.echo("")
+        typer.echo(_field("Broker Order ID", snapshot.broker_order_id))
+        typer.echo(_field("Client Order ID", snapshot.client_order_id))
+        typer.echo(_field("Submitted Qty", format_quantity(snapshot.quantity)))
+        typer.echo(_field("Broker Status", snapshot.status))
+        typer.echo(_field("Filled Qty", format_quantity(snapshot.filled_quantity)))
+    typer.echo("")
+    typer.echo("Accepted is not filled. Local positions are not updated from an")
+    typer.echo("accepted order. Run `autotrader reconcile` to settle it against the broker.")
+
+
+def _echo_equity_shadow_banner(
+    runtime: EquityShadowRuntime, *, once: bool, lock: Path, database: Path
+) -> None:
+    typer.echo("AUTO TRADER - EQUITY V3 LIVE SHADOW")
+    typer.echo("")
+    typer.echo(_field("Environment", "OBSERVATION ONLY"))
+    typer.echo(_field("Engine", runtime.engine_version))
+    typer.echo(_field("Universe", ", ".join(EQUITY_PROCESSING_ORDER)))
+    typer.echo(_field("Session", "US regular hours, broker calendar"))
+    typer.echo(_field("Lookback Bars", str(runtime.lookback_bars)))
+    typer.echo(_field("Mode", "single cycle" if once else "daemon"))
+    typer.echo(_field("Database", str(database)))
+    typer.echo(_field("Lock", str(lock)))
+    typer.echo("")
+    typer.secho(
+        "ZERO ORDER MUTATION: this process holds no execution path. Decisions are",
+        bold=True,
+    )
+    typer.secho(
+        "recorded and dropped; no order can be submitted, cancelled, or replaced.",
+        bold=True,
+    )
+    typer.echo("")
+
+
+@app.command(name="equity-shadow")
+def equity_shadow(
+    once: bool = typer.Option(
+        False,
+        "--once",
+        help="Process the current cycle once and exit, without waiting.",
+    ),
+    safety_delay: float = typer.Option(
+        DEFAULT_SAFETY_DELAY.total_seconds(),
+        "--safety-delay",
+        help=(
+            "Seconds to wait after a 15-minute boundary before treating the bar that "
+            "just closed as fetchable. Covers provider publication lag."
+        ),
+    ),
+    lookback_bars: int = typer.Option(
+        DEFAULT_SHADOW_LOOKBACK_BARS,
+        "--lookback-bars",
+        help=(
+            f"Completed base bars fetched per cycle, between {MIN_SHADOW_LOOKBACK_BARS} "
+            f"(V3's declared requirement) and {MAX_SHADOW_LOOKBACK_BARS}. The default "
+            "is the historical study's pre-declared uniform lookback."
+        ),
+    ),
+    database: Annotated[
+        Path,
+        typer.Option(
+            "--db",
+            help=(
+                "The shadow's own state database. Never the trading database: a "
+                "database that has ever held an order intent is refused."
+            ),
+        ),
+    ] = EQUITY_SHADOW_DATABASE_PATH,
+) -> None:
+    """Run the Equity V3 LIVE SHADOW: real decisions recorded, zero orders.
+
+    Watches the ten Equity V0.2 symbols on completed regular-session 15-minute
+    bars - the broker's calendar and clock are the authority, exactly as in the
+    trading runtime - runs the V3 decision engine on each newest completed bar,
+    and records every decision durably in `shadow_decisions`.
+
+    \b
+    What makes this a shadow rather than a runtime with its gates shut:
+      * there is no execution path to disable - the shadow runtime's
+        constructor has no execution parameter and holds no gateway
+      * no environment gate and no confirmation token exist here, because
+        there is nothing they could authorize
+      * the shadow keeps its own database and refuses one that has ever held
+        an order intent, so it can never share (or steal) the trading
+        runtime's per-symbol bar claims
+      * after every cycle the process re-verifies that its database holds
+        zero order intents, and stops if that is ever untrue
+
+    Reads the market-data and calendar endpoints only. A completed bar is
+    claimed durably before V3 sees it and is never evaluated twice, across
+    restarts included: miss an observation rather than duplicate one.
+
+    Exits 0 on a clean stop - a shadow that found the market shut and observed
+    nothing did its job - and 1 on a controlled refusal or a fatal failure.
+    """
+    _configure_runtime_logging(verbose=False)
+
+    code_sha: str | None = None
+    try:
+        from autotrader.smoke.gitinfo import git_state
+
+        code_sha = git_state(Path(".")).sha
+    except Exception:  # noqa: BLE001 - provenance is recorded, never required
+        code_sha = None
+
+    try:
+        config = EquityShadowConfig(
+            safety_delay=timedelta(seconds=safety_delay),
+            lookback_bars=lookback_bars,
+            code_sha=code_sha,
+        )
+    except (ScheduleError, EquityError) as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE) from None
+
+    try:
+        initialize_database(database)
+    except StateError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE) from None
+
+    lock = RuntimeLock(lock_path_for(database, scope=EQUITY_SHADOW_LOCK_SCOPE))
+    try:
+        lock.acquire()
+    except RuntimeLockError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE) from None
+
+    shutdown = ShutdownRequest()
+    shutdown.install()
+    try:
+        with connect(database) as connection:
+            calendar = AlpacaMarketCalendar()
+            runtime = EquityShadowRuntime(
+                connection,
+                market_data=ShadowEquityBars(calendar),
+                calendar=calendar,
+                config=config,
+                shutdown=shutdown,
+            )
+            try:
+                runtime.start()
+            except ShadowIntegrityError as error:
+                typer.secho(str(error), fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE) from None
+            _echo_equity_shadow_banner(runtime, once=once, lock=lock.path, database=database)
+            try:
+                if once:
+                    runtime.run_cycle()
+                else:
+                    runtime.run_forever()
+            finally:
+                runtime.stop()
+            state_value = runtime.state
+    finally:
+        shutdown.restore()
+        lock.release()
+
+    if state_value is RuntimeState.FAILED:
+        typer.echo("")
+        typer.secho("SHADOW STOPPED ON A FATAL ERROR", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE)
 
 
 #: The research command group. Registered here rather than defined here: study
