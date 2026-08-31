@@ -32,7 +32,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args()
     horizon = PRIMARY_HORIZON
-    out: dict = {"generated_at": datetime.now(tz=UTC).isoformat(), "horizon": horizon, "symbols": {}}
+    out: dict = {
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "horizon": horizon,
+        "symbols": {},
+    }
     for symbol in SYMBOLS:
         frame = concatenated_frame(symbol)
         masks = build_event_masks(frame)

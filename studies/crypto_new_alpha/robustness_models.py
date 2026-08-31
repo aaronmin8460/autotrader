@@ -98,7 +98,10 @@ def summarize(rows: list[dict]) -> dict:
     per_year: dict = {}
     for year in sorted({r["year"] for r in rows}):
         year_deltas = [r["delta_ll"] for r in rows if r["year"] == year]
-        per_year[str(year)] = {"cells": len(year_deltas), "mean_delta_ll": float(np.mean(year_deltas))}
+        per_year[str(year)] = {
+            "cells": len(year_deltas),
+            "mean_delta_ll": float(np.mean(year_deltas)),
+        }
     strongest_year = min(per_year, key=lambda y: per_year[y]["mean_delta_ll"])
     without_year = [r["delta_ll"] for r in rows if str(r["year"]) != strongest_year]
     return {
@@ -136,9 +139,7 @@ def main() -> None:
     for family in ("logistic", "gbt"):
         rows = collect(args.horizon, family, windows)
         sound = [r for r in rows if r["train_rows"] >= MIN_SOUND_TRAIN]
-        per_symbol = {
-            s: summarize([r for r in rows if r["symbol"] == s]) for s in SYMBOLS
-        }
+        per_symbol = {s: summarize([r for r in rows if r["symbol"] == s]) for s in SYMBOLS}
         out["families"][family] = {
             "all_cells": summarize(rows),
             "sound_train_cells": summarize(sound),
