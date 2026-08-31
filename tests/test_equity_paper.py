@@ -869,3 +869,47 @@ def test_the_heartbeat_reports_the_durable_safety_answer(
     assert beat.paper_execution_enabled is True
     assert beat.startup_safety_code == state.ACCOUNT_SAFETY_SAFE
     runtime.stop()
+
+
+def test_a_restart_re_checks_parity_for_a_bar_it_already_claimed(
+    connection: sqlite3.Connection,
+) -> None:
+    """CRITICAL. A process bounce must not clear a shadow disagreement.
+
+    Restarting re-reads the stored decision and re-derives a target from it, so
+    a symbol the shadow disagreed with on its first claim would otherwise
+    become eligible again simply because the process restarted - the block
+    would last until the next restart rather than until the disagreement was
+    resolved.
+    """
+
+    class Disagreeing(AgreeingParity):
+        def decision_for(self, symbol: str, bar_timestamp: datetime) -> ParityRecord | None:
+            return ParityRecord(
+                symbol=symbol,
+                bar_timestamp=bar_timestamp,
+                reference_close=0.0,
+                participate=True,
+                eda1_signal="SELL",
+                eda1_stance=0,
+            )
+
+    # First pass: claim the bars with an agreeing shadow and no execution.
+    first = build_paper(connection, gateway=RecordingGateway(), stage="A")
+    first.run_once()
+
+    # Restart against a shadow that now disagrees, on the same already-claimed
+    # bars, with a gateway that fails the test if it is ever reached.
+    second = build_paper(
+        connection,
+        gateway=RefusingGateway(),
+        parity=Disagreeing(),
+        stage="A",
+        require_parity=True,
+        parity_price_tolerance=1e9,
+    )
+    report = second.run_once()
+
+    spy = next(item for item in report.outcomes if item.symbol == "SPY")
+    assert spy.disposition is Disposition.PARITY_MISMATCH
+    assert report.parity_mismatches > 0

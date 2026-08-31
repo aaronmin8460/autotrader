@@ -1115,6 +1115,13 @@ class EquityPaperRuntime:
         if not outcome.claimed:
             # Already processed. Not an error and not a second opinion: this
             # runtime holds the target it already computed for that bar.
+            #
+            # The parity check is re-run against the restored answer, and that
+            # is not redundant. A restart re-reads the stored decision and
+            # re-derives a target from it, so without this a symbol the shadow
+            # disagreed with on its first claim would become eligible again
+            # simply because the process bounced - the block would last until
+            # the next restart instead of until the disagreement was resolved.
             log_event(
                 self._logger,
                 "bar_already_processed",
@@ -1122,7 +1129,9 @@ class EquityPaperRuntime:
                 timestamp=bars.latest,
                 reason=outcome.skipped_reason or SKIPPED_ALREADY_PROCESSED,
             )
-            return self._outcome_from_store(symbol, bars.latest)
+            restored = self._outcome_from_store(symbol, bars.latest)
+            self._check_parity(restored, reference_close)
+            return restored
 
         self._heartbeat.last_processed_bars[symbol] = bars.latest
         eda1 = self._recorder.last_eda1.get(symbol)
