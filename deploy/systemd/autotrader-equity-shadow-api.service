@@ -1,0 +1,80 @@
+# AutoTrader EQUITY SHADOW dashboard API - read-only, 127.0.0.1:8001.
+#
+# Install to /etc/systemd/system/autotrader-equity-shadow-api.service.
+#
+# A second API process rather than more routes on the first one, and the
+# reason is the identity rather than the code. autotrader-dashboard-api reads
+# the trading database as `autotrader`, the user that owns operational truth.
+# This one reads the shadow's own record as `atshadow`, a user that cannot
+# open /var/lib/autotrader/autotrader.db, cannot read
+# /etc/autotrader/autotrader.secrets.env, and cannot read the activation file
+# that authorizes paper submission. Serving both records from one process
+# would have given the research reader that reach; the split is what makes the
+# separation kernel-enforced instead of conventional.
+#
+# The frontend joins them back together for the browser: Next.js rewrites
+# /api/dashboard/* to :8000 and /api/equity-shadow/* to :8001, so there is one
+# public origin, one authentication boundary, and one CSP.
+#
+# This unit reads NO activation file - see autotrader-equity-shadow.service
+# for the full reasoning. It is a reader of a record written by a process that
+# cannot trade, and there is nothing here for a gate to authorize.
+
+[Unit]
+Description=AutoTrader Equity Shadow API (read-only, 127.0.0.1)
+Documentation=file:/opt/autotrader-equity-shadow/app/docs/DEPLOYMENT.md
+After=network.target
+
+ConditionPathExists=/etc/autotrader/autotrader-shadow.env
+ConditionPathExists=/opt/autotrader-equity-shadow/venv/bin/python
+
+[Service]
+Type=simple
+User=atshadow
+Group=atshadow
+WorkingDirectory=/opt/autotrader-equity-shadow/app
+
+# One file, and no secrets in it. This process opens a SQLite file and serves
+# it; it never contacts the broker, so it is given no credential to lose.
+EnvironmentFile=/etc/autotrader/autotrader-shadow.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# No --host argument, deliberately: the entry point hardcodes 127.0.0.1, and a
+# host flag here would be a second way to get that wrong.
+ExecStart=/opt/autotrader-equity-shadow/venv/bin/python -m autotrader.dashboard.equity_shadow_api --port ${AUTOTRADER_EQUITY_SHADOW_API_PORT}
+
+# A viewer, not a trader. Nothing it does can be left half-finished, so unlike
+# the runtimes it restarts unconditionally: a dashboard that is down teaches an
+# operator nothing, and there is no state for a retry to corrupt.
+Restart=always
+RestartSec=5
+
+StateDirectory=autotrader-equity-shadow
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity-shadow-api
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,100 @@
+# AutoTrader EQUITY SHADOW - V3 + EDA-1 side by side, OBSERVATION ONLY.
+#
+# This unit starts a process that CANNOT submit, cancel or replace an order.
+# That is not a configuration of this file; it is a property of the program.
+# `autotrader equity-shadow` holds no execution path: its runtime constructor
+# takes no gateway, its module imports nothing from the execution layer or the
+# broker trading SDK, and after every cycle it re-verifies that its database
+# holds zero order intents and stops if that is ever untrue.
+#
+# Defence in depth, in the four places it can be placed:
+#
+#   1. the program      - no execution seam to disable (source-pinned tests)
+#   2. this unit        - loads NO activation file; there is no
+#                         AUTOTRADER_PAPER_TRADING_ENABLED and no
+#                         --confirm-paper token anywhere in ExecStart
+#   3. the identity     - runs as `atshadow`, which cannot read
+#                         /etc/autotrader/autotrader.trading.env, cannot read
+#                         /etc/autotrader/autotrader.secrets.env, and cannot
+#                         open /var/lib/autotrader/autotrader.db
+#   4. the database     - its own file, which the program refuses if it has
+#                         ever held an order intent
+#
+# Deliberately NOT autotrader-equity.service. That unit is the equity
+# PRODUCTION runtime and is masked. This one is not a replacement for it, is
+# not a step towards enabling it, and must never be edited into one.
+
+[Unit]
+Description=V3 + EDA-1 Equity Shadow - ZERO ORDER MUTATION
+Documentation=file:/opt/autotrader-equity-shadow/app/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+# An unconfigured host is an unfinished install, not a crash to retry.
+ConditionPathExists=/etc/autotrader/autotrader-shadow.env
+ConditionPathExists=/opt/autotrader-equity-shadow/venv/bin/autotrader
+
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=atshadow
+Group=atshadow
+WorkingDirectory=/opt/autotrader-equity-shadow/app
+
+# Two files, and there is no third. The trading runtimes read a third -
+# autotrader.trading.env, the activation file - and its absence here is the
+# point: there is no gate to open because there is nothing to authorize.
+EnvironmentFile=/etc/autotrader/autotrader-shadow.env
+EnvironmentFile=/etc/autotrader/autotrader-shadow.secrets.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# No --confirm-paper, no --confirm-paper-runtime, no --observe-only. The first
+# two authorize submission on commands that can submit; the third disables it
+# on a runtime that can. `equity-shadow` accepts none of them, because none of
+# them would mean anything to it.
+ExecStart=/opt/autotrader-equity-shadow/venv/bin/autotrader equity-shadow --db ${AUTOTRADER_EQUITY_SHADOW_DB}
+
+# The shadow has no exit code 2 - nothing it runs can submit, so no outcome of
+# it can be UNKNOWN. Exit 0 is a clean stop (including a closed market), exit 1
+# is a controlled refusal or a fatal failure and is worth a bounded retry.
+# RestartPreventExitStatus=2 is kept anyway so that a future exit-code change
+# cannot turn a safety halt into a retry loop by omission.
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+
+StateDirectory=autotrader-equity-shadow
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity-shadow
+
+[Install]
+WantedBy=multi-user.target

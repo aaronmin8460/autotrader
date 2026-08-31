@@ -2,10 +2,17 @@
  * The header. An operations product's title bar, not a landing page's.
  *
  * Product name, the environment it is pointed at, the one-word system verdict,
- * and when the data on screen is from. Nothing else earns a place: there is no
- * navigation because there is one page, and no logo because a screenshot of an
- * internal tool does not need branding.
+ * and when the data on screen is from. No logo: a screenshot of an internal
+ * tool does not need branding.
+ *
+ * There is now navigation, because there is now a second page whose record
+ * means something categorically different - decisions two engines *would have*
+ * taken, by a process that cannot take them. Each tab states its own nature so
+ * that a reader who lands on a screenshot can tell which of the two they are
+ * looking at without reading the body.
  */
+
+import Link from "next/link";
 
 import { clockUtc } from "@/lib/format";
 import type { Overview } from "@/lib/types";
@@ -31,6 +38,28 @@ export function Header({
           AutoTrader
         </h1>
         <Tag title="Alpaca paper trading. This repository has no live mode.">Paper</Tag>
+
+        <nav aria-label="Sections" className="ml-2 flex items-center gap-1">
+          <Link
+            href="/"
+            aria-current="page"
+            className="flex items-baseline gap-2 rounded-[4px] bg-sunken px-2 py-1.5 text-[12.5px] leading-none whitespace-nowrap text-ink"
+          >
+            <span className="font-medium">Operations</span>
+            <span className="hidden text-[10px] tracking-[0.06em] text-ink-3 uppercase sm:inline">
+              Crypto · paper
+            </span>
+          </Link>
+          <Link
+            href="/equity-shadow"
+            className="flex items-baseline gap-2 rounded-[4px] px-2 py-1.5 text-[12.5px] leading-none whitespace-nowrap text-ink-3 transition-colors hover:text-ink-2"
+          >
+            <span className="font-medium">Equity Shadow</span>
+            <span className="hidden text-[10px] tracking-[0.06em] uppercase sm:inline">
+              Observation · zero orders
+            </span>
+          </Link>
+        </nav>
 
         <div className="ml-auto flex items-center gap-4">
           <span
