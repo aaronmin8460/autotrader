@@ -74,6 +74,7 @@ from autotrader.decision.probability import (
 )
 from autotrader.decision.v1 import EmaCrossV1Engine
 from autotrader.decision.v2 import MultiFactorV2Engine
+from autotrader.equity import paper as equity_paper
 from autotrader.runtime.checkpoint import (
     InMemoryCheckpoint,
     ProcessedBarCheckpoint,
@@ -1354,21 +1355,85 @@ def source_modules() -> list[Path]:
     return sorted(path for path in root.rglob("*.py") if "shadow" not in path.parts)
 
 
+#: The two modules allowed to import the shadow package, each paired below with
+#: a test holding it to the property that earns the exemption.
+SHADOW_IMPORT_EXEMPT: tuple[tuple[str, str], ...] = (
+    ("equity", "shadow.py"),
+    ("equity", "paper.py"),
+)
+
+
 def test_nothing_outside_the_shadow_package_imports_it() -> None:
     """CRITICAL. No trading runtime constructs a panel; no gate reads a shadow decision.
 
-    One narrow exemption: `equity/shadow.py`, the V3 live-shadow runtime, is
-    the observational service this package was built for and may import it.
-    The exemption is paired with the test below, which holds that module to
-    the property that justifies it - no execution layer, no broker SDK, no
-    gateway, anywhere in its code.
+    Two narrow exemptions, each earned by a paired test below.
+
+    `equity/shadow.py` is the observational service this package was built for.
+    It earns its exemption by having no execution layer, no broker SDK and no
+    gateway anywhere in its code.
+
+    `equity/paper.py` is the EDA-1 paper runtime, and it *does* have an
+    execution path - so its exemption is the narrower and more interesting one.
+    It exists because the alternative is worse: the paper runtime must produce
+    the same EDA-1 decision the validated shadow produces, and the only way to
+    guarantee that is to run the same panel and the same overlay recorder.
+    Re-implementing them inside the paper module to satisfy an import guard
+    would manufacture exactly the drift the guard exists to prevent, and would
+    do it in the module where drift is most expensive. It earns its exemption
+    instead by the property in the second test below: a shadow decision may
+    *block* a mutation and may never authorize one.
     """
-    exempt = ("equity", "shadow.py")
     for path in source_modules():
-        if path.parts[-2:] == exempt:
+        if path.parts[-2:] in SHADOW_IMPORT_EXEMPT:
             continue
         code = code_without_prose(path.read_text(encoding="utf-8"))
         assert "autotrader.shadow" not in code, f"{path.name} imports the shadow package"
+
+
+def test_the_equity_paper_runtime_earns_its_shadow_exemption() -> None:
+    """CRITICAL. In the paper runtime, a shadow decision can only ever say no.
+
+    Three properties, all checked against the stripped source:
+
+    1. It imports the shadow package only for the *decision* machinery - the
+       per-symbol cycle and the engine panel. Nothing that releases, sizes or
+       authorizes anything comes from there.
+    2. It never opens the shadow's database through this package's normal path.
+       The comparison is a read-only URI and a single SELECT, so the paper
+       runtime cannot migrate, repair or write the store it is checking itself
+       against - and cannot write the crypto store it reads safety from either.
+    3. The parity result has exactly one effect on the outcome of a bar:
+       setting the blocking disposition. It never sets an enabling one, and the
+       set of symbols the allocator is asked to fund is built from this
+       runtime's own recorded stance, never from anything the parity source
+       returned.
+    """
+    path = Path(state.__file__).parent.parent / "equity" / "paper.py"
+    source = path.read_text(encoding="utf-8")
+    code = code_without_prose(source)
+
+    imported = {
+        line.split("import")[0].split("from")[1].strip()
+        for line in code.splitlines()
+        if line.startswith("from autotrader.shadow")
+    }
+    assert imported <= {"autotrader.shadow.cycle", "autotrader.shadow.panel"}, imported
+
+    assert "initialize_database" not in code
+    assert code.count("mode=ro") >= 2
+    for statement in ("INSERT INTO shadow_side_by_side", "UPDATE shadow_", "DELETE FROM shadow_"):
+        assert statement not in code, statement
+
+    check = inspect.getsource(equity_paper.EquityPaperRuntime._check_parity)
+    dispositions = {
+        fragment.split("\n")[0].strip().rstrip(")").strip()
+        for fragment in check.split("Disposition.")[1:]
+    }
+    assert dispositions == {"PARITY_MISMATCH"}, dispositions
+
+    settle = inspect.getsource(equity_paper.EquityPaperRuntime._settle)
+    assert "self._parity" not in settle
+    assert "eda1_stance == 1" in settle
 
 
 def test_the_equity_shadow_runtime_earns_its_exemption() -> None:
