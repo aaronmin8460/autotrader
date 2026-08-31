@@ -913,3 +913,132 @@ def test_a_restart_re_checks_parity_for_a_bar_it_already_claimed(
     spy = next(item for item in report.outcomes if item.symbol == "SPY")
     assert spy.disposition is Disposition.PARITY_MISMATCH
     assert report.parity_mismatches > 0
+
+
+# ==========================================================================
+# Blocker 3: the schema split, as repository tests rather than only as a
+# proof run on the host
+# ==========================================================================
+
+
+def test_a_store_one_version_ahead_is_refused_rather_than_downgraded(tmp_path: Path) -> None:
+    """CRITICAL. What the crypto build does when handed this lineage's store.
+
+    The crypto service runs a build whose SCHEMA_VERSION is one below this
+    one's. Simulated by stamping a current store one version ahead and asking
+    this build to open it - the same code path, the same refusal, without
+    needing two installs in one interpreter.
+    """
+    from autotrader.state.sqlite import SCHEMA_VERSION, UnsupportedSchemaVersionError
+
+    database = tmp_path / "ahead.db"
+    initialize_database(database)
+    with connect(database) as open_connection:
+        open_connection.execute(
+            "UPDATE schema_metadata SET schema_version = ? WHERE id = 1", (SCHEMA_VERSION + 1,)
+        )
+        open_connection.commit()
+
+    with pytest.raises(UnsupportedSchemaVersionError, match="newer than the supported version"):
+        initialize_database(database)
+
+
+def test_opening_an_older_store_the_normal_way_migrates_it(tmp_path: Path) -> None:
+    """CRITICAL. Why the crypto store is never opened the normal way.
+
+    This is not a defect - upward migration is what every command in this
+    package relies on. It is the reason the crypto operational store must be
+    reached only through a read-only URI: opening it through `connect` or
+    `initialize_database` would take it to this lineage's version, and the
+    running crypto service would then refuse to open its own file.
+    """
+    from autotrader.state.sqlite import SCHEMA_VERSION
+
+    database = tmp_path / "behind.db"
+    initialize_database(database)
+    with connect(database) as open_connection:
+        # A genuine previous-version store: the version stamp AND the table the
+        # last migration added. Stamping alone leaves a database the migration
+        # correctly refuses as inconsistent.
+        open_connection.execute("DROP TABLE shadow_decisions")
+        open_connection.execute(
+            "UPDATE schema_metadata SET schema_version = ? WHERE id = 1", (SCHEMA_VERSION - 1,)
+        )
+        open_connection.commit()
+
+    initialize_database(database)
+
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as check:
+        after = check.execute("SELECT schema_version FROM schema_metadata").fetchone()[0]
+    assert after == SCHEMA_VERSION
+
+
+def test_the_paper_runtime_never_opens_another_store_the_normal_way() -> None:
+    """CRITICAL. The isolation is in the code path, not in an operator's care."""
+    import inspect
+
+    from test_runtime import code_without_prose
+
+    source = code_without_prose(
+        inspect.getsource(SqliteExternalSafety) + inspect.getsource(SqliteShadowParity)
+    )
+    assert "initialize_database" not in source
+    assert "connect(" not in source.replace("sqlite3.connect(", "")
+    assert source.count("mode=ro") >= 2
+
+
+# ==========================================================================
+# Partial fills, and the delta that follows one
+# ==========================================================================
+
+
+def test_a_partial_fill_leaves_the_remainder_as_the_next_delta(
+    connection: sqlite3.Connection,
+) -> None:
+    """CRITICAL. Accepted is not filled, and half-filled is not filled.
+
+    The next bar's delta is computed against what the broker says the account
+    *holds*, so a partial fill produces a smaller follow-up order rather than a
+    repeat of the original one. Nothing infers a position from an accepted
+    order.
+    """
+    broker = FakeBrokerState()
+    gateway = RecordingGateway()
+    runtime = build_paper(connection, gateway=gateway, broker=broker, stage="A")
+    runtime.start()
+    runtime.run_cycle()
+
+    symbol, side, wanted = gateway.calls[0]
+    assert side is OrderSide.BUY
+    assert wanted >= Decimal(2)
+
+    # The broker filled one share of the order and no more.
+    broker.hold(symbol, Decimal(1), PRICES[symbol])
+    gateway.calls.clear()
+    report = runtime.run_cycle()
+    runtime.stop()
+
+    assert len(gateway.calls) == 1
+    _, again_side, remainder = gateway.calls[0]
+    assert again_side is OrderSide.BUY
+    assert remainder == wanted - Decimal(1)
+    spy = next(item for item in report.outcomes if item.symbol == "SPY")
+    assert spy.actual_quantity == Decimal(1)
+
+
+def test_an_over_fill_is_sold_back_down_and_never_shorted(
+    connection: sqlite3.Connection,
+) -> None:
+    """A holding above target reduces to target. It does not cross zero."""
+    broker = FakeBrokerState()
+    broker.hold("SPY", Decimal(500), PRICES["SPY"])
+    gateway = RecordingGateway()
+    runtime = build_paper(connection, gateway=gateway, broker=broker, stage="A")
+    report = runtime.run_once()
+
+    _, side, quantity = gateway.calls[0]
+    assert side is OrderSide.SELL
+    assert quantity < Decimal(500)
+    spy = next(item for item in report.outcomes if item.symbol == "SPY")
+    assert spy.target_quantity is not None
+    assert spy.actual_quantity - spy.delta_quantity == spy.target_quantity
