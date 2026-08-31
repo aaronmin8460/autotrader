@@ -74,27 +74,33 @@ def aggregate_month(symbol: str, month: str) -> tuple[pd.DataFrame, dict]:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
 
-    per_bucket: dict = {}
+    partials: list[pd.DataFrame] = []
     notionals_sample: list[np.ndarray] = []
     rows_total = 0
     with zipfile.ZipFile(zip_path) as archive:
         inner = archive.namelist()[0]
+        with archive.open(inner) as peek:
+            has_header = peek.readline().startswith(b"agg_trade_id")
         with archive.open(inner) as stream:
             reader = pd.read_csv(
-                stream, header=None, names=COLUMNS, chunksize=CHUNK_ROWS, dtype=str
+                stream,
+                header=None,
+                names=COLUMNS,
+                chunksize=CHUNK_ROWS,
+                skiprows=1 if has_header else 0,
+                dtype={
+                    "price": "float64",
+                    "quantity": "float64",
+                    "transact_time": "int64",
+                    "is_buyer_maker": "str",
+                },
+                usecols=["price", "quantity", "transact_time", "is_buyer_maker"],
             )
             for chunk in reader:
-                if chunk.iloc[0, 0] == "agg_trade_id":
-                    chunk = chunk.iloc[1:]
-                if chunk.empty:
-                    continue
                 rows_total += len(chunk)
-                price = chunk["price"].astype("float64").to_numpy()
-                quantity = chunk["quantity"].astype("float64").to_numpy()
-                notional = price * quantity
-                time_ms = chunk["transact_time"].astype("int64").to_numpy()
+                notional = (chunk["price"] * chunk["quantity"]).to_numpy()
                 buyer_is_taker = chunk["is_buyer_maker"].str.lower().eq("false").to_numpy()
-                bucket = (time_ms // 900_000) * 900_000
+                bucket = (chunk["transact_time"].to_numpy() // 900_000) * 900_000
                 frame = pd.DataFrame(
                     {
                         "bucket": bucket,
@@ -104,23 +110,11 @@ def aggregate_month(symbol: str, month: str) -> tuple[pd.DataFrame, dict]:
                         "sell_count": (~buyer_is_taker).astype("int64"),
                     }
                 )
-                grouped = frame.groupby("bucket").agg(
-                    notional=("notional", "sum"),
-                    buy_notional=("buy_notional", "sum"),
-                    buy_count=("buy_count", "sum"),
-                    sell_count=("sell_count", "sum"),
-                )
-                for key, row in grouped.iterrows():
-                    if key in per_bucket:
-                        per_bucket[key] = per_bucket[key] + row.to_numpy()
-                    else:
-                        per_bucket[key] = row.to_numpy()
+                partials.append(frame.groupby("bucket", as_index=False).sum())
                 if len(notionals_sample) < 200:
                     notionals_sample.append(notional[::101].copy())
 
-    aggregate = pd.DataFrame.from_dict(
-        per_bucket, orient="index", columns=["notional", "buy_notional", "buy_count", "sell_count"]
-    ).sort_index()
+    aggregate = pd.concat(partials, ignore_index=True).groupby("bucket").sum().sort_index()
     aggregate.index = pd.to_datetime(aggregate.index, unit="ms", utc=True)
     aggregate.index.name = "bar_open"
 
