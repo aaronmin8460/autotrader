@@ -59,6 +59,7 @@ export interface PaperExposurePanel {
   account_equity: number | null;
   crypto_positions: string[];
   equity_positions: string[];
+  equity_positions_as_of: string | null;
   equity_exposure_note: string;
   per_symbol_cap: string;
   total_account_cap: string;

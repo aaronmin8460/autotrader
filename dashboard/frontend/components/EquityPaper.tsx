@@ -171,11 +171,24 @@ export function PaperExposure({ exposure }: { exposure: PaperExposurePanel | nul
           {exposure?.total_account_cap ?? "—"}
         </Field>
         <Field label="UTC-day loss halt">{exposure?.daily_loss_halt ?? "—"}</Field>
-        <Field label="Crypto positions" className="sm:col-span-3">
+        <Field
+          label="Non-equity positions"
+          className="sm:col-span-3"
+          title="Read from the crypto store, filtered to what is not one of the ten equities. That table snapshots the whole account, so an unfiltered view would show the equity book twice."
+        >
           <span className="num">{exposure?.crypto_positions?.join("  ") || "none"}</span>
         </Field>
-        <Field label="Equity positions" className="sm:col-span-3">
+        <Field
+          label="Equity positions (last reconciled snapshot)"
+          className="sm:col-span-3"
+          title="A last-known snapshot written by a reconciliation pass, not live broker truth."
+        >
           <span className="num">{exposure?.equity_positions?.join("  ") || "none"}</span>
+          {exposure?.equity_positions_as_of ? (
+            <span className="ml-2 text-[11px] text-ink-3">
+              as of {exposure.equity_positions_as_of}
+            </span>
+          ) : null}
         </Field>
       </div>
       <p className="mt-3 max-w-[92ch] text-[11px] leading-relaxed text-ink-3">
@@ -347,9 +360,9 @@ export function PaperSafety({ safety }: { safety: PaperSafetyPanel | null }) {
           </span>
         </Field>
         <Field
-          label="Shadow/Paper mismatches"
+          label="Shadow/Paper mismatches (cumulative)"
           className="sm:col-span-2"
-          title="A symbol whose two independently computed EDA-1 answers disagree is excluded from mutation for that bar."
+          title="A symbol whose two independently computed EDA-1 answers disagree is excluded from mutation for that bar. Counted since this store was created, not since the last cycle: a per-cycle count would let a standing disagreement vanish from view the moment it stopped recurring."
         >
           <span className={cn("num", (safety?.parity_mismatches ?? 0) > 0 && "text-warn")}>
             {safety?.parity_mismatches ?? 0}

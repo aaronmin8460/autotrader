@@ -249,18 +249,31 @@ def read_paper(path: str | Path) -> PaperSnapshot:
 
 
 def read_crypto_exposure(path: str | Path) -> tuple[str, ...]:
-    """The crypto book's position snapshot, read-only, never migrating the store.
+    """The **non-equity** positions the crypto store knows about, read-only.
 
     A single SELECT through a `mode=ro` URI. The crypto store is schema 6 and
     this package is schema 7; opening it through the normal path would migrate
     it, and a dashboard poll is the last place that should happen.
+
+    Filtered to non-equity symbols on purpose. That store's `positions` table
+    holds a snapshot of the **whole account**, not of the crypto book: a
+    reconciliation pass covers all twelve tracked symbols, because only a
+    full-universe pass can clear the shared account halt, and it records
+    holdings outside its own universe as observed rather than ignoring them.
+    Rendering that table unfiltered under the label "crypto" would show this
+    page the equity positions twice and call one of them crypto.
     """
+    equity = {symbol.upper() for symbol in EQUITY_SYMBOLS}
     rows: list[str] = []
     try:
         with read_only_connection(path) as connection:
             for row in connection.execute(
-                "SELECT symbol, quantity, average_price FROM positions"
+                "SELECT symbol, quantity FROM positions ORDER BY symbol"
             ).fetchall():
+                if str(row["symbol"]).upper() in equity:
+                    continue
+                if _decimal(row["quantity"]) <= _ZERO:
+                    continue
                 rows.append(f"{row['symbol']}:{row['quantity']}")
     except sqlite3.Error:
         return ()
@@ -308,6 +321,10 @@ class ExposurePanel:
     account_equity: float | None
     crypto_positions: tuple[str, ...]
     equity_positions: tuple[str, ...]
+    #: When the equity snapshot was last written by a reconciliation pass. The
+    #: table is a last-known snapshot, not live broker truth, and a page that
+    #: did not say so would read as though it were.
+    equity_positions_as_of: str | None
     equity_exposure_note: str
     per_symbol_cap: str
     total_account_cap: str
@@ -353,6 +370,9 @@ class SafetyPanel:
     reconciliation_status: str | None
     reconciliation_at: str | None
     reconciliation_unresolved: int | None
+    #: Cumulative since this store was created, not since the last cycle. A
+    #: page showing a per-cycle count would let a standing disagreement vanish
+    #: from view the moment it stopped recurring.
     parity_mismatches: int
     risk_blocked_recent: tuple[str, ...]
 
@@ -501,19 +521,24 @@ def build_exposure(
     policy: AllocationPolicy,
     crypto_positions: Sequence[str],
 ) -> ExposurePanel:
-    equity_rows = tuple(
-        f"{row['symbol']}:{row['quantity']}"
+    held = [
+        row
         for row in snapshot.positions
         if str(row["symbol"]) in EQUITY_SYMBOLS and _decimal(row["quantity"]) > _ZERO
-    )
+    ]
+    equity_rows = tuple(f"{row['symbol']}:{row['quantity']}" for row in held)
+    as_of = max((str(row["updated_at"]) for row in held), default=None)
     return ExposurePanel(
         account_equity=None,
         crypto_positions=tuple(crypto_positions),
         equity_positions=equity_rows,
+        equity_positions_as_of=as_of,
         equity_exposure_note=(
-            "Exposure percentages are enforced against BROKER truth at submission "
-            "time, not against this snapshot. The total ceiling is an ACCOUNT "
-            "ceiling and includes the crypto book."
+            "Positions here are the last snapshot a reconciliation pass wrote, not "
+            "live broker truth, so a fill since that pass is not shown yet. Exposure "
+            "percentages are enforced against BROKER truth at submission time, not "
+            "against this snapshot. The total ceiling is an ACCOUNT ceiling and "
+            "includes the crypto book."
         ),
         per_symbol_cap=f"{policy.per_symbol_cap:%}",
         total_account_cap=f"{policy.total_cap:%}",
