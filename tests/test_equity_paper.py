@@ -165,6 +165,25 @@ class RecordingGateway:
             message="fake",
             max_allowed_quantity=approved,
         )
+        # The real boundary mints an intent with a FRESH uuid - it is not
+        # derived from the decision - and returns it. A fake that returned none
+        # would let a runtime that mis-keys its own audit row pass this suite,
+        # which is exactly what happened before this line existed.
+        from autotrader.execution.models import OrderIntent
+
+        intent = (
+            OrderIntent(
+                symbol=symbol,
+                side=side,
+                requested_quantity=requested_quantity,
+                approved_quantity=approved,
+                reference_price=PRICES[symbol],
+                risk_reason_code=decision.reason_code,
+                created_at=now,
+            )
+            if self._approve
+            else None
+        )
         return PaperExecutionResult(
             outcome=(
                 ExecutionOutcome.SUBMITTED if self._approve else ExecutionOutcome.REJECTED_BY_RISK
@@ -174,6 +193,7 @@ class RecordingGateway:
             requested_quantity=requested_quantity,
             reference_price=PRICES[symbol],
             risk_decision=decision,
+            intent=intent,
             account=PaperAccountState(
                 equity=ACCOUNT_EQUITY,
                 cash=ACCOUNT_EQUITY,
@@ -1095,6 +1115,7 @@ def test_the_target_record_shares_the_key_with_the_order_intent(
     row = connection.execute(
         "SELECT client_order_id FROM equity_paper_targets WHERE symbol = 'SPY'"
     ).fetchone()
+    assert spy.client_order_id is not None
     assert row["client_order_id"] == spy.client_order_id
 
 

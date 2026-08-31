@@ -356,7 +356,13 @@ class SqliteShadowParity:
 CREATE_PAPER_TARGETS = """
     CREATE TABLE IF NOT EXISTS equity_paper_targets (
         id                 INTEGER PRIMARY KEY,
-        client_order_id    TEXT NOT NULL UNIQUE CHECK (client_order_id <> ''),
+        -- Filled in after the attempt returns, because the execution boundary
+        -- mints the id: `client_order_id` defaults to a fresh UUID per intent
+        -- and is deliberately NOT derived from the decision, so this row cannot
+        -- know it in advance. Writing the row first and the key second is the
+        -- right way round anyway - the row must survive a crash that happens
+        -- before an id exists.
+        client_order_id    TEXT UNIQUE,
         engine             TEXT NOT NULL CHECK (engine <> ''),
         environment        TEXT NOT NULL CHECK (environment = 'PAPER'),
         sizing_policy      TEXT NOT NULL CHECK (sizing_policy <> ''),
@@ -1579,7 +1585,7 @@ class EquityPaperRuntime:
         # Durable, and BEFORE the broker is asked for anything. A crash between
         # this row and the intent leaves a target nobody acted on, which reads
         # correctly; the reverse order would leave an order nobody can explain.
-        self._record_target(outcome, allocation, moment, report)
+        target_id = self._record_target(outcome, allocation, moment, report)
 
         try:
             result = self._gateway.execute(
@@ -1646,7 +1652,7 @@ class EquityPaperRuntime:
         else:
             outcome.disposition = Disposition.FAILED
 
-        self._settle_target_risk(outcome)
+        self._settle_target_risk(target_id, outcome)
         log_event(
             self._logger,
             "paper_order",
@@ -1660,33 +1666,23 @@ class EquityPaperRuntime:
         allocation: SymbolAllocation,
         moment: datetime,
         report: EquityPaperCycleReport,
-    ) -> None:
-        """Persist what was wanted, and why, keyed by the durable order id.
+    ) -> int:
+        """Persist what was wanted, and why, before anything is sent.
 
-        The `client_order_id` is deterministic for a (symbol, bar, side, size)
-        decision, so this row and the `order_intents` row the execution boundary
-        writes moments later share a key without either having to know about the
-        other. Written before the submission attempt for the same reason the
-        intent is: a decision that may have reached the broker must be
-        reconstructable afterwards.
+        Written before the submission attempt, and *without* a
+        `client_order_id`, because the execution boundary mints one per intent
+        from a fresh UUID rather than deriving it from the decision - this row
+        cannot know it in advance and must not pretend to. The id and what Risk
+        allowed are both filled in by `_settle_target_risk` once the attempt has
+        returned. That ordering is the right way round regardless: the row has
+        to survive a crash that happens before any id exists.
+
+        Returns the row id, so the settle step can find this exact row.
         """
-        from autotrader.execution.models import OrderIntent
-
-        intent = OrderIntent(
-            symbol=allocation.symbol,
-            side=allocation.side,  # type: ignore[arg-type]
-            requested_quantity=allocation.delta_quantity,
-            approved_quantity=allocation.delta_quantity,
-            reference_price=float(allocation.reference_price),
-            risk_reason_code="PENDING_RISK",
-            created_at=moment,
-            strategy_run_id=self._strategy_run_id,
-        )
-        outcome.client_order_id = intent.client_order_id
         policy = self._config.policy
         with state.transaction(self._connection):
-            self._connection.execute(
-                "INSERT OR REPLACE INTO equity_paper_targets ("
+            cursor = self._connection.execute(
+                "INSERT INTO equity_paper_targets ("
                 " client_order_id, engine, environment, sizing_policy,"
                 " sizing_config_hash, rollout_stage, symbol, side, target_weight,"
                 " target_notional, target_quantity, broker_quantity, requested_delta,"
@@ -1694,7 +1690,7 @@ class EquityPaperRuntime:
                 " external_exposure, budget_fraction, bar_timestamp, decided_at"
                 ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    intent.client_order_id,
+                    None,
                     EDA1_ENGINE_VERSION,
                     "PAPER",
                     policy.policy_id,
@@ -1719,21 +1715,28 @@ class EquityPaperRuntime:
                     state.to_utc_text(moment, "decided_at"),
                 ),
             )
+        return int(cursor.lastrowid or 0)
 
-    def _settle_target_risk(self, outcome: SymbolOutcome) -> None:
-        """Back-fill what Risk actually allowed, once the attempt has returned."""
-        if outcome.client_order_id is None:
+    def _settle_target_risk(self, target_id: int, outcome: SymbolOutcome) -> None:
+        """Back-fill the broker key and what Risk allowed, once the attempt returned.
+
+        The key comes second on purpose - see `_record_target`. A row that never
+        gets one describes an attempt that failed before the boundary minted an
+        id, which is exactly what it should look like.
+        """
+        if not target_id:
             return
         with state.transaction(self._connection):
             self._connection.execute(
-                "UPDATE equity_paper_targets SET approved_quantity = ?,"
-                " risk_reason_code = ? WHERE client_order_id = ?",
+                "UPDATE equity_paper_targets SET client_order_id = ?,"
+                " approved_quantity = ?, risk_reason_code = ? WHERE id = ?",
                 (
+                    outcome.client_order_id,
                     str(outcome.approved_quantity)
                     if outcome.approved_quantity is not None
                     else None,
                     outcome.risk_reason_code,
-                    outcome.client_order_id,
+                    target_id,
                 ),
             )
 
