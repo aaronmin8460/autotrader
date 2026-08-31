@@ -155,6 +155,13 @@ def main() -> None:
     window_frames: dict[str, pd.DataFrame] = {}
     for symbol in STUDY_SYMBOLS:
         stored = frame_to_decisions(pd.read_parquet(OUTPUT / f"{symbol}_w00_V3.parquet"))
+        # A series checkpointed before the window start was corrected may carry
+        # a superset; trim to the window so stance and replay agree exactly.
+        stored = tuple(
+            record
+            for record in stored
+            if market_date(record.timestamp.to_pydatetime()) >= window.start
+        )
         bars = window.bars(frames[symbol])
         window_frames[symbol] = bars
         by_bar = per_bar_participation(bars, participation)
