@@ -9,7 +9,7 @@
     "start": "next start --port 3000",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-strip-types lib/format.test.ts"
+    "test": "node --test --experimental-strip-types lib/format.test.ts lib/services.test.ts"
   },
   "dependencies": {
     "next": "^15.5.0",

@@ -9,10 +9,16 @@
  * and the right column says whether the machinery underneath is healthy and
  * how much risk is in use.
  *
- * Two runtimes now share one account, so the shared account-safety strip sits
- * directly above them: it answers "may anything trade?", which outranks either
- * service's answer to "am I running?". The two runtime cards sit side by side
- * on a wide screen and stack below it.
+ * Several runtimes share one account, so the shared account-safety strip sits
+ * directly above them: it answers "may anything trade?", which outranks any
+ * service's answer to "am I running?". The runtime cards sit side by side on a
+ * wide screen and stack below it.
+ *
+ * **Two sources, one page.** The operational API describes the account and the
+ * trails written into its store; the service endpoint describes which units are
+ * actually up. The second exists because the first cannot see the equity paper
+ * runtime at all, and a health panel built only from the first reported the
+ * masked legacy service as though it were the current equity book.
  *
  * There is no control on this page. No buy, no sell, no close, no start, no
  * stop, no editable limit - and no endpoint behind any of them, which is the
@@ -28,7 +34,7 @@ import { Positions } from "@/components/Positions";
 import { Risk } from "@/components/Risk";
 import { Runtimes } from "@/components/Runtime";
 import { SystemHealth } from "@/components/SystemHealth";
-import { POLL_INTERVAL_MS, useOverview } from "@/lib/api";
+import { POLL_INTERVAL_MS, useOverview, useServiceUnits } from "@/lib/api";
 
 function Loading() {
   return (
@@ -55,6 +61,7 @@ function Unreachable() {
 
 export default function Page() {
   const { data, loading, connected, lastSuccessAt } = useOverview();
+  const { services } = useServiceUnits();
 
   return (
     <div className="min-h-full">
@@ -80,6 +87,7 @@ export default function Page() {
               <div className="lg:col-span-4">
                 <SystemHealth
                   components={data.health}
+                  services={services}
                   reconciliation={data.reconciliation}
                   generatedAt={data.generated_at}
                 />
@@ -98,7 +106,11 @@ export default function Page() {
                   lastFailureAt={data.last_failure_at}
                   generatedAt={data.generated_at}
                 />
-                <Runtimes panels={data.runtimes} generatedAt={data.generated_at} />
+                <Runtimes
+                  panels={data.runtimes}
+                  services={services}
+                  generatedAt={data.generated_at}
+                />
               </div>
             </div>
           </div>

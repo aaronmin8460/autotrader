@@ -17,7 +17,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from autotrader.dashboard import equity_paper
+from autotrader.dashboard import equity_paper, service_units
 
 #: Loopback only, and not configurable here. Making "listen on every interface"
 #: a one-flag decision is how an unauthenticated internal tool ends up on a
@@ -104,6 +104,28 @@ def create_app() -> FastAPI:
         """Durable intents and what the broker said about each of them."""
         page = build_overview()
         return {"generated_at": page.generated_at, "orders": list(page.orders)}
+
+    @application.get(f"{_API_PREFIX}/services", tags=["runtime-units"])
+    def services() -> service_units.ServiceUnitsPanel:
+        """Every AutoTrader runtime unit on this host, as the manager reports it.
+
+        Wider than this API's name, and here on purpose. Three separate
+        services answer to the word "equity" on this host, and the panel that
+        has to tell them apart cannot be built from any one store: the store
+        that records the legacy runtime knows nothing about the paper runtime
+        that replaced it, which is precisely how the operations page came to
+        report equity trading as stopped while it was running.
+
+        So the question is asked of the service manager instead, and it is
+        asked from this process because this is the least privileged of the
+        three readers - it holds no broker credential and cannot open the
+        trading database. A read-only property query needs neither.
+
+        GET, like everything else here. Nothing in this application can start,
+        stop, restart, enable, disable or unmask a unit, and `service_units`
+        knows exactly one verb.
+        """
+        return service_units.build_panel(now=datetime.now(UTC))
 
     @application.get(f"{_API_PREFIX}/safety", tags=["equity-paper"])
     def safety() -> dict[str, Any]:

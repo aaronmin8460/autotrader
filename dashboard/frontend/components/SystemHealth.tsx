@@ -1,27 +1,51 @@
 /**
  * Health, and the reconciliation pass behind it.
  *
- * Five subsystem rows, then the latest reconciliation result in full. They
- * share one card because they are one question: reconciliation is the thing
- * that decides whether trading is allowed, so putting it a scroll away from
- * the health list would separate a verdict from its evidence.
+ * Subsystem rows, then the latest reconciliation result in full. They share one
+ * card because they are one question: reconciliation is the thing that decides
+ * whether trading is allowed, so putting it a scroll away from the health list
+ * would separate a verdict from its evidence.
  *
  * Every status is quoted from stored truth. `CLEAN` is never inferred from the
  * absence of an error, and a database with no reconciliation run in it reports
  * `NEVER RUN`.
+ *
+ * **The runtime rows come from the service manager, not from a store.** Three
+ * separate services on this host answer to the word "equity" and only one of
+ * them ever wrote to the operational database, so a row derived from that
+ * database reported the masked legacy service and called it "Equity runtime".
+ * `healthRows` replaces those rows with one per named unit - see `lib/services`
+ * for why that is a replacement rather than a rename.
+ *
+ * Three colours, three meanings, and the middle one is the point: green is an
+ * expected running service, red is a service that is not what this host is
+ * configured for, and neutral is a service that is off on purpose. `MASKED` on
+ * the legacy runtime is neutral, because it is a decision rather than a fault.
  */
 
 import { relative, stampUtc } from "@/lib/format";
+import type { HealthRow, ServiceUnitsPanel } from "@/lib/services";
+import { healthRows } from "@/lib/services";
 import type { HealthComponent, ReconciliationPanel } from "@/lib/types";
 
 import { Card, Dot, cn, toneText } from "./ui";
 
-function Row({ component }: { component: HealthComponent }) {
+function Row({ component }: { component: HealthRow }) {
   const loud = component.tone === "ATTENTION" || component.tone === "NEGATIVE";
   return (
     <div className="flex items-start justify-between gap-3 py-2 first:pt-0 last:pb-0">
       <div className="min-w-0">
-        <div className="text-[12.5px] leading-tight text-ink-2">{component.label}</div>
+        <div className="text-[12.5px] leading-tight text-ink-2" title={component.unit ?? undefined}>
+          {component.label}
+        </div>
+        {/* Shown whatever the status. "PAPER · NO REAL MONEY" and "ZERO ORDERS"
+            are properties of the service, not warnings about it, and a reader
+            who only sees them when something is wrong has learnt the opposite. */}
+        {component.note ? (
+          <div className="mt-0.5 text-[10px] leading-none tracking-[0.06em] text-ink-3 uppercase">
+            {component.note}
+          </div>
+        ) : null}
         {loud && component.detail ? (
           <div className="mt-0.5 text-[11px] leading-snug text-ink-3">{component.detail}</div>
         ) : null}
@@ -52,18 +76,22 @@ function Stat({ label, value }: { label: string; value: string }) {
 
 export function SystemHealth({
   components,
+  services,
   reconciliation,
   generatedAt,
 }: {
   components: HealthComponent[];
+  services: ServiceUnitsPanel | null;
   reconciliation: ReconciliationPanel | null;
   generatedAt: string | null;
 }) {
+  const rows = healthRows(components, services);
+
   return (
     <Card title="System health" bodyClassName="">
       <div className="divide-y divide-line px-4 py-1.5">
-        {components.map((component) => (
-          <Row key={component.key} component={component} />
+        {rows.map((row) => (
+          <Row key={row.key} component={row} />
         ))}
       </div>
 

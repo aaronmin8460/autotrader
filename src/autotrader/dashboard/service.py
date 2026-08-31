@@ -540,15 +540,25 @@ def _latest_failure(snapshot: StateSnapshot) -> state.SystemEvent | None:
     return max(failures, key=lambda event: (event.event_timestamp, event.id))
 
 
-#: The two services, and the durable evidence that tells them apart. Each
-#: runtime writes its own lifecycle event types and claims bars only for its own
-#: symbols, so a panel per service is derived rather than guessed. What is
-#: *not* here is the strategy run: both services open one under the same
+#: The two services whose trail is in *this* store, and the durable evidence
+#: that tells them apart. Each writes its own lifecycle event types and claims
+#: bars only for its own symbols, so a panel per service is derived rather than
+#: guessed. What is *not* here is the strategy run: both open one under the same
 #: strategy name, so attributing a run to a service would be a guess.
+#:
+#: **The equity entry is the legacy runtime and nothing else.** The events and
+#: checkpoints it reads were written by `autotrader-equity.service`, which is
+#: masked on the deployed host and is not the service that trades equities now.
+#: `autotrader-equity-paper.service` runs EDA-1 against a different store this
+#: process never opens, so no panel built from here can say anything about it -
+#: and labelling this one "Equity runtime" told an operator that current equity
+#: trading had stopped when it had not. Live service state comes from
+#: `autotrader.dashboard.service_units`, which asks the service manager by unit
+#: name instead of inferring one service's health from another's trail.
 RUNTIME_SPECS: tuple[dict[str, object], ...] = (
     {
         "key": "crypto",
-        "label": "Crypto runtime",
+        "label": "Crypto Paper",
         "symbols": frozenset(SUPPORTED_SYMBOLS),
         "started": "RUNTIME_STARTED",
         "stopped": "RUNTIME_STOPPED",
@@ -556,7 +566,7 @@ RUNTIME_SPECS: tuple[dict[str, object], ...] = (
     },
     {
         "key": "equity",
-        "label": "Equity runtime",
+        "label": "Legacy Equity Runtime",
         "symbols": frozenset(EQUITY_SYMBOLS),
         "started": "EQUITY_RUNTIME_STARTED",
         "stopped": "EQUITY_RUNTIME_STOPPED",

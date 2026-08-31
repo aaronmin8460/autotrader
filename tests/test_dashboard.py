@@ -859,7 +859,7 @@ def test_runtime_state_is_derived_from_the_durable_trail(populated: Path) -> Non
     page = overview(populated)
     panel = runtime_named(page, "crypto")
 
-    assert panel.label == "Crypto runtime"
+    assert panel.label == "Crypto Paper"
     assert panel.state == "RUNNING"
     assert panel.started_at == (NOW - timedelta(hours=2)).isoformat()
     assert panel.startup_safety == "SAFE"

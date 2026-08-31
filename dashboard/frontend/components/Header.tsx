@@ -5,11 +5,17 @@
  * and when the data on screen is from. No logo: a screenshot of an internal
  * tool does not need branding.
  *
- * There is now navigation, because there is now a second page whose record
- * means something categorically different - decisions two engines *would have*
- * taken, by a process that cannot take them. Each tab states its own nature so
- * that a reader who lands on a screenshot can tell which of the two they are
- * looking at without reading the body.
+ * There is navigation, because there are three pages whose records mean
+ * categorically different things: an account that trades crypto and equities,
+ * an equity book that trades on its own, and two engines that cannot trade at
+ * all. Each tab states its own nature so that a reader who lands on a
+ * screenshot can tell which of the three they are looking at without reading
+ * the body. All three tabs appear on every page - a page missing from the nav
+ * is a page an operator concludes does not exist.
+ *
+ * This page's tab says "Broker account", not "Crypto". The positions table
+ * below is the whole paper account and holds equity rows alongside crypto
+ * ones, so calling the page crypto-only would misdescribe what is on it.
  */
 
 import Link from "next/link";
@@ -37,6 +43,9 @@ export function Header({
         <h1 className="text-[14px] leading-none font-semibold tracking-tight text-ink">
           AutoTrader
         </h1>
+        <span className="hidden text-[12.5px] leading-none text-ink-3 sm:inline">
+          Operations · Broker account
+        </span>
         <Tag title="Alpaca paper trading. This repository has no live mode.">Paper</Tag>
 
         <nav aria-label="Sections" className="ml-2 flex items-center gap-1">
@@ -47,7 +56,7 @@ export function Header({
           >
             <span className="font-medium">Operations</span>
             <span className="hidden text-[10px] tracking-[0.06em] text-ink-3 uppercase sm:inline">
-              Crypto · paper
+              Broker account
             </span>
           </Link>
           <Link
@@ -57,6 +66,15 @@ export function Header({
             <span className="font-medium">Equity Shadow</span>
             <span className="hidden text-[10px] tracking-[0.06em] uppercase sm:inline">
               Observation · zero orders
+            </span>
+          </Link>
+          <Link
+            href="/equity-paper"
+            className="flex items-baseline gap-2 rounded-[4px] px-2 py-1.5 text-[12.5px] leading-none whitespace-nowrap text-ink-3 transition-colors hover:text-ink-2"
+          >
+            <span className="font-medium">Equity Paper</span>
+            <span className="hidden text-[10px] tracking-[0.06em] uppercase sm:inline">
+              EDA-1 · paper orders
             </span>
           </Link>
         </nav>

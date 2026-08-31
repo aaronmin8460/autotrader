@@ -66,7 +66,7 @@ export function ShadowNav({
           <Tab
             href="/"
             label="Operations"
-            detail="Crypto · paper"
+            detail="Broker account"
             active={current === "operations"}
           />
           <Tab

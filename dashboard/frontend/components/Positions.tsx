@@ -1,5 +1,11 @@
 /**
- * What the account holds.
+ * What the account holds - the whole broker account, not one book.
+ *
+ * The scope label is load-bearing. This table is the paper brokerage account in
+ * full, so crypto rows and Equity Paper rows appear in it together, and a
+ * reader who assumes it is the crypto book will misread every total on it. The
+ * `Class` column already distinguishes the rows; the header now says what the
+ * set of rows is.
  *
  * The broker is the authority and the panel says so in its header. When the
  * broker cannot be read it falls back to the local snapshot, labels it
@@ -43,6 +49,9 @@ export function Positions({
 
   const meta = (
     <>
+      <Tag title="Every position on the Alpaca paper account, crypto and equity together. Not one strategy's book.">
+        Alpaca paper account
+      </Tag>
       <Tag title={panel.note ?? "Read live from the Alpaca paper account."}>{panel.source}</Tag>
       {panel.as_of ? (
         <span className="num text-[11px] text-ink-3">{stampUtc(panel.as_of, generatedAt)} UTC</span>
@@ -82,7 +91,7 @@ export function Positions({
   }
 
   return (
-    <Card title="Positions" meta={meta} bodyClassName="">
+    <Card title="Broker account positions" meta={meta} bodyClassName="">
       {panel.note ? (
         <p className="border-b border-line px-4 py-2 text-[11.5px] text-ink-3">{panel.note}</p>
       ) : null}

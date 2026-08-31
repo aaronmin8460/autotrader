@@ -1233,8 +1233,12 @@ def test_dashboard_v02_shows_both_runtimes_separately(database_path: Path) -> No
     panels = {panel.key: panel for panel in page.runtimes}
 
     assert set(panels) == {"crypto", "equity"}
-    assert panels["crypto"].label == "Crypto runtime"
-    assert panels["equity"].label == "Equity runtime"
+    assert panels["crypto"].label == "Crypto Paper"
+    # Not "Equity runtime". This panel is built from the operational store, and
+    # the only equity service that ever wrote to it is the masked legacy one -
+    # so the label has to name that service rather than the category, or it
+    # reports current equity trading as stopped. See RUNTIME_SPECS.
+    assert panels["equity"].label == "Legacy Equity Runtime"
     assert panels["crypto"].state == "RUNNING"
     # The equity service has recorded nothing, and the screen says exactly that
     # rather than borrowing the crypto runtime's state.

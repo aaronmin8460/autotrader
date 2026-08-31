@@ -1,10 +1,19 @@
 /**
- * The two loops, as their durable trails describe them.
+ * The two trails in the operational store, as they describe themselves.
  *
- * There are two services now - the 24/7 crypto runtime and the regular-session
- * equity runtime - and they run as separate processes. Each gets its own strip,
- * in a fixed order, because a single merged panel would have to average two
- * states into one and would be wrong whenever they differ.
+ * **Read the labels carefully: this card is not the list of equity services.**
+ * The operational database was written by two processes - the 24/7 crypto
+ * runtime, and the older general equity runtime that is now masked. The
+ * current equity book runs as `autotrader-equity-paper.service` against a
+ * different store this API never opens, so it cannot appear here and its
+ * absence must not be read as its absence from the host. That is exactly the
+ * inference that made this page report equity trading as stopped, so the
+ * second card is titled "Legacy Equity Runtime" and takes its headline state
+ * from the service manager rather than from the trail underneath it.
+ *
+ * Each gets its own strip, in a fixed order, because a single merged panel
+ * would have to average two states into one and would be wrong whenever they
+ * differ.
  *
  * A full-width strip rather than a column card: each panel is a row of small
  * facts, and they read in one pass across the page where they would be cramped
@@ -22,9 +31,41 @@
  */
 
 import { relative, stampUtc } from "@/lib/format";
-import type { RuntimePanel } from "@/lib/types";
+import type { ServiceUnitsPanel } from "@/lib/services";
+import { LEGACY_EQUITY_KEY, serviceUnit } from "@/lib/services";
+import type { RuntimePanel, Tone } from "@/lib/types";
 
-import { Card, Dot, Field, Td, Th, cn, toneText } from "./ui";
+import { Card, Dot, Field, Tag, Td, Th, cn, toneText } from "./ui";
+
+/** How a trail-derived panel should be titled and headlined on screen.
+ *
+ * The trail says what the process recorded; the service manager says whether
+ * the unit exists and is allowed to run. When they disagree about the legacy
+ * runtime - trail says "stopped cleanly", manager says "masked" - the manager
+ * wins the headline, because "masked" is the fact an operator needs and
+ * "stopped" is the one that misleads them.
+ */
+export function runtimeView(
+  panel: RuntimePanel,
+  services: ServiceUnitsPanel | null,
+): { label: string; state: string; tone: Tone; detail: string | null; note: string | null } {
+  if (panel.key !== "equity") {
+    return {
+      label: panel.label,
+      state: panel.state,
+      tone: panel.tone,
+      detail: panel.detail,
+      note: null,
+    };
+  }
+
+  const unit = serviceUnit(services, LEGACY_EQUITY_KEY);
+  const note = "Superseded by Equity Paper · EDA-1. Not the current equity runtime.";
+  if (unit === null) {
+    return { label: panel.label, state: panel.state, tone: panel.tone, detail: panel.detail, note };
+  }
+  return { label: unit.label, state: unit.status, tone: unit.tone, detail: unit.detail, note };
+}
 
 /** Whether a stale checkpoint is worth flagging.
  *
@@ -38,29 +79,38 @@ function staleMatters(state: string): boolean {
 
 function RuntimeStrip({
   panel,
+  services,
   generatedAt,
 }: {
   panel: RuntimePanel;
+  services: ServiceUnitsPanel | null;
   generatedAt: string | null;
 }) {
-  const flagStale = staleMatters(panel.state);
+  const view = runtimeView(panel, services);
+  const flagStale = staleMatters(view.state);
 
   const meta = (
     <span
       className={cn(
         "inline-flex items-center gap-1.5 text-[11px] leading-none font-medium",
         "tracking-[0.06em] uppercase",
-        toneText(panel.tone),
+        toneText(view.tone),
       )}
-      title={panel.detail ?? undefined}
+      title={view.detail ?? undefined}
     >
-      <Dot tone={panel.tone} />
-      {panel.state}
+      <Dot tone={view.tone} />
+      {view.state}
     </span>
   );
 
   return (
-    <Card title={panel.label} meta={meta} bodyClassName="">
+    <Card title={view.label} meta={meta} bodyClassName="">
+      {view.note ? (
+        <p className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2 text-[11.5px] leading-snug text-ink-3">
+          <Tag>Intentionally off</Tag>
+          {view.note}
+        </p>
+      ) : null}
       <div className="grid grid-cols-2 gap-x-5 gap-y-3.5 px-4 py-3.5 sm:grid-cols-3">
         <Field label="Startup safety" title={panel.startup_safety_detail ?? undefined}>
           <span
@@ -159,9 +209,11 @@ function RuntimeStrip({
 
 export function Runtimes({
   panels,
+  services,
   generatedAt,
 }: {
   panels: RuntimePanel[];
+  services: ServiceUnitsPanel | null;
   generatedAt: string | null;
 }) {
   if (panels.length === 0) {
@@ -175,7 +227,12 @@ export function Runtimes({
   return (
     <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
       {panels.map((panel) => (
-        <RuntimeStrip key={panel.key} panel={panel} generatedAt={generatedAt} />
+        <RuntimeStrip
+          key={panel.key}
+          panel={panel}
+          services={services}
+          generatedAt={generatedAt}
+        />
       ))}
     </div>
   );
