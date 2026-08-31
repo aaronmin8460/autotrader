@@ -82,11 +82,15 @@ from autotrader.equity.runtime import PROCESSING_ORDER as EQUITY_PROCESSING_ORDE
 from autotrader.equity.session import SessionError, is_market_open
 from autotrader.equity.shadow import (
     DEFAULT_SHADOW_LOOKBACK_BARS,
+    DEFAULT_STATE_SESSIONS,
     EQUITY_SHADOW_LOCK_SCOPE,
     MAX_SHADOW_LOOKBACK_BARS,
+    MAX_STATE_SESSIONS,
     MIN_SHADOW_LOOKBACK_BARS,
+    MIN_STATE_SESSIONS,
     EquityShadowConfig,
     EquityShadowRuntime,
+    RegimeEquityBars,
     ShadowEquityBars,
     ShadowIntegrityError,
 )
@@ -1506,10 +1510,21 @@ def equity_submit(
 def _echo_equity_shadow_banner(
     runtime: EquityShadowRuntime, *, once: bool, lock: Path, database: Path
 ) -> None:
-    typer.echo("AUTO TRADER - EQUITY V3 LIVE SHADOW")
+    spec = runtime.regime_spec
+    typer.echo("AUTO TRADER - EQUITY V3 + EDA-1 SIDE-BY-SIDE LIVE SHADOW")
     typer.echo("")
     typer.echo(_field("Environment", "OBSERVATION ONLY"))
     typer.echo(_field("Engine", runtime.engine_version))
+    typer.echo(
+        _field(
+            "Derived Engine",
+            (
+                f"{runtime.derived_engine_version} (EDA1_RGP overlay: participate iff "
+                f"SPY close > SMA{spec.sma_sessions} and drawdown > "
+                f"{spec.calm_threshold:.0%}, lag {spec.lag_sessions} session)"
+            ),
+        )
+    )
     typer.echo(_field("Universe", ", ".join(EQUITY_PROCESSING_ORDER)))
     typer.echo(_field("Session", "US regular hours, broker calendar"))
     typer.echo(_field("Lookback Bars", str(runtime.lookback_bars)))
@@ -1552,6 +1567,15 @@ def equity_shadow(
             "is the historical study's pre-declared uniform lookback."
         ),
     ),
+    state_sessions: int = typer.Option(
+        DEFAULT_STATE_SESSIONS,
+        "--state-sessions",
+        help=(
+            f"Completed sessions behind the EDA-1 regime state, between "
+            f"{MIN_STATE_SESSIONS} and {MAX_STATE_SESSIONS}. The default approximates "
+            "the research frame; the provider returns what its history holds."
+        ),
+    ),
     database: Annotated[
         Path,
         typer.Option(
@@ -1563,12 +1587,15 @@ def equity_shadow(
         ),
     ] = EQUITY_SHADOW_DATABASE_PATH,
 ) -> None:
-    """Run the Equity V3 LIVE SHADOW: real decisions recorded, zero orders.
+    """Run the Equity V3 + EDA-1 LIVE SHADOW: real decisions recorded, zero orders.
 
     Watches the ten Equity V0.2 symbols on completed regular-session 15-minute
     bars - the broker's calendar and clock are the authority, exactly as in the
     trading runtime - runs the V3 decision engine on each newest completed bar,
-    and records every decision durably in `shadow_decisions`.
+    derives the EDA-1 research champion's decision through its deterministic
+    participation overlay (SPY completed-session closes, one session of lag),
+    and records both durably in `shadow_decisions`, side by side, with the
+    per-session regime state and a per-bar comparison row.
 
     \b
     What makes this a shadow rather than a runtime with its gates shut:
@@ -1603,6 +1630,7 @@ def equity_shadow(
         config = EquityShadowConfig(
             safety_delay=timedelta(seconds=safety_delay),
             lookback_bars=lookback_bars,
+            state_sessions=state_sessions,
             code_sha=code_sha,
         )
     except (ScheduleError, EquityError) as error:
@@ -1630,6 +1658,7 @@ def equity_shadow(
             runtime = EquityShadowRuntime(
                 connection,
                 market_data=ShadowEquityBars(calendar),
+                regime_data=RegimeEquityBars(calendar),
                 calendar=calendar,
                 config=config,
                 shutdown=shutdown,

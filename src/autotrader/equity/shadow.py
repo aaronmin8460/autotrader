@@ -1,9 +1,21 @@
-"""Equity V3 live shadow: real session, real decisions, no path to an order.
+"""Equity V3 + EDA-1 live shadow: real session, real decisions, no order path.
 
 This runtime watches the ten Equity V0.2 symbols on completed regular-session
 15-minute bars, runs the **V3 multi-timeframe decision engine** on each newest
-completed bar, and records every decision durably. That is the whole job. It
-sizes nothing, submits nothing, cancels nothing, and holds nothing that could.
+completed bar, derives the **EDA-1 research champion's decision** for the same
+bar through its exact deterministic overlay (`autotrader.equity.regime`), and
+records both durably, side by side. That is the whole job. It sizes nothing,
+submits nothing, cancels nothing, and holds nothing that could.
+
+**EDA-1 is derived, not fitted, and re-verified on every bar.** The champion
+is V3 plus a deterministic participation overlay driven by the reference
+symbol's completed-session closes, with one full session of lag. This runtime
+resolves that state once per session - before any decision that session - and
+persists it. Each bar's EDA-1 decision is then produced by replaying the
+research overlay over the *entire stored V3 series*, and every previously
+stored EDA-1 row must equal the replay's answer, field by field, or the
+process stops: the stored challenger series can never silently drift from the
+transform that defines it.
 
 **The guarantee is structural, not behavioural.** The trading runtime removes
 its execution path with a flag (`--observe-only` constructs no gateway); this
@@ -54,7 +66,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 
 import pandas as pd
@@ -64,9 +76,19 @@ from autotrader.data.validation import (
     ValidationResult,
     validate_frame,
 )
-from autotrader.decision.contract import VERSION_V3
+from autotrader.decision.contract import VERSION_V3, DecisionSignal
 from autotrader.decision.v3 import MultiTimeframeV3Engine
 from autotrader.equity import EQUITY_SYMBOLS, EquityError
+from autotrader.equity.regime import (
+    EDA1_ENGINE_VERSION,
+    REGIME_REFERENCE_SYMBOL,
+    ParticipationSpec,
+    SeriesRecord,
+    participation_overlay,
+    session_closes,
+    source_stance,
+    state_for_session,
+)
 from autotrader.equity.session import (
     MarketCalendar,
     MarketSession,
@@ -97,7 +119,7 @@ from autotrader.runtime.schedule import (
     require_utc,
 )
 from autotrader.shadow.cycle import SKIPPED_ALREADY_PROCESSED, BarOutcome, ShadowCycle
-from autotrader.shadow.panel import EnginePanel, ShadowError
+from autotrader.shadow.panel import EnginePanel, PanelEvaluation, ShadowError
 from autotrader.shadow.recorder import ShadowRecorder
 from autotrader.state import sqlite as state
 
@@ -127,6 +149,17 @@ V3_REQUIRED_BASE_BARS: int = MultiTimeframeV3Engine.for_symbol(
 MIN_SHADOW_LOOKBACK_BARS: int = V3_REQUIRED_BASE_BARS
 MAX_SHADOW_LOOKBACK_BARS = 6000
 DEFAULT_SHADOW_LOOKBACK_BARS = 4750
+
+#: Bounds for the completed sessions behind the EDA-1 regime state. The floor
+#: covers the router's 200-session average, its one-session lag, and margin
+#: for provider gaps; below it the state would be a permanent warm-up
+#: DEFENSIVE that measures the configuration rather than the market. The
+#: default approximates the research frame: the trailing-peak drawdown there
+#: ran from the start of a multi-year history, and the provider keeps roughly
+#: six years, so the state window asks for all of it and uses what exists.
+MIN_STATE_SESSIONS = 250
+MAX_STATE_SESSIONS = 2500
+DEFAULT_STATE_SESSIONS = 1500
 
 #: Audit event types this runtime writes to `system_events`.
 EVENT_SHADOW_STARTED = "EQUITY_SHADOW_STARTED"
@@ -161,6 +194,19 @@ def require_shadow_lookback_bars(value: int, field_name: str = "lookback_bars") 
     return value
 
 
+def require_state_sessions(value: int, field_name: str = "state_sessions") -> int:
+    """Require a session count the regime state can actually be resolved from."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise EquityError(f"{field_name} must be an int, got {type(value).__name__}.")
+    if not MIN_STATE_SESSIONS <= value <= MAX_STATE_SESSIONS:
+        raise EquityError(
+            f"{field_name} must be between {MIN_STATE_SESSIONS} (the router's "
+            f"200-session average plus lag and margin) and {MAX_STATE_SESSIONS}, "
+            f"got {value}."
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class EquityShadowConfig:
     """How the shadow loop runs. Nothing here decides or authorizes anything.
@@ -172,11 +218,13 @@ class EquityShadowConfig:
 
     safety_delay: timedelta = DEFAULT_SAFETY_DELAY
     lookback_bars: int = DEFAULT_SHADOW_LOOKBACK_BARS
+    state_sessions: int = DEFAULT_STATE_SESSIONS
     code_sha: str | None = None
 
     def __post_init__(self) -> None:
         require_safety_delay(self.safety_delay)
         require_shadow_lookback_bars(self.lookback_bars)
+        require_state_sessions(self.state_sessions)
 
 
 class ShadowBarSource(Protocol):
@@ -275,6 +323,98 @@ class ShadowEquityBars:
         }
 
 
+class RegimeBarSource(Protocol):
+    """Where the EDA-1 regime state gets its completed-session closes from.
+
+    A separate protocol from `ShadowBarSource` because it answers a different
+    question: not "the newest V3-sized window ending at this bar" but "every
+    completed regular-session bar of the reference symbol across the sessions
+    strictly before this one". The state must never see the governing
+    session's own bars, so the boundary is a session date, not a bar.
+    """
+
+    def state_frame(
+        self,
+        *,
+        before: date,
+        now: datetime,
+        sessions: int,
+    ) -> pd.DataFrame:
+        """Reference-symbol bars over completed sessions strictly before `before`."""
+
+
+class RegimeEquityBars:
+    """The production `RegimeBarSource`: one reference-symbol request per session.
+
+    The same market-data boundary the shadow's universe fetch reads through -
+    the historical stock-bars client, which has no order surface of any kind.
+    Called once per session (the resolved state is persisted and reused), so
+    the multi-year window costs one request a day.
+    """
+
+    def __init__(
+        self,
+        calendar: MarketCalendar,
+        client: object | None = None,
+    ) -> None:
+        self._calendar = calendar
+        self._client = client
+        #: Provider calls actually made, for the shared API-budget accounting.
+        self.api_calls = 0
+
+    def _resolve_client(self) -> object:
+        if self._client is None:
+            from autotrader.equity.data import create_client
+
+            self._client = create_client()
+        return self._client
+
+    def state_frame(
+        self,
+        *,
+        before: date,
+        now: datetime,
+        sessions: int,
+    ) -> pd.DataFrame:
+        """Fetch the reference symbol's bars for the sessions before `before`."""
+        from autotrader.data.historical import RESOLUTION
+        from autotrader.equity.data import fetch_bars_for_symbols
+
+        count = require_state_sessions(sessions)
+        require_utc(now, "now")
+        window = recent_sessions(
+            self._calendar,
+            day=before - timedelta(days=1),
+            count=count,
+        )
+        if not window:
+            raise EquityError(
+                f"The broker's calendar reports no session before {before.isoformat()}, "
+                "so no regime state can be resolved and nothing was fetched."
+            )
+        if window[-1].session_date >= before:
+            raise SessionError(
+                f"The calendar returned a session on {window[-1].session_date.isoformat()} "
+                f"for a state window that must end before {before.isoformat()}. Refusing "
+                "to resolve a regime state that could read the governing session's own "
+                "closes."
+            )
+        start = window[0].open_utc
+        end = window[-1].close_utc
+        self.api_calls += 1
+        frames = fetch_bars_for_symbols(
+            self._resolve_client(),
+            [REGIME_REFERENCE_SYMBOL],
+            start,
+            end - RESOLUTION,
+        )
+        frame = frames[REGIME_REFERENCE_SYMBOL]
+        if frame.empty:
+            return frame
+        mask = session_bar_mask(window, list(frame["timestamp"]))
+        return frame.loc[mask].reset_index(drop=True)
+
+
 @dataclass
 class ShadowSymbolResult:
     """What one symbol's pass through one cycle produced."""
@@ -283,6 +423,7 @@ class ShadowSymbolResult:
     bar_timestamp: datetime | None = None
     recorded: bool = False
     signal: str | None = None
+    eda1_signal: str | None = None
     candidate_dropped: bool = False
     skipped_reason: str | None = None
 
@@ -323,6 +464,223 @@ class _SymbolBars:
     latest: datetime | None = None
 
 
+#: The shadow's own side-by-side tables. They live only in the shadow's
+#: database - which refuses to be the trading database - and hold the regime
+#: state series and the per-bar V3/EDA-1 comparison the later evaluation joins
+#: on. Created idempotently at startup; the shared schema is not changed.
+_SIDE_BY_SIDE_TABLES = """
+CREATE TABLE IF NOT EXISTS shadow_regime_state (
+    session_date TEXT PRIMARY KEY,
+    participate INTEGER NOT NULL CHECK (participate IN (0, 1)),
+    info_close REAL,
+    info_sma REAL,
+    info_drawdown REAL,
+    sessions_observed INTEGER NOT NULL,
+    sma_sessions INTEGER NOT NULL,
+    calm_threshold REAL NOT NULL,
+    lag_sessions INTEGER NOT NULL,
+    reference_symbol TEXT NOT NULL,
+    computed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS shadow_side_by_side (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    bar_timestamp TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    participate INTEGER NOT NULL CHECK (participate IN (0, 1)),
+    v3_signal TEXT NOT NULL,
+    v3_stance INTEGER NOT NULL CHECK (v3_stance IN (0, 1)),
+    eda1_signal TEXT NOT NULL,
+    eda1_stance INTEGER NOT NULL CHECK (eda1_stance IN (0, 1)),
+    signals_agree INTEGER NOT NULL CHECK (signals_agree IN (0, 1)),
+    stances_agree INTEGER NOT NULL CHECK (stances_agree IN (0, 1)),
+    reference_close REAL NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (symbol, bar_timestamp)
+);
+"""
+
+
+def create_side_by_side_tables(connection: sqlite3.Connection) -> None:
+    """Create the shadow-only regime-state and comparison tables, idempotently."""
+    connection.executescript(_SIDE_BY_SIDE_TABLES)
+
+
+class SideBySideShadowRecorder(ShadowRecorder):
+    """Records V3's decision and EDA-1's derived decision for every bar, atomically.
+
+    The V3 rows are the shipped recorder's, unchanged. In the same transaction
+    this recorder then replays the research overlay over the entire stored V3
+    series - under the persisted per-session participation states - verifies
+    that every previously stored EDA-1 row equals the replay's answer field by
+    field, writes the newest EDA-1 row, and writes one comparison row holding
+    both signals, both hypothetical stances, the regime state, and the bar's
+    reference close. Two decision rows and one comparison row, or none.
+
+    Like its parent it reaches nothing that could act on a decision: no
+    client, no gateway, no socket. It reads and writes rows.
+    """
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        spec: ParticipationSpec,
+        strategy_run_id: int | None = None,
+    ) -> None:
+        super().__init__(connection, strategy_run_id=strategy_run_id)
+        self._spec = spec
+        self._context_symbol: str | None = None
+        self._context_close: float | None = None
+        #: The newest EDA-1 record per symbol, for the runtime's log line.
+        self.last_eda1: dict[str, SeriesRecord] = {}
+        #: The participation state behind the newest record, per symbol.
+        self.last_participate: dict[str, bool] = {}
+
+    def begin_bar(self, symbol: str, *, reference_close: float) -> None:
+        """Hand the recorder the one per-bar fact the evaluation cannot carry."""
+        self._context_symbol = symbol
+        self._context_close = float(reference_close)
+
+    def record(self, evaluation: PanelEvaluation) -> tuple[int, ...]:
+        """Write the V3 rows, the EDA-1 row, and the comparison row, atomically."""
+        with state.transaction(self._connection):
+            recorded = super().record(evaluation)
+            eda1_id = self._record_eda1(evaluation)
+        return (*recorded, eda1_id)
+
+    # ------------------------------------------------------------------
+    # EDA-1 derivation
+    # ------------------------------------------------------------------
+
+    def _record_eda1(self, evaluation: PanelEvaluation) -> int:
+        observation = evaluation.observation_for(SHADOW_ENGINE_VERSION)
+        if observation is None:
+            raise ShadowIntegrityError(
+                "The panel evaluation carries no V3 observation, so no EDA-1 decision "
+                "can be derived. Nothing was recorded."
+            )
+        symbol = evaluation.symbol
+        if self._context_symbol != symbol or self._context_close is None:
+            raise ShadowIntegrityError(
+                f"No reference close was staged for {symbol}; begin_bar must be called "
+                "before every evaluation so the comparison row is complete. Nothing "
+                "was recorded."
+            )
+        reference_close = self._context_close
+        self._context_symbol = None
+        self._context_close = None
+
+        source = self._stored_series(symbol, SHADOW_ENGINE_VERSION)
+        if not source:
+            raise ShadowIntegrityError(
+                f"The V3 row for {symbol} is not visible in this transaction; the "
+                "EDA-1 derivation has nothing to replay. Nothing was recorded."
+            )
+        participate = self._participation_by_session()
+        derived = participation_overlay(source, participate)
+        stored = self._stored_series(symbol, EDA1_ENGINE_VERSION)
+        self._require_replay_matches(symbol, stored, derived)
+
+        current = derived[-1]
+        row_id = state.record_shadow_decision(
+            self._connection,
+            strategy_run_id=self.strategy_run_id,
+            bar_timestamp=current.timestamp,
+            symbol=symbol,
+            engine_version=EDA1_ENGINE_VERSION,
+            signal=current.signal.value,
+            score=current.score,
+            confidence=current.confidence,
+            regime=current.regime,
+            reasons=current.reasons,
+            feature_version=None,
+            model_version=None,
+            execution_version=observation.execution_version,
+            designation=state.SHADOW_DESIGNATION_NOT_EXECUTED,
+        )
+
+        session_day = market_date(current.timestamp)
+        state_on = participate[session_day]
+        v3_signal = source[-1].signal
+        v3_stance = source_stance(list(source))[-1]
+        eda1_stance = source_stance(list(derived))[-1]
+        self._connection.execute(
+            "INSERT INTO shadow_side_by_side ("
+            " symbol, bar_timestamp, session_date, participate,"
+            " v3_signal, v3_stance, eda1_signal, eda1_stance,"
+            " signals_agree, stances_agree, reference_close, recorded_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                symbol,
+                state.to_utc_text(current.timestamp, "bar_timestamp"),
+                session_day.isoformat(),
+                int(state_on),
+                v3_signal.value,
+                int(v3_stance),
+                current.signal.value,
+                int(eda1_stance),
+                int(v3_signal is current.signal),
+                int(v3_stance == eda1_stance),
+                reference_close,
+                state.to_utc_text(datetime.now(UTC), "recorded_at"),
+            ),
+        )
+        self.last_eda1[symbol] = current
+        self.last_participate[symbol] = state_on
+        return row_id
+
+    def _stored_series(self, symbol: str, engine_version: str) -> tuple[SeriesRecord, ...]:
+        rows = self._connection.execute(
+            "SELECT bar_timestamp, signal, score, confidence, regime, reasons"
+            " FROM shadow_decisions WHERE symbol = ? AND engine_version = ?"
+            " ORDER BY bar_timestamp",
+            (symbol, engine_version),
+        ).fetchall()
+        return tuple(
+            SeriesRecord(
+                timestamp=state.from_utc_text(row[0]),
+                symbol=symbol,
+                signal=DecisionSignal(row[1]),
+                score=float(row[2]),
+                confidence=float(row[3]),
+                regime=str(row[4]),
+                reasons=tuple(str(row[5]).split(state.REASON_SEPARATOR)),
+            )
+            for row in rows
+        )
+
+    def _participation_by_session(self) -> dict[date, bool]:
+        rows = self._connection.execute(
+            "SELECT session_date, participate FROM shadow_regime_state"
+        ).fetchall()
+        return {date.fromisoformat(str(row[0])): bool(row[1]) for row in rows}
+
+    def _require_replay_matches(
+        self,
+        symbol: str,
+        stored: tuple[SeriesRecord, ...],
+        derived: tuple[SeriesRecord, ...],
+    ) -> None:
+        """The stored EDA-1 series must be exactly the replay minus the newest bar."""
+        expected = derived[:-1]
+        if len(stored) != len(expected):
+            raise ShadowIntegrityError(
+                f"The stored EDA-1 series for {symbol} holds {len(stored)} row(s) but "
+                f"the overlay replay of the stored V3 series produces {len(expected)}. "
+                "The stored challenger series no longer matches the transform that "
+                "defines it; nothing was recorded."
+            )
+        for stored_record, expected_record in zip(stored, expected, strict=True):
+            if stored_record != expected_record:
+                raise ShadowIntegrityError(
+                    f"The stored EDA-1 decision for {symbol} at "
+                    f"{stored_record.timestamp.isoformat()} does not equal the overlay "
+                    "replay of the stored V3 series. The stored challenger series no "
+                    "longer matches the transform that defines it; nothing was recorded."
+                )
+
+
 class EquityShadowRuntime:
     """The V3 equity live shadow. Observes, records, and cannot trade.
 
@@ -339,9 +697,11 @@ class EquityShadowRuntime:
         connection: sqlite3.Connection,
         *,
         market_data: ShadowBarSource,
+        regime_data: RegimeBarSource,
         calendar: MarketCalendar,
         checkpoint: ProcessedBarCheckpoint | None = None,
         config: EquityShadowConfig | None = None,
+        regime_spec: ParticipationSpec | None = None,
         clock: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], None] = time.sleep,
         shutdown: ShutdownRequest | None = None,
@@ -350,10 +710,12 @@ class EquityShadowRuntime:
         self._connection = connection
         self._config = config if config is not None else EquityShadowConfig()
         self._market_data = market_data
+        self._regime_data = regime_data
         self._calendar = calendar
         self._checkpoint: ProcessedBarCheckpoint = (
             checkpoint if checkpoint is not None else SqliteCheckpoint(connection)
         )
+        self._spec = regime_spec if regime_spec is not None else ParticipationSpec()
         self._clock = clock
         self._sleep = sleep
         self._shutdown = shutdown if shutdown is not None else ShutdownRequest()
@@ -361,7 +723,7 @@ class EquityShadowRuntime:
 
         self._heartbeat = Heartbeat()
         self._heartbeat.last_processed_bars = {symbol: None for symbol in SHADOW_PROCESSING_ORDER}
-        self._recorder = ShadowRecorder(connection, strategy_run_id=None)
+        self._recorder = SideBySideShadowRecorder(connection, spec=self._spec, strategy_run_id=None)
         self._cycles: dict[str, ShadowCycle] = {
             symbol: ShadowCycle(
                 panel=EnginePanel(
@@ -393,8 +755,18 @@ class EquityShadowRuntime:
 
     @property
     def engine_version(self) -> str:
-        """The one version this shadow observes."""
+        """The version the panel evaluates; EDA-1 is derived from its record."""
         return SHADOW_ENGINE_VERSION
+
+    @property
+    def derived_engine_version(self) -> str:
+        """The challenger recorded beside the panel's engine on every bar."""
+        return EDA1_ENGINE_VERSION
+
+    @property
+    def regime_spec(self) -> ParticipationSpec:
+        """The research champion's predeclared router parameters."""
+        return self._spec
 
     @property
     def lookback_bars(self) -> int:
@@ -436,6 +808,8 @@ class EquityShadowRuntime:
             return
         now = require_utc(self._clock(), "now")
         self.assert_no_order_intents()
+        create_side_by_side_tables(self._connection)
+        self._require_consistent_regime_spec()
 
         self._heartbeat.state = RuntimeState.RUNNING
         self._heartbeat.started_at = now
@@ -443,15 +817,21 @@ class EquityShadowRuntime:
             self._heartbeat.last_processed_bars[symbol] = self._checkpoint.last_processed(symbol)
         self._started = True
 
+        spec = self._spec
         state.record_system_event(
             self._connection,
             event_timestamp=now,
             event_type=EVENT_SHADOW_STARTED,
             message=(
-                f"Equity V3 shadow started for {', '.join(SHADOW_PROCESSING_ORDER)}. "
-                f"Engine {SHADOW_ENGINE_VERSION}, lookback {self._config.lookback_bars} "
-                f"bars, code {self._config.code_sha or 'unknown'}. This process holds "
-                "no execution path: zero order mutation, verified per cycle."
+                f"Equity V3 + EDA-1 side-by-side shadow started for "
+                f"{', '.join(SHADOW_PROCESSING_ORDER)}. Engines {SHADOW_ENGINE_VERSION} "
+                f"and {EDA1_ENGINE_VERSION} (router sma={spec.sma_sessions}, "
+                f"calm={spec.calm_threshold}, lag={spec.lag_sessions}, "
+                f"reference {REGIME_REFERENCE_SYMBOL}), lookback "
+                f"{self._config.lookback_bars} bars, state window "
+                f"{self._config.state_sessions} sessions, code "
+                f"{self._config.code_sha or 'unknown'}. This process holds no "
+                "execution path: zero order mutation, verified per cycle."
             ),
         )
         log_event(
@@ -459,12 +839,47 @@ class EquityShadowRuntime:
             "equity_shadow_started",
             started_at=now,
             engine=SHADOW_ENGINE_VERSION,
+            derived_engine=EDA1_ENGINE_VERSION,
+            regime_sma_sessions=spec.sma_sessions,
+            regime_calm_threshold=spec.calm_threshold,
+            regime_lag_sessions=spec.lag_sessions,
+            regime_reference=REGIME_REFERENCE_SYMBOL,
             symbols=",".join(SHADOW_PROCESSING_ORDER),
             lookback_bars=self._config.lookback_bars,
+            state_sessions=self._config.state_sessions,
             safety_delay_seconds=self._config.safety_delay.total_seconds(),
             code_sha=self._config.code_sha,
             order_paths="NONE",
         )
+
+    def _require_consistent_regime_spec(self) -> None:
+        """Refuse a database whose stored regime states used different parameters.
+
+        The overlay replay treats every stored state as produced by *this*
+        process's router. A state series computed under another spec would make
+        the stored EDA-1 rows unreproducible - so it is refused at startup, the
+        same way a database with intents is.
+        """
+        rows = self._connection.execute(
+            "SELECT DISTINCT sma_sessions, calm_threshold, lag_sessions, reference_symbol"
+            " FROM shadow_regime_state"
+        ).fetchall()
+        expected = (
+            self._spec.sma_sessions,
+            self._spec.calm_threshold,
+            self._spec.lag_sessions,
+            REGIME_REFERENCE_SYMBOL,
+        )
+        for row in rows:
+            found = (int(row[0]), float(row[1]), int(row[2]), str(row[3]))
+            if found != expected:
+                raise ShadowIntegrityError(
+                    f"This database holds regime states computed under "
+                    f"(sma, calm, lag, reference)={found}, but this process is "
+                    f"configured with {expected}. A state series from another router "
+                    "would make the stored EDA-1 series unreproducible; refusing to "
+                    "mix them. Nothing was evaluated."
+                )
 
     def stop(self) -> None:
         """Close the record. Idempotent."""
@@ -650,6 +1065,12 @@ class EquityShadowRuntime:
                 market_date=session.session_date.isoformat(),
             )
             return
+        # The regime state is resolved before any symbol is evaluated: without
+        # it EDA-1's decision for this session is undefined, and recording V3
+        # alone would break the side-by-side invariant that every observed bar
+        # carries both answers. A failure here skips the whole cycle - miss an
+        # observation rather than record half of one.
+        self._ensure_regime_state(session, moment)
         frames = self._market_data.recent_bars(
             SHADOW_PROCESSING_ORDER,
             now=moment,
@@ -673,6 +1094,67 @@ class EquityShadowRuntime:
                 self._heartbeat.state = RuntimeState.FAILED
                 report.fatal = True
                 break
+
+    def _ensure_regime_state(self, session: MarketSession, moment: datetime) -> None:
+        """Resolve and persist the EDA-1 state governing `session`, once.
+
+        The state is a deterministic function of completed-session closes
+        strictly before the session, so it is computed at most once per
+        session and read back on every later cycle - a restart mid-session
+        reuses the stored answer rather than asking the provider again.
+        """
+        day = session.session_date
+        existing = self._connection.execute(
+            "SELECT participate FROM shadow_regime_state WHERE session_date = ?",
+            (day.isoformat(),),
+        ).fetchone()
+        if existing is not None:
+            return
+        frame = self._regime_data.state_frame(
+            before=day,
+            now=moment,
+            sessions=self._config.state_sessions,
+        )
+        if frame is None or frame.empty:
+            raise EquityError(
+                f"The reference symbol {REGIME_REFERENCE_SYMBOL} returned no completed "
+                f"bars before {day.isoformat()}, so the regime state governing this "
+                "session cannot be resolved. Nothing was evaluated."
+            )
+        closes = session_closes(frame)
+        resolved = state_for_session(closes, self._spec, session_date=day)
+        with state.transaction(self._connection):
+            self._connection.execute(
+                "INSERT INTO shadow_regime_state ("
+                " session_date, participate, info_close, info_sma, info_drawdown,"
+                " sessions_observed, sma_sessions, calm_threshold, lag_sessions,"
+                " reference_symbol, computed_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    day.isoformat(),
+                    int(resolved.participate),
+                    resolved.info_close,
+                    resolved.info_sma,
+                    resolved.info_drawdown,
+                    resolved.sessions_observed,
+                    self._spec.sma_sessions,
+                    self._spec.calm_threshold,
+                    self._spec.lag_sessions,
+                    REGIME_REFERENCE_SYMBOL,
+                    state.to_utc_text(moment, "computed_at"),
+                ),
+            )
+        log_event(
+            self._logger,
+            "regime_state_resolved",
+            session=day.isoformat(),
+            participate=resolved.participate,
+            info_close=resolved.info_close,
+            info_sma=resolved.info_sma,
+            info_drawdown=resolved.info_drawdown,
+            sessions_observed=resolved.sessions_observed,
+            reference=REGIME_REFERENCE_SYMBOL,
+        )
 
     def _observe_symbol(
         self,
@@ -701,6 +1183,7 @@ class EquityShadowRuntime:
         if bars.latest is None:
             return ShadowSymbolResult(symbol=symbol, skipped_reason="NO_BAR_THIS_SESSION")
 
+        self._recorder.begin_bar(symbol, reference_close=float(bars.frame["close"].iloc[-1]))
         outcome = self._cycles[symbol].evaluate_bar(symbol, bars.frame, bar_timestamp=bars.latest)
         if not outcome.claimed:
             log_event(
@@ -727,9 +1210,13 @@ class EquityShadowRuntime:
         observation = evaluation.observation_for(SHADOW_ENGINE_VERSION)
         reference_close = float(bars.frame["close"].iloc[-1])
         signal_value: str | None = None
+        eda1_signal_value: str | None = None
         if observation is not None:
             result = observation.result
             signal_value = result.signal.value
+            eda1 = self._recorder.last_eda1.get(symbol)
+            participate = self._recorder.last_participate.get(symbol)
+            eda1_signal_value = eda1.signal.value if eda1 is not None else None
             log_event(
                 self._logger,
                 "shadow_decision",
@@ -743,6 +1230,13 @@ class EquityShadowRuntime:
                 reasons=" ".join(result.reasons),
                 feature_version=observation.feature_version,
                 model_version=observation.model_version,
+                eda1_signal=eda1_signal_value,
+                eda1_regime=eda1.regime if eda1 is not None else None,
+                eda1_reasons=" ".join(eda1.reasons) if eda1 is not None else None,
+                participate=participate,
+                signals_agree=(
+                    eda1_signal_value == signal_value if eda1_signal_value is not None else None
+                ),
                 reference_close=reference_close,
                 code_sha=self._config.code_sha,
                 order_created="NO_ORDER_PATH",
@@ -778,6 +1272,7 @@ class EquityShadowRuntime:
             ),
             recorded=True,
             signal=signal_value,
+            eda1_signal=eda1_signal_value,
             candidate_dropped=candidate is not None,
         )
 
@@ -835,7 +1330,8 @@ class EquityShadowRuntime:
             event_timestamp=moment,
             event_type=EVENT_SHADOW_CYCLE,
             message=(
-                f"Shadow cycle: {report.recorded_count} decision(s) recorded, "
+                f"Shadow cycle: {report.recorded_count} bar(s) recorded side by side "
+                f"({SHADOW_ENGINE_VERSION} and {EDA1_ENGINE_VERSION}, replay-verified), "
                 f"{report.dropped_candidates} actionable candidate(s) dropped "
                 "unexecuted, 0 order intents in this database (verified)."
             ),
@@ -873,12 +1369,15 @@ class EquityShadowRuntime:
 
 __all__ = [
     "DEFAULT_SHADOW_LOOKBACK_BARS",
+    "DEFAULT_STATE_SESSIONS",
     "EQUITY_SHADOW_LOCK_SCOPE",
     "EVENT_SHADOW_CYCLE",
     "EVENT_SHADOW_STARTED",
     "EVENT_SHADOW_STOPPED",
     "MAX_SHADOW_LOOKBACK_BARS",
+    "MAX_STATE_SESSIONS",
     "MIN_SHADOW_LOOKBACK_BARS",
+    "MIN_STATE_SESSIONS",
     "NO_SESSION_TODAY",
     "SESSION_CLOSED",
     "SESSION_OPEN",
@@ -887,11 +1386,16 @@ __all__ = [
     "V3_REQUIRED_BASE_BARS",
     "EquityShadowConfig",
     "EquityShadowRuntime",
+    "RegimeBarSource",
+    "RegimeEquityBars",
     "ShadowBarSource",
     "ShadowCycleReport",
     "ShadowEquityBars",
     "ShadowIntegrityError",
     "ShadowSymbolResult",
+    "SideBySideShadowRecorder",
+    "create_side_by_side_tables",
     "filter_to_shadow_sessions",
     "require_shadow_lookback_bars",
+    "require_state_sessions",
 ]

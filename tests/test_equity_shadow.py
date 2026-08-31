@@ -31,11 +31,13 @@ from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from autotrader.decision.contract import VERSION_V3
 from autotrader.decision.v3 import MultiTimeframeV3Engine
-from autotrader.equity.session import MarketSession
+from autotrader.equity.regime import EDA1_ENGINE_VERSION, ParticipationSpec
+from autotrader.equity.session import MarketSession, regular_session_bar_starts
 from autotrader.equity.shadow import (
     DEFAULT_SHADOW_LOOKBACK_BARS,
     MAX_SHADOW_LOOKBACK_BARS,
@@ -63,6 +65,7 @@ from autotrader.state.sqlite import (
 from conftest import establish_account_safety
 from test_equity_runtime import (
     SESSION,
+    SESSIONS,
     SPY,
     T_BAR,
     T_NOW,
@@ -84,10 +87,56 @@ def connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
         yield open_connection
 
 
+#: The sessions the default regime fixture covers: everything before SESSION.
+STATE_SESSIONS = SESSIONS[:-1]
+
+
+def make_state_frame(
+    sessions: tuple[MarketSession, ...] = STATE_SESSIONS,
+    *,
+    closes: list[float] | None = None,
+) -> pd.DataFrame:
+    """A reference-symbol frame with one final bar per completed session."""
+    stamps = [regular_session_bar_starts(session)[-1] for session in sessions]
+    prices = closes if closes is not None else [500.0] * len(stamps)
+    return pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp(stamp) for stamp in stamps],
+            "open": prices,
+            "high": prices,
+            "low": prices,
+            "close": prices,
+            "volume": [1000.0] * len(stamps),
+        }
+    )
+
+
+class FakeRegimeBars:
+    """Returns a prepared reference-symbol state frame, or raises."""
+
+    def __init__(
+        self,
+        frame: pd.DataFrame | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.frame = frame
+        self.error = error
+        self.calls: list[tuple[date, datetime, int]] = []
+
+    def state_frame(self, *, before: date, now: datetime, sessions: int) -> pd.DataFrame:
+        self.calls.append((before, now, sessions))
+        if self.error is not None:
+            raise self.error
+        return self.frame if self.frame is not None else make_state_frame()
+
+
 def build_shadow(
     connection: sqlite3.Connection,
     *,
     bars: FakeEquityBars | None = None,
+    regime: FakeRegimeBars | None = None,
+    regime_spec: ParticipationSpec | None = None,
     calendar: FakeCalendar | None = None,
     clock: FakeClock | None = None,
     config: EquityShadowConfig | None = None,
@@ -95,7 +144,9 @@ def build_shadow(
     return EquityShadowRuntime(
         connection,
         market_data=bars if bars is not None else FakeEquityBars(),
+        regime_data=regime if regime is not None else FakeRegimeBars(),
         calendar=calendar if calendar is not None else FakeCalendar([SESSION]),
+        regime_spec=regime_spec,
         clock=clock if clock is not None else FakeClock(),
         sleep=lambda seconds: None,
         shutdown=ShutdownRequest(),
@@ -104,12 +155,12 @@ def build_shadow(
 
 
 def stored_shadow_decisions(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    # `connect` installs sqlite3.Row; keep it installed - the state layer's
+    # own readers depend on it, and a later cycle shares this connection.
     connection.row_factory = sqlite3.Row
-    rows = connection.execute(
+    return connection.execute(
         "SELECT * FROM shadow_decisions ORDER BY symbol, bar_timestamp, engine_version"
     ).fetchall()
-    connection.row_factory = None
-    return rows
 
 
 # ==========================================================================
@@ -244,7 +295,11 @@ def test_the_stored_decision_is_v3s_own_answer(connection: sqlite3.Connection) -
     runtime.run_once()
 
     direct = MultiTimeframeV3Engine.for_symbol(SPY).decide(frame)
-    [row] = [r for r in stored_shadow_decisions(connection) if r["symbol"] == SPY]
+    [row] = [
+        r
+        for r in stored_shadow_decisions(connection)
+        if r["symbol"] == SPY and r["engine_version"] == VERSION_V3
+    ]
 
     assert row["engine_version"] == VERSION_V3
     assert row["execution_version"] == VERSION_V3
@@ -256,15 +311,17 @@ def test_the_stored_decision_is_v3s_own_answer(connection: sqlite3.Connection) -
     assert datetime.fromisoformat(row["bar_timestamp"]) == direct.timestamp.to_pydatetime()
 
 
-def test_every_universe_symbol_is_recorded_once_per_bar(
+def test_every_universe_symbol_is_recorded_once_per_bar_per_engine(
     connection: sqlite3.Connection,
 ) -> None:
     runtime = build_shadow(connection)
     runtime.run_once()
 
     rows = stored_shadow_decisions(connection)
-    assert sorted(row["symbol"] for row in rows) == sorted(SHADOW_PROCESSING_ORDER)
-    assert {row["engine_version"] for row in rows} == {VERSION_V3}
+    assert {row["engine_version"] for row in rows} == {VERSION_V3, EDA1_ENGINE_VERSION}
+    for engine in (VERSION_V3, EDA1_ENGINE_VERSION):
+        symbols = sorted(row["symbol"] for row in rows if row["engine_version"] == engine)
+        assert symbols == sorted(SHADOW_PROCESSING_ORDER)
 
 
 # ==========================================================================
@@ -309,7 +366,7 @@ def test_a_bar_is_never_evaluated_twice_within_a_process(
     assert first.recorded_count == len(SHADOW_PROCESSING_ORDER)
     assert second.recorded_count == 0
     rows = stored_shadow_decisions(connection)
-    assert len(rows) == len(SHADOW_PROCESSING_ORDER)
+    assert len(rows) == 2 * len(SHADOW_PROCESSING_ORDER)
 
 
 def test_the_claim_survives_a_process_restart(tmp_path: Path) -> None:
@@ -325,7 +382,7 @@ def test_the_claim_survives_a_process_restart(tmp_path: Path) -> None:
         build_shadow(connection).run_once()
         rows = stored_shadow_decisions(connection)
 
-    assert first_count == len(SHADOW_PROCESSING_ORDER)
+    assert first_count == 2 * len(SHADOW_PROCESSING_ORDER)
     assert len(rows) == first_count
 
 
@@ -423,7 +480,6 @@ def test_the_cli_command_exists_and_names_the_guarantee() -> None:
 def test_the_cli_command_constructs_nothing_that_can_execute() -> None:
     """The command builds a shadow runtime and passes it no execution anything."""
     from autotrader import cli
-
     from test_runtime import code_without_prose
 
     code = code_without_prose(inspect.getsource(cli.equity_shadow))
