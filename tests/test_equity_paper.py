@@ -756,3 +756,116 @@ def test_the_market_calendar_is_the_only_thing_that_opens_a_cycle(
     report = runtime.run_once()
     assert report.session_state != SESSION_OPEN
     assert report.outcomes == []
+
+
+# ==========================================================================
+# Parity compares the target stance, not the transition signal
+#
+# Observed on the first live cycle of 2026-08-31: the shadow had been running
+# since 15:22 and recorded its EDA-1 entry as a BUY on its own first bar, so by
+# 16:45 it was HOLDing; the paper runtime started at 17:16 and recorded its
+# entry as a BUY on *its* first bar, which was 16:45. Every decision field
+# agreed - participate 1, stance 1, reference close 765.89 to the cent - and
+# the signal differed on all ten symbols purely because the two series began on
+# different days. Comparing the signal blocked every mutation. It is the wrong
+# field to compare, and these tests pin the right one.
+# ==========================================================================
+
+
+def _record(signal: str, stance: int, *, participate: bool = True, close: float = 765.89):
+    return ParityRecord(
+        symbol="SPY",
+        bar_timestamp=T_BAR,
+        reference_close=close,
+        participate=participate,
+        eda1_signal=signal,
+        eda1_stance=stance,
+    )
+
+
+def test_a_phase_shifted_transition_signal_is_not_a_disagreement() -> None:
+    """CRITICAL. The exact 2026-08-31 first-cycle case, pinned."""
+    paper = _record("BUY", 1)
+    shadow = _record("HOLD", 1)
+    assert paper.disagreement(shadow, price_tolerance=0.01) is None
+    note = paper.phase_note(shadow)
+    assert note is not None
+    assert "phase-shifted" in note
+
+
+def test_a_differing_stance_is_always_a_disagreement() -> None:
+    """CRITICAL. The decision itself. Same signal cannot excuse it."""
+    paper = _record("HOLD", 1)
+    shadow = _record("HOLD", 0)
+    assert paper.disagreement(shadow, price_tolerance=0.01) is not None
+    assert paper.phase_note(shadow) is None
+
+
+def test_a_differing_participate_state_is_a_disagreement() -> None:
+    paper = _record("HOLD", 1)
+    shadow = _record("HOLD", 1, participate=False)
+    assert "participate" in (paper.disagreement(shadow, price_tolerance=0.01) or "")
+
+
+def test_a_materially_different_reference_close_is_a_disagreement() -> None:
+    paper = _record("HOLD", 1, close=765.89)
+    shadow = _record("HOLD", 1, close=770.00)
+    assert "reference_close" in (paper.disagreement(shadow, price_tolerance=0.01) or "")
+
+
+def test_a_last_decimal_place_difference_is_tolerated() -> None:
+    """Two provider reads of the same bar may differ in the last place."""
+    paper = _record("HOLD", 1, close=765.89)
+    shadow = _record("HOLD", 1, close=765.895)
+    assert paper.disagreement(shadow, price_tolerance=0.01) is None
+
+
+def test_identical_records_produce_neither_a_disagreement_nor_a_note() -> None:
+    paper = _record("HOLD", 1)
+    assert paper.disagreement(paper, price_tolerance=0.01) is None
+    assert paper.phase_note(paper) is None
+
+
+def test_a_phase_shifted_shadow_does_not_block_mutation(
+    connection: sqlite3.Connection,
+) -> None:
+    """CRITICAL. End to end: agreeing stance, differing signal, order still placed."""
+
+    class PhaseShifted(AgreeingParity):
+        def decision_for(self, symbol: str, bar_timestamp: datetime) -> ParityRecord | None:
+            return ParityRecord(
+                symbol=symbol,
+                bar_timestamp=bar_timestamp,
+                reference_close=0.0,
+                participate=True,
+                eda1_signal="HOLD",
+                eda1_stance=1,
+            )
+
+    gateway = RecordingGateway()
+    runtime = build_paper(
+        connection,
+        gateway=gateway,
+        parity=PhaseShifted(),
+        stage="A",
+        require_parity=True,
+        parity_price_tolerance=1e9,
+    )
+    report = runtime.run_once()
+
+    assert report.parity_mismatches == 0
+    assert runtime.parity_phase_notes > 0
+    assert [symbol for symbol, _, _ in gateway.calls] == ["SPY"]
+
+
+def test_the_heartbeat_reports_the_durable_safety_answer(
+    connection: sqlite3.Connection,
+) -> None:
+    """A beat that printed a code this runtime never computed would be the
+    crypto heartbeat's own defect: echoing a stale verdict as current."""
+    runtime = build_paper(connection, gateway=RecordingGateway(), stage="A")
+    runtime.start()
+    beat = runtime.heartbeat
+    assert beat.paper_execution_enabled is True
+    assert beat.startup_safety_code == state.ACCOUNT_SAFETY_SAFE
+    runtime.stop()

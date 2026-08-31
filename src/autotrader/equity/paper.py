@@ -235,25 +235,60 @@ class ParityRecord:
     eda1_stance: int
 
     def disagreement(self, other: ParityRecord, *, price_tolerance: float) -> str | None:
-        """What differs between two independent computations, or None.
+        """What the two computations actually disagree about, or None.
+
+        **The comparison is on the target stance, not the transition signal,
+        and that distinction is the whole point.** EDA-1 is a target-position
+        architecture: the decision for a bar is "hold this symbol or do not",
+        and `eda1_stance` is that decision. `eda1_signal` is BUY/SELL/HOLD -
+        emitted only where the target *changes* - so it is a function of where
+        a series began, not of what the market did. Two correct series that
+        started on different days therefore differ on it forever: the one that
+        began while the regime was already on records its entry as a BUY on its
+        own first bar, and the older one has been HOLDing since its own.
+
+        Comparing the signal would make that startup phase difference look like
+        a decision disagreement and block every mutation for as long as both
+        series live - which is exactly what it did on this runtime's first live
+        cycle, on all ten symbols, while every decision field agreed to the
+        cent. The stance is what the allocator consumes and the stance is what
+        is compared.
+
+        A signal difference where the stance agrees is reported separately by
+        `phase_note` and is informational.
 
         The reference close is compared with a tolerance and everything else
-        exactly. The tolerance exists because two processes fetch bars from the
-        provider in two separate requests and a late-arriving revision can move
-        the last decimal place; the *decision* fields have no such excuse and
-        are required to be identical.
+        exactly. The tolerance exists because two processes fetch bars in two
+        separate provider requests and a late revision can move the last
+        decimal place; the decision fields have no such excuse.
         """
         if self.bar_timestamp != other.bar_timestamp:
             return f"bar_timestamp {self.bar_timestamp} != {other.bar_timestamp}"
         if self.participate != other.participate:
             return f"participate {self.participate} != {other.participate}"
-        if self.eda1_signal != other.eda1_signal:
-            return f"eda1_signal {self.eda1_signal} != {other.eda1_signal}"
         if self.eda1_stance != other.eda1_stance:
             return f"eda1_stance {self.eda1_stance} != {other.eda1_stance}"
         if abs(self.reference_close - other.reference_close) > price_tolerance:
             return f"reference_close {self.reference_close} != {other.reference_close}"
         return None
+
+    def phase_note(self, other: ParityRecord) -> str | None:
+        """A transition-signal difference the agreeing stance explains, or None.
+
+        Reported so the difference is visible in the record rather than
+        silently dropped - an operator should be able to see that the two
+        series are phase-shifted, and see it stop mattering once both have
+        lived through a transition together.
+        """
+        if self.eda1_stance != other.eda1_stance:
+            return None
+        if self.eda1_signal == other.eda1_signal:
+            return None
+        return (
+            f"eda1_signal {self.eda1_signal} != {other.eda1_signal} with stance "
+            f"{self.eda1_stance} agreed: the two series began on different bars, so "
+            "their transition signals are phase-shifted. Not a decision disagreement."
+        )
 
 
 class ShadowParitySource(Protocol):
@@ -642,6 +677,11 @@ class EquityPaperRuntime:
 
         self._heartbeat = Heartbeat()
         self._heartbeat.last_processed_bars = {symbol: None for symbol in PAPER_DECISION_ORDER}
+        # The heartbeat's shared fields, set honestly for this runtime: it does
+        # hold an execution path, and its account-safety answer comes from the
+        # durable row reconciliation wrote rather than from a startup pass this
+        # process runs itself.
+        self._heartbeat.paper_execution_enabled = True
         self._recorder = SideBySideShadowRecorder(
             connection, spec=self._spec, strategy_run_id=strategy_run_id
         )
@@ -658,6 +698,7 @@ class EquityPaperRuntime:
         }
         self._started = False
         self._parity_mismatches = 0
+        self._parity_phase_notes = 0
 
     # ------------------------------------------------------------------
     # Observable state
@@ -687,6 +728,11 @@ class EquityPaperRuntime:
     def parity_mismatches(self) -> int:
         return self._parity_mismatches
 
+    @property
+    def parity_phase_notes(self) -> int:
+        """Transition-signal differences an agreeing stance explains. Not mismatches."""
+        return self._parity_phase_notes
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -704,6 +750,7 @@ class EquityPaperRuntime:
         self._heartbeat.started_at = now
         for symbol in PAPER_DECISION_ORDER:
             self._heartbeat.last_processed_bars[symbol] = self._checkpoint.last_processed(symbol)
+        self._refresh_safety_heartbeat()
         self._started = True
 
         policy = self._config.policy
@@ -736,6 +783,20 @@ class EquityPaperRuntime:
             code_sha=self._config.code_sha,
             environment="PAPER",
         )
+
+    def _refresh_safety_heartbeat(self) -> None:
+        """Show the durable account-safety answer and the freshest pass in the beat.
+
+        Read rather than assumed. A heartbeat that printed a startup code this
+        runtime never computed would be the same defect the crypto heartbeat
+        had: echoing a stale verdict as though it were current.
+        """
+        safety = state.read_account_safety_state(self._connection)
+        self._heartbeat.startup_safety_code = safety.state
+        row = self._connection.execute(
+            "SELECT status FROM reconciliation_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self._heartbeat.reconciliation_status = str(row[0]) if row is not None else None
 
     def _require_consistent_regime_spec(self) -> None:
         """Refuse a store whose regime states were computed by a different router."""
@@ -922,6 +983,7 @@ class EquityPaperRuntime:
             self._heartbeat.last_successful_cycle_at = moment
         if report.session_state == SESSION_OPEN:
             self._record_cycle_audit(moment, report)
+        self._refresh_safety_heartbeat()
 
         log_event(
             self._logger,
@@ -1167,6 +1229,18 @@ class EquityPaperRuntime:
             outcome.disposition = Disposition.PARITY_MISMATCH
             outcome.message = difference
             self._record_parity_mismatch(outcome, difference)
+            return
+        phase = mine.phase_note(theirs)
+        if phase is not None:
+            self._parity_phase_notes += 1
+            log_event(
+                self._logger,
+                "shadow_paper_signal_phase",
+                symbol=outcome.symbol,
+                bar_timestamp=outcome.bar_timestamp,
+                detail=phase,
+                action="MUTATION_STILL_ALLOWED",
+            )
 
     def _record_parity_mismatch(self, outcome: SymbolOutcome, detail: str) -> None:
         self._parity_mismatches += 1
