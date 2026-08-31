@@ -123,7 +123,10 @@ def attach_features(trades: pd.DataFrame, context: pd.DataFrame, ordinal) -> pd.
     ]
     exit_ords = []
     for ts in enriched["exit_signal"]:
-        exit_ords.append(None if ts is None else ordinal.get(market_date(ts.to_pydatetime())))
+        if pd.isna(ts):
+            exit_ords.append(None)
+        else:
+            exit_ords.append(ordinal.get(market_date(ts.to_pydatetime())))
     enriched["exit_session_ord"] = exit_ords
     return enriched
 
@@ -200,7 +203,7 @@ def build_overlay(trades: pd.DataFrame, decisions: Path, suppressed: set) -> dic
             replace = False
             if record.signal is DecisionSignal.BUY:
                 for start, end in symbol_spans:
-                    if record.timestamp >= start and (end is None or record.timestamp < end):
+                    if record.timestamp >= start and (pd.isna(end) or record.timestamp < end):
                         replace = True
                         break
             if replace:
