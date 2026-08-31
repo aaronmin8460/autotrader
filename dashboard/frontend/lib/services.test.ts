@@ -19,6 +19,7 @@ import {
   SERVICE_UNITS,
   healthRows,
   serviceUnit,
+  trailPanelLabel,
   unknownServiceRows,
   type HealthRow,
   type ServiceUnitRow,
@@ -363,4 +364,27 @@ test("positions stay the broker-global account view", () => {
   // The panel renders whatever rows the broker returns; nothing filters by
   // asset class, which is what makes it the account rather than a book.
   assert.ok(!text.includes("CRYPTO\"") && !text.includes("filter("));
+});
+
+// =========================================================================
+// The runtime cards take their names from the registry, not the payload
+// =========================================================================
+
+test("a trail panel is titled by the unit it is really about", () => {
+  // The deployed operational API is pinned and still sends its own labels.
+  assert.equal(trailPanelLabel("crypto", "Crypto runtime"), "Crypto Paper");
+  assert.equal(trailPanelLabel("equity", "Equity runtime"), "Legacy Equity Runtime");
+});
+
+test("an unrecognised trail panel keeps its own label rather than guessing", () => {
+  assert.equal(trailPanelLabel("something-new", "Something New"), "Something New");
+});
+
+test("no runtime card can be titled with the ambiguous name", () => {
+  for (const [key, sent] of [
+    ["crypto", "Crypto runtime"],
+    ["equity", "Equity runtime"],
+  ] as const) {
+    assert.notEqual(trailPanelLabel(key, sent), "Equity runtime");
+  }
 });

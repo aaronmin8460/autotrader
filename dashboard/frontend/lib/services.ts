@@ -116,6 +116,26 @@ export const SERVICE_UNITS: ReadonlyArray<{
 /** The unit whose masked state must never be read as current equity trading. */
 export const LEGACY_EQUITY_KEY = "equity_legacy";
 
+/**
+ * Which unit each of the operational API's trail panels is actually about.
+ *
+ * The operational API sends its own labels, and the deployed build of it is
+ * pinned to the crypto production checkout - so the page cannot rely on those
+ * strings being the corrected ones. Names this specific are exactly what the
+ * defect was about, so the frontend takes them from the registry above and
+ * treats the payload's `label` as advisory.
+ */
+export const TRAIL_PANEL_UNITS: Readonly<Record<string, string>> = {
+  crypto: "crypto",
+  equity: LEGACY_EQUITY_KEY,
+};
+
+/** The label for a trail panel, by the unit it is really about. */
+export function trailPanelLabel(panelKey: string, fallback: string): string {
+  const unitKey = TRAIL_PANEL_UNITS[panelKey];
+  return SERVICE_UNITS.find((spec) => spec.key === unitKey)?.label ?? fallback;
+}
+
 /** Rows for when the status source itself could not be read. */
 export function unknownServiceRows(): HealthRow[] {
   return SERVICE_UNITS.map((spec) => ({

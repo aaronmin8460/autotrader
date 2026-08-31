@@ -32,7 +32,7 @@
 
 import { relative, stampUtc } from "@/lib/format";
 import type { ServiceUnitsPanel } from "@/lib/services";
-import { LEGACY_EQUITY_KEY, serviceUnit } from "@/lib/services";
+import { LEGACY_EQUITY_KEY, serviceUnit, trailPanelLabel } from "@/lib/services";
 import type { RuntimePanel, Tone } from "@/lib/types";
 
 import { Card, Dot, Field, Tag, Td, Th, cn, toneText } from "./ui";
@@ -49,20 +49,23 @@ export function runtimeView(
   panel: RuntimePanel,
   services: ServiceUnitsPanel | null,
 ): { label: string; state: string; tone: Tone; detail: string | null; note: string | null } {
+  // The label is always the registry's, never the payload's. The operational
+  // API's deployed build is pinned and still sends "Crypto runtime"; a page
+  // that showed one name in the health panel and another on the card would
+  // have reintroduced the ambiguity in a smaller font.
+  const label = trailPanelLabel(panel.key, panel.label);
+
   if (panel.key !== "equity") {
-    return {
-      label: panel.label,
-      state: panel.state,
-      tone: panel.tone,
-      detail: panel.detail,
-      note: null,
-    };
+    // The headline stays the trail's. This card is about the loop, and the
+    // trail is the only source that can say STALE - a unit the manager calls
+    // active while it has stopped claiming bars.
+    return { label, state: panel.state, tone: panel.tone, detail: panel.detail, note: null };
   }
 
   const unit = serviceUnit(services, LEGACY_EQUITY_KEY);
   const note = "Superseded by Equity Paper · EDA-1. Not the current equity runtime.";
   if (unit === null) {
-    return { label: panel.label, state: panel.state, tone: panel.tone, detail: panel.detail, note };
+    return { label, state: panel.state, tone: panel.tone, detail: panel.detail, note };
   }
   return { label: unit.label, state: unit.status, tone: unit.tone, detail: unit.detail, note };
 }
