@@ -340,6 +340,53 @@ class SqliteShadowParity:
         )
 
 
+#: The durable record of *why* an order was the size it was.
+#:
+#: `order_intents` holds what was sent - symbol, side, quantities, reference
+#: price, risk reason, `client_order_id`. It does not hold what was wanted, and
+#: after the fact those are different questions: "the broker was asked for 3
+#: shares of SPY" does not say which engine wanted it, under which sizing
+#: policy, against which target weight, or what the account already held. That
+#: context lives in the journal, and a journal is rotated.
+#:
+#: Created on demand rather than added to the versioned schema, exactly as the
+#: side-by-side tables are. A schema bump here would put this store a version
+#: ahead of the shadow's for a table the shadow has no use for - and the whole
+#: point of this deployment is that a version gap between stores is expensive.
+CREATE_PAPER_TARGETS = """
+    CREATE TABLE IF NOT EXISTS equity_paper_targets (
+        id                 INTEGER PRIMARY KEY,
+        client_order_id    TEXT NOT NULL UNIQUE CHECK (client_order_id <> ''),
+        engine             TEXT NOT NULL CHECK (engine <> ''),
+        environment        TEXT NOT NULL CHECK (environment = 'PAPER'),
+        sizing_policy      TEXT NOT NULL CHECK (sizing_policy <> ''),
+        sizing_config_hash TEXT NOT NULL CHECK (sizing_config_hash <> ''),
+        rollout_stage      TEXT NOT NULL CHECK (rollout_stage <> ''),
+        symbol             TEXT NOT NULL CHECK (symbol <> ''),
+        side               TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+        target_weight      TEXT NOT NULL,
+        target_notional    TEXT NOT NULL,
+        target_quantity    TEXT NOT NULL,
+        broker_quantity    TEXT NOT NULL,
+        requested_delta    TEXT NOT NULL,
+        approved_quantity  TEXT,
+        risk_reason_code   TEXT,
+        reference_price    TEXT NOT NULL,
+        account_equity     TEXT NOT NULL,
+        external_exposure  TEXT NOT NULL,
+        budget_fraction    TEXT NOT NULL,
+        bar_timestamp      TEXT NOT NULL,
+        decided_at         TEXT NOT NULL
+    )
+"""
+
+
+def create_paper_target_table(connection: sqlite3.Connection) -> None:
+    """Ensure the durable target record exists. Idempotent."""
+    with state.transaction(connection):
+        connection.execute(CREATE_PAPER_TARGETS)
+
+
 class ExternalSafetySource(Protocol):
     """Another product's durable account-safety answer, read from its own store."""
 
@@ -743,6 +790,7 @@ class EquityPaperRuntime:
             return
         now = require_utc(self._clock(), "now")
         create_side_by_side_tables(self._connection)
+        create_paper_target_table(self._connection)
         self._require_consistent_regime_spec()
         self._require_no_unresolved_intents()
 
@@ -1528,6 +1576,11 @@ class EquityPaperRuntime:
             outcome.disposition = Disposition.ALREADY_SATISFIED
             return
 
+        # Durable, and BEFORE the broker is asked for anything. A crash between
+        # this row and the intent leaves a target nobody acted on, which reads
+        # correctly; the reverse order would leave an order nobody can explain.
+        self._record_target(outcome, allocation, moment, report)
+
         try:
             result = self._gateway.execute(
                 self._connection,
@@ -1593,12 +1646,96 @@ class EquityPaperRuntime:
         else:
             outcome.disposition = Disposition.FAILED
 
+        self._settle_target_risk(outcome)
         log_event(
             self._logger,
             "paper_order",
             **outcome.as_fields(),
             outcome=result.outcome.value,
         )
+
+    def _record_target(
+        self,
+        outcome: SymbolOutcome,
+        allocation: SymbolAllocation,
+        moment: datetime,
+        report: EquityPaperCycleReport,
+    ) -> None:
+        """Persist what was wanted, and why, keyed by the durable order id.
+
+        The `client_order_id` is deterministic for a (symbol, bar, side, size)
+        decision, so this row and the `order_intents` row the execution boundary
+        writes moments later share a key without either having to know about the
+        other. Written before the submission attempt for the same reason the
+        intent is: a decision that may have reached the broker must be
+        reconstructable afterwards.
+        """
+        from autotrader.execution.models import OrderIntent
+
+        intent = OrderIntent(
+            symbol=allocation.symbol,
+            side=allocation.side,  # type: ignore[arg-type]
+            requested_quantity=allocation.delta_quantity,
+            approved_quantity=allocation.delta_quantity,
+            reference_price=float(allocation.reference_price),
+            risk_reason_code="PENDING_RISK",
+            created_at=moment,
+            strategy_run_id=self._strategy_run_id,
+        )
+        outcome.client_order_id = intent.client_order_id
+        policy = self._config.policy
+        with state.transaction(self._connection):
+            self._connection.execute(
+                "INSERT OR REPLACE INTO equity_paper_targets ("
+                " client_order_id, engine, environment, sizing_policy,"
+                " sizing_config_hash, rollout_stage, symbol, side, target_weight,"
+                " target_notional, target_quantity, broker_quantity, requested_delta,"
+                " approved_quantity, risk_reason_code, reference_price, account_equity,"
+                " external_exposure, budget_fraction, bar_timestamp, decided_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    intent.client_order_id,
+                    EDA1_ENGINE_VERSION,
+                    "PAPER",
+                    policy.policy_id,
+                    policy.config_hash(),
+                    self._config.stage,
+                    allocation.symbol,
+                    allocation.side.value,  # type: ignore[union-attr]
+                    str(allocation.target_weight),
+                    str(allocation.target_notional),
+                    str(allocation.target_quantity),
+                    str(allocation.actual_quantity),
+                    str(allocation.delta_quantity),
+                    None,
+                    None,
+                    str(allocation.reference_price),
+                    str(report.account_equity),
+                    str(report.external_exposure_fraction),
+                    str(report.plan.budget_fraction if report.plan is not None else ""),
+                    state.to_utc_text(outcome.bar_timestamp, "bar_timestamp")
+                    if outcome.bar_timestamp is not None
+                    else "",
+                    state.to_utc_text(moment, "decided_at"),
+                ),
+            )
+
+    def _settle_target_risk(self, outcome: SymbolOutcome) -> None:
+        """Back-fill what Risk actually allowed, once the attempt has returned."""
+        if outcome.client_order_id is None:
+            return
+        with state.transaction(self._connection):
+            self._connection.execute(
+                "UPDATE equity_paper_targets SET approved_quantity = ?,"
+                " risk_reason_code = ? WHERE client_order_id = ?",
+                (
+                    str(outcome.approved_quantity)
+                    if outcome.approved_quantity is not None
+                    else None,
+                    outcome.risk_reason_code,
+                    outcome.client_order_id,
+                ),
+            )
 
     def _record_cycle_audit(self, moment: datetime, report: EquityPaperCycleReport) -> None:
         counts: dict[str, int] = {}
@@ -1639,7 +1776,9 @@ __all__ = [
     "EquityPaperError",
     "EquityPaperExecutionGateway",
     "ExternalSafetySource",
+    "CREATE_PAPER_TARGETS",
     "SqliteExternalSafety",
+    "create_paper_target_table",
     "NotPaperAccountError",
     "PaperIntegrityError",
     "ParityRecord",

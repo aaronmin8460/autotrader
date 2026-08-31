@@ -1042,3 +1042,75 @@ def test_an_over_fill_is_sold_back_down_and_never_shorted(
     spy = next(item for item in report.outcomes if item.symbol == "SPY")
     assert spy.target_quantity is not None
     assert spy.actual_quantity - spy.delta_quantity == spy.target_quantity
+
+
+# ==========================================================================
+# The durable target record: what was wanted, and why
+# ==========================================================================
+
+
+def test_every_submitted_target_leaves_a_durable_record_of_why(
+    connection: sqlite3.Connection,
+) -> None:
+    """CRITICAL. `order_intents` says what was sent. This says what was wanted.
+
+    After the fact those are different questions: "the broker was asked for 3
+    shares of SPY" does not say which engine wanted it, under which sizing
+    policy, against which target weight, or what the account already held.
+    """
+    gateway = RecordingGateway()
+    runtime = build_paper(connection, gateway=gateway, stage="A")
+    runtime.run_once()
+
+    connection.row_factory = sqlite3.Row
+    rows = connection.execute("SELECT * FROM equity_paper_targets").fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["engine"] == "eda1"
+    assert row["environment"] == "PAPER"
+    assert row["sizing_policy"] == POLICY.policy_id
+    assert row["sizing_config_hash"] == POLICY.config_hash()
+    assert row["rollout_stage"] == "A"
+    assert row["symbol"] == "SPY"
+    assert row["side"] == "BUY"
+    assert Decimal(row["target_weight"]) > 0
+    assert Decimal(row["broker_quantity"]) == Decimal(0)
+    assert Decimal(row["requested_delta"]) == Decimal(row["target_quantity"])
+    assert row["bar_timestamp"]
+    assert row["decided_at"]
+    # Back-filled after the attempt returned, not guessed before it.
+    assert row["risk_reason_code"] == "APPROVED"
+    assert Decimal(row["approved_quantity"]) == Decimal(row["requested_delta"])
+
+
+def test_the_target_record_shares_the_key_with_the_order_intent(
+    connection: sqlite3.Connection,
+) -> None:
+    """One durable key for both rows, without either knowing about the other."""
+    runtime = build_paper(connection, gateway=RecordingGateway(), stage="A")
+    report = runtime.run_once()
+    spy = next(item for item in report.outcomes if item.symbol == "SPY")
+
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT client_order_id FROM equity_paper_targets WHERE symbol = 'SPY'"
+    ).fetchone()
+    assert row["client_order_id"] == spy.client_order_id
+
+
+def test_a_cycle_that_submits_nothing_writes_no_target_record(
+    connection: sqlite3.Connection,
+) -> None:
+    """The record describes attempts, not opinions. A satisfied target is silent."""
+    broker = FakeBrokerState()
+    gateway = RecordingGateway()
+    runtime = build_paper(connection, gateway=gateway, broker=broker, stage="A")
+    runtime.start()
+    runtime.run_cycle()
+    symbol, _, quantity = gateway.calls[0]
+    broker.hold(symbol, quantity, PRICES[symbol])
+    before = connection.execute("SELECT COUNT(*) FROM equity_paper_targets").fetchone()[0]
+    runtime.run_cycle()
+    runtime.stop()
+    after = connection.execute("SELECT COUNT(*) FROM equity_paper_targets").fetchone()[0]
+    assert after == before
