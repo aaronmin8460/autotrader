@@ -26,7 +26,6 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 RAW_DIR = Path("/Volumes/AUTOTRADER_QA/datasets/crypto-new-alpha/raw")
@@ -100,9 +99,7 @@ def normalize_flow(symbol: str) -> tuple[pd.DataFrame, dict]:
     misaligned = int((out["bar_close"] != out["bar_open"] + BAR - pd.Timedelta("1ms")).sum())
     if misaligned:
         raise ValueError(f"{symbol}: {misaligned} klines are not 15m-grid aligned")
-    off_grid = int(
-        ((out["bar_open"].dt.minute % 15 != 0) | (out["bar_open"].dt.second != 0)).sum()
-    )
+    off_grid = int(((out["bar_open"].dt.minute % 15 != 0) | (out["bar_open"].dt.second != 0)).sum())
     if off_grid:
         raise ValueError(f"{symbol}: {off_grid} klines off the 15m UTC grid")
 

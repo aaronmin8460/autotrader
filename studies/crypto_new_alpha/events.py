@@ -40,11 +40,7 @@ def _trailing_quantile(series: pd.Series, quantile: float) -> pd.Series:
     Shifted by one bar so the threshold at row i is computed from rows
     strictly before i - the event definition can never read its own value.
     """
-    return (
-        series.rolling(THRESHOLD_BARS, min_periods=THRESHOLD_MIN)
-        .quantile(quantile)
-        .shift(1)
-    )
+    return series.rolling(THRESHOLD_BARS, min_periods=THRESHOLD_MIN).quantile(quantile).shift(1)
 
 
 def build_event_masks(frame: pd.DataFrame) -> dict[str, pd.Series]:
@@ -115,9 +111,7 @@ def study_one(frame: pd.DataFrame, mask: pd.Series, horizon: int) -> dict:
 
     positions = rows["grid_position"].to_numpy(dtype="int64")
     # grid_position restarts per era; offset the modern era so ordering holds.
-    era_offset = np.where(
-        rows["timestamp"].dt.year.to_numpy() >= 2024, 10_000_000, 0
-    )
+    era_offset = np.where(rows["timestamp"].dt.year.to_numpy() >= 2024, 10_000_000, 0)
     order = np.argsort(positions + era_offset, kind="stable")
     kept = deoverlap((positions + era_offset)[order], horizon)
     kept_mask = np.isin(positions + era_offset, kept)

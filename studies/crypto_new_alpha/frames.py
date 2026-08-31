@@ -93,10 +93,7 @@ def _regime_columns(observations: pd.DataFrame) -> pd.DataFrame:
     crash_return = _endpoint_return(close, CRASH_WINDOW_BARS)
     crash = crash_return < CRASH_THRESHOLD
     crash_recent = (
-        crash.astype("float64")
-        .rolling(RECOVERY_WINDOW_BARS, min_periods=1)
-        .max()
-        .astype(bool)
+        crash.astype("float64").rolling(RECOVERY_WINDOW_BARS, min_periods=1).max().astype(bool)
     )
 
     regime = pd.Series("sideways", index=observations.index, dtype="object")

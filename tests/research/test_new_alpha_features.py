@@ -106,9 +106,9 @@ class TestOiAlignment:
     def test_oi_gap_beyond_tolerance_withdraws_the_feature(self):
         oi = _oi_frame(periods=9000)
         hole_start = pd.Timestamp("2024-01-05 00:00", tz="UTC")
-        oi = oi.loc[
-            ~((oi["create_time"] >= hole_start) & (oi["create_time"] < hole_start + pd.Timedelta("13h")))
-        ].reset_index(drop=True)
+        hole_end = hole_start + pd.Timedelta("13h")
+        in_hole = (oi["create_time"] >= hole_start) & (oi["create_time"] < hole_end)
+        oi = oi.loc[~in_hole].reset_index(drop=True)
         flow = _flow_frame(periods=3000)
         timestamps = _grid_timestamps("2024-01-05 06:00", periods=8)
         frame, audit = _join(timestamps, oi, flow)

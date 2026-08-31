@@ -70,8 +70,10 @@ def probe(symbol: str, stream: str, cut: pd.Timestamp) -> dict:
     clean_before = clean.loc[before].reset_index(drop=True)
     poisoned_before = poisoned.loc[before].reset_index(drop=True)
     identical = clean_before.equals(poisoned_before)
-    changed_after = not clean.loc[after].reset_index(drop=True).equals(
-        poisoned.loc[after].reset_index(drop=True)
+    changed_after = (
+        not clean.loc[after]
+        .reset_index(drop=True)
+        .equals(poisoned.loc[after].reset_index(drop=True))
     )
     return {
         "symbol": symbol,

@@ -33,8 +33,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from autotrader.ml.v4 import fit_isotonic, fit_logistic, fit_standardizer
 from autotrader.ml.v4 import fit_gradient_boosted as fit_gbt
+from autotrader.ml.v4 import fit_isotonic, fit_logistic, fit_standardizer
 from studies.crypto_new_alpha.frames import (
     BARS_PER_DAY,
     BASELINE_FEATURES,
@@ -115,9 +115,7 @@ def score_logistic(estimator, standardized: np.ndarray) -> np.ndarray:
 
 
 def score_gbt(estimator, standardized: np.ndarray) -> np.ndarray:
-    return sigmoid(
-        np.asarray([estimator.raw_score(row) for row in standardized], dtype="float64")
-    )
+    return sigmoid(np.asarray([estimator.raw_score(row) for row in standardized], dtype="float64"))
 
 
 def log_loss_of(probabilities: np.ndarray, actual: np.ndarray) -> float:
@@ -136,7 +134,9 @@ def roc_auc_of(probabilities: np.ndarray, actual: np.ndarray) -> float | None:
     return float((positive_ranks - positives * (positives + 1) / 2) / (positives * negatives))
 
 
-def calibration_error(probabilities: np.ndarray, actual: np.ndarray, bins: int = 10) -> float | None:
+def calibration_error(
+    probabilities: np.ndarray, actual: np.ndarray, bins: int = 10
+) -> float | None:
     if len(probabilities) < bins:
         return None
     edges = np.linspace(0.0, 1.0, bins + 1)
@@ -267,9 +267,7 @@ def run_cell(arm: str, symbol: str, window: str, horizon: int) -> dict:
         high = float(np.quantile(calibrated_cal, QUINTILE_HIGH))
         record["families"][family] = {
             "predictive": prediction_metrics(calibrated_test, y_test, fwd_test),
-            "log_loss_vs_null": (
-                log_loss_of(calibrated_test, y_test) - record["null"]["log_loss"]
-            ),
+            "log_loss_vs_null": (log_loss_of(calibrated_test, y_test) - record["null"]["log_loss"]),
             "quintile_thresholds": {"low": low, "high": high},
             "economic": economic_read(calibrated_test, fwd_test, day_mask, low, high),
         }
@@ -361,7 +359,10 @@ def main() -> None:
                 f"elapsed={elapsed / 60:.1f}m eta={eta / 60:.1f}m "
                 f"cell_s={outcome['seconds']}"
             )
-    emit(f"PHASE=pilot tag={args.tag} COMPLETE units={total} elapsed={(time.time() - started) / 60:.1f}m")
+    emit(
+        f"PHASE=pilot tag={args.tag} COMPLETE units={total} "
+        f"elapsed={(time.time() - started) / 60:.1f}m"
+    )
 
 
 if __name__ == "__main__":
