@@ -77,13 +77,24 @@ def stitched_frame(datasets: Path, symbol: str) -> pd.DataFrame:
 
 
 def w00_window(frames: dict[str, pd.DataFrame]) -> ScoringWindow:
-    """First scored session = the latest session at which every symbol has the
-    full warm-up behind it on its stitched frame."""
+    """First scored session = the latest, across symbols, of the first session
+    whose FIRST bar already has the full warm-up behind it. A session whose
+    early bars sit inside the warm-up would be rejected by `score_window`."""
     starts = []
     for symbol, frame in frames.items():
         if len(frame) <= LOOKBACK_BARS:
             raise RuntimeError(f"{symbol}: stitched frame shorter than the warm-up.")
-        starts.append(market_date(frame["timestamp"].iloc[LOOKBACK_BARS - 1].to_pydatetime()))
+        first_position: dict[object, int] = {}
+        for position, ts in enumerate(frame["timestamp"]):
+            day = market_date(ts.to_pydatetime())
+            if day not in first_position:
+                first_position[day] = position
+        eligible = [
+            day for day, position in first_position.items() if position >= LOOKBACK_BARS - 1
+        ]
+        if not eligible:
+            raise RuntimeError(f"{symbol}: no session clears the warm-up on the stitched frame.")
+        starts.append(min(eligible))
     return ScoringWindow(
         name="w00",
         start=max(starts),
