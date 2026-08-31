@@ -37,13 +37,16 @@ neither read from nor writable by the allocator. The change from the previous
 design is only that Risk is now asked for something it will grant, instead of
 being asked for a billion shares and used as the sizing rule.
 
-**Paper, and provably so.** The repository holds exactly one `TradingClient`
-construction and it hardcodes ``paper=True``; there is no live factory to
-reject. This runtime adds two independent confirmations anyway, because a
-process that submits orders should not infer its environment from the absence
-of an alternative: the client must prove it reaches the paper host, and the
-account number must carry the paper namespace prefix. Either failing stops the
-runtime before a single bar is fetched.
+**Paper, and provably so.** The repository builds exactly one broker client,
+in `execution.paper`, and that one line hardcodes the paper environment; there
+is no live factory to reject. (The type's name is deliberately not written
+here: a source guard pins the broker vocabulary to the execution boundary, and
+naming it in prose would weaken a check that is meant to be mechanical.) This
+runtime adds two independent confirmations anyway, because a process that
+submits orders should not infer its environment from the absence of an
+alternative: the client must prove it reaches the paper host, and the account
+number must carry the paper namespace prefix. Either failing stops the runtime
+before a single bar is fetched.
 
 **Staged by universe.** The decision universe is always all ten symbols - the
 EDA-1 series must stay complete or the overlay replay breaks - but the
