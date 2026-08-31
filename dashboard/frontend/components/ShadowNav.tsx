@@ -1,11 +1,12 @@
 /**
- * The two-page navigation, and the one distinction it has to carry.
+ * The three-page navigation, and the distinction it has to carry.
  *
- * This dashboard now shows two things that must never be confused: an account
- * that can trade, and two engines that cannot. The nav is the first place a
- * reader learns which one they are on, so each tab states its own nature -
- * "Paper" against the operational page, "Shadow · zero orders" against this
- * one - rather than leaving the difference to the page body.
+ * This dashboard shows three records that must never be confused: a crypto
+ * book that trades, an equity book that trades, and two engines that cannot.
+ * Two of the three are real and the middle one is hypothetical. The nav is the
+ * first place a reader learns which one they are on, so each tab states its
+ * own nature in its detail line rather than leaving the difference to the page
+ * body.
  *
  * `next/link` rather than a bare anchor, which is what the framework's own
  * lint rule requires for an in-app route - and it keeps the two pages from
@@ -50,7 +51,7 @@ export function ShadowNav({
   connected,
   lastSuccessAt,
 }: {
-  current: "operations" | "shadow";
+  current: "operations" | "shadow" | "paper";
   connected: boolean;
   lastSuccessAt: string | null;
 }) {
@@ -74,12 +75,24 @@ export function ShadowNav({
             detail="Observation · zero orders"
             active={current === "shadow"}
           />
+          <Tab
+            href="/equity-paper"
+            label="Equity Paper"
+            detail="EDA-1 · paper orders"
+            active={current === "paper"}
+          />
         </nav>
 
         <div className="ml-auto flex items-center gap-3">
           {current === "shadow" ? (
             <Tag title="This page shows recorded decisions. No order can be submitted, cancelled, or replaced by the process behind it.">
               Zero order mutation
+            </Tag>
+          ) : null}
+
+          {current === "paper" ? (
+            <Tag title="Orders on this page were really submitted, to a paper brokerage account. No real money is involved and this system has no live path.">
+              Alpaca paper · no real money
             </Tag>
           ) : null}
 
