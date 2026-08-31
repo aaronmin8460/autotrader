@@ -131,11 +131,18 @@
 		-Server
 	}
 
-	# Account state must not be written to the viewing device's disk cache.
-	# Scoped to the API rather than applied site-wide, because the same rule
+	# Operator data must not be written to the viewing device's disk cache.
+	# Scoped to the APIs rather than applied site-wide, because the same rule
 	# over /_next/static would re-download an immutable bundle on every page
 	# load to protect content that is a JavaScript file.
-	@account path /api/dashboard/*
+	#
+	# Both API prefixes, not just the first. /api/dashboard/* is account
+	# state; /api/equity-shadow/* is the observation record, which holds no
+	# account figure but is still this operator's data behind this
+	# operator's password, and a shared machine's disk cache is no place for
+	# it. A new API path that quietly fell outside this rule would be a
+	# regression introduced by adding a page.
+	@account path /api/dashboard/* /api/equity-shadow/*
 	header @account Cache-Control "no-store"
 
 	log {
