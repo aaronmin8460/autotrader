@@ -25,7 +25,11 @@ from pathlib import Path
 import pandas as pd
 
 from studies.equity_10_full import CALENDAR_END, CALENDAR_START, DATA_END, DATA_START
-from studies.equity_10_full.split_audit import audit_overnight_steps
+from studies.equity_10_full.split_audit import (
+    LARGE_STEP_THRESHOLD,
+    SPLIT_SIGNATURE_TOLERANCE,
+    audit_symbol,
+)
 from studies.equity_deep_arch.evaluate import write_json
 from studies.equity_eda1_nextgen import NEXTGEN_DATASETS, REPORT_ROOT
 from studies.equity_eda1_nextgen.universe import (
@@ -225,12 +229,15 @@ def run_manifest(datasets: Path) -> None:
                 "reasons": ["no session frame (download failed or symbol unavailable)"],
             }
             continue
-        sessions = len({market_date(ts.to_pydatetime()) for ts in frame["timestamp"]})
+        from datetime import date as date_type
+
+        days = sorted({market_date(ts.to_pydatetime()) for ts in frame["timestamp"]})
+        sessions = len(days)
         first_bar = str(frame["timestamp"].iloc[0])
         missing_fraction = max(0.0, 1.0 - len(frame) / expected_bars)
-        if sessions < expected_sessions:
+        if days[0] > date_type(2021, 1, 5) or days[-1] < date_type(2026, 8, 27):
             reasons.append(
-                f"covers {sessions}/{expected_sessions} sessions (listing/coverage gap)"
+                f"listing/coverage gap: sessions span {days[0]}..{days[-1]}"
             )
         if missing_fraction >= MAX_MISSING_FRACTION:
             reasons.append(f"missing-bar fraction {missing_fraction:.4f} >= 0.01")
@@ -244,9 +251,16 @@ def run_manifest(datasets: Path) -> None:
             "reasons": reasons,
         }
 
-    split_audit = audit_overnight_steps(
-        datasets, [s for s in DOWNLOAD_SYMBOLS if _session_frame(datasets, s) is not None]
-    )
+    audited = []
+    for symbol in DOWNLOAD_SYMBOLS:
+        stored = _session_frame(datasets, symbol)
+        if stored is not None:
+            audited.append(audit_symbol(stored, symbol))
+    split_audit = {
+        "large_step_threshold": LARGE_STEP_THRESHOLD,
+        "split_signature_tolerance": SPLIT_SIGNATURE_TOLERANCE,
+        "symbols": audited,
+    }
 
     manifests = build_manifests(
         {
