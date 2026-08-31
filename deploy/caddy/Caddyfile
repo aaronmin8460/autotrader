@@ -136,13 +136,16 @@
 	# over /_next/static would re-download an immutable bundle on every page
 	# load to protect content that is a JavaScript file.
 	#
-	# Both API prefixes, not just the first. /api/dashboard/* is account
-	# state; /api/equity-shadow/* is the observation record, which holds no
-	# account figure but is still this operator's data behind this
-	# operator's password, and a shared machine's disk cache is no place for
-	# it. A new API path that quietly fell outside this rule would be a
-	# regression introduced by adding a page.
-	@account path /api/dashboard/* /api/equity-shadow/*
+	# All three API prefixes, not just the first. /api/dashboard/* is the
+	# crypto book's account state; /api/equity-paper/* is the equity book's,
+	# on the same account; /api/equity-shadow/* is the observation record,
+	# which holds no account figure but is still this operator's data behind
+	# this operator's password, and a shared machine's disk cache is no place
+	# for it. A new API path that quietly fell outside this rule would be a
+	# regression introduced by adding a page - which is why the list is
+	# explicit rather than a /api/* wildcard that would silently absorb a
+	# future route nobody reviewed.
+	@account path /api/dashboard/* /api/equity-shadow/* /api/equity-paper/*
 	header @account Cache-Control "no-store"
 
 	log {
