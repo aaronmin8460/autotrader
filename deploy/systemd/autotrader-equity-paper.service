@@ -1,0 +1,129 @@
+# AutoTrader Equity EDA-1 - ALPACA PAPER ONLY.
+#
+# Install to /usr/lib/systemd/system/autotrader-equity-paper.service.
+#
+# This unit runs the research champion EDA-1 against the paper broker: V3
+# evaluated by the shadow's own panel, EDA-1 derived by the shadow's own
+# overlay, a frozen shared-account allocator, the Risk Engine, a
+# desired-versus-broker-actual delta, a durable order intent, and the validated
+# equity execution boundary. NO REAL MONEY IS AT RISK: the repository contains
+# exactly one TradingClient construction and it hardcodes paper=True, and this
+# runtime additionally proves the host and the account namespace before it
+# fetches a single bar.
+#
+# THIS IS NOT autotrader-equity.service. That unit is masked (symlinked to
+# /dev/null) and stays masked. It runs V3 with the "ask for a billion shares and
+# let Risk clamp" sizing that funded six of ten symbols by their index in a
+# Python tuple. Nothing here unmasks it.
+#
+# ITS OWN STORE, AND WHY THAT IS NOT A CONVENIENCE. The crypto operational
+# database is schema 6 and this lineage is schema 7. Every command in this
+# package calls initialize_database() first, which migrates upward - so a v7
+# process opening the crypto store would take it to schema 7 and the running
+# crypto service would refuse to open its own file on its next 15-minute cycle.
+# The separation is therefore enforced three ways: a different StateDirectory,
+# a different unix user that cannot write the crypto directory at all, and
+# ProtectSystem=strict which makes every path outside StateDirectory read-only
+# to this process.
+#
+# WHAT IT MAY READ ACROSS. Two stores, read-only, for two reasons that do not
+# survive being separated:
+#   * the shadow store, so every bar's EDA-1 answer can be compared against the
+#     independently computed shadow row before anything is submitted;
+#   * the crypto store's account safety row, so an ambiguous crypto order still
+#     stops this runtime - one paper account carries both books.
+# Both are opened with read-only URIs and single SELECTs, never through the
+# normal open path, so neither can be migrated by this process. ProtectSystem
+# makes that kernel-enforced rather than merely intended.
+
+[Unit]
+Description=AutoTrader Equity EDA-1 - ALPACA PAPER ONLY
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+ConditionPathExists=/etc/autotrader/autotrader-equity-paper.env
+ConditionPathExists=/opt/autotrader-equity-paper/venv/bin/autotrader
+
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ateqpaper
+Group=ateqpaper
+# Read the shadow store (parity) and the crypto store (account safety). Both
+# read-only; ProtectSystem=strict is what makes "read" the only option.
+SupplementaryGroups=atshadow autotrader
+WorkingDirectory=/opt/autotrader-equity-paper/app
+
+# Order matters; later files win.
+#
+#   autotrader-equity-paper.env          paths, ports, and the SAFE DEFAULTS
+#   autotrader-equity-paper.secrets.env  paper credentials (0640 root:ateqpaper)
+#   autotrader-equity-paper.trading.env  the ACTIVATION file
+#
+# The activation file is absent on a freshly deployed host and its absence
+# leaves the safe defaults standing rather than failing the unit. The gate fails
+# closed at the deployment layer for the same reason it fails closed in code.
+EnvironmentFile=/etc/autotrader/autotrader-equity-paper.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-paper.secrets.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-paper.trading.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Single-`$` on the args so systemd splits them into separate arguments, which
+# is what turns `--confirm-paper-runtime PAPER` into the two the CLI expects.
+# The paths are braced: a path is one argument even with a space in it.
+ExecStart=/opt/autotrader-equity-paper/venv/bin/autotrader equity-paper \
+  --db ${AUTOTRADER_EQUITY_PAPER_DB} \
+  --shadow-db ${AUTOTRADER_EQUITY_SHADOW_DB} \
+  --crypto-db ${AUTOTRADER_CRYPTO_DB} \
+  --sizing-policy ${AUTOTRADER_EQUITY_PAPER_SIZING_POLICY} \
+  --stage ${AUTOTRADER_EQUITY_PAPER_STAGE} \
+  $AUTOTRADER_EQUITY_PAPER_ARGS
+
+# Exit codes are not interchangeable:
+#
+#   0  clean stop, including a clean SIGTERM.
+#   1  controlled refusal or a fatal cycle failure. Some are transient - a
+#      provider outage mid-session - so a bounded retry is worth having.
+#   2  an order intent in this store has no settled broker outcome. An order
+#      may exist at the broker under that key, so restarting could place a
+#      duplicate. It stays down until someone reconciles this store.
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+
+StateDirectory=autotrader-equity-paper
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity-paper
+
+[Install]
+WantedBy=multi-user.target

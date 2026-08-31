@@ -69,9 +69,26 @@ from autotrader.data.validation import (
     validate_parquet_file,
 )
 from autotrader.equity import EQUITY_SYMBOLS, EQUITY_TIMEFRAME, EquityError
+from autotrader.equity.allocation import (
+    POLICY_IDS,
+    AllocationError,
+    AllocationPolicy,
+)
 from autotrader.equity.data import FEED as EQUITY_FEED
 from autotrader.equity.data import download_bars as download_equity_bars
 from autotrader.equity.market_data import AlpacaEquityBars
+from autotrader.equity.paper import (
+    EQUITY_PAPER_LOCK_SCOPE,
+    PAPER_DECISION_ORDER,
+    AlpacaEquityPaperGateway,
+    EquityPaperConfig,
+    EquityPaperError,
+    EquityPaperRuntime,
+    PaperIntegrityError,
+    SqliteExternalSafety,
+    SqliteShadowParity,
+    require_paper_account,
+)
 from autotrader.equity.runtime import (
     EQUITY_LOCK_SCOPE,
     EquityRuntime,
@@ -101,6 +118,11 @@ from autotrader.execution.paper import (
     AmbiguousSubmissionError,
     ExecutionOutcome,
     PaperExecutionResult,
+    create_paper_trading_client,
+    fetch_paper_account_state,
+    fetch_paper_positions,
+    require_confirmation,
+    require_paper_trading_enabled,
 )
 from autotrader.ml.cli import app as ml_app
 from autotrader.reconciliation import (
@@ -204,6 +226,23 @@ EQUITY_SHADOW_REFUSED_EXIT_CODE = 1
 #: two must not share a file: they would share the per-symbol bar claims, and
 #: the shadow refuses any database that has ever held an order intent.
 EQUITY_SHADOW_DATABASE_PATH = Path("data/autotrader-shadow.db")
+
+#: The equity paper runtime's own operational store. Deliberately not the
+#: crypto store: the two lineages declare different schema versions, and a
+#: command from this lineage pointed at the crypto database would migrate it
+#: upward and leave the running crypto service unable to open its own file.
+EQUITY_PAPER_DATABASE_PATH = Path("data/autotrader-equity-paper.db")
+
+#: The shadow database the paper runtime compares its decisions against. Opened
+#: read-only and never migrated.
+EQUITY_PAPER_SHADOW_DATABASE_PATH = Path("data/autotrader-shadow.db")
+
+#: A controlled refusal, a fatal cycle failure, or a durable-invariant stop.
+EQUITY_PAPER_REFUSED_EXIT_CODE = 1
+
+#: An order intent in this store has no settled broker outcome. Restarting
+#: would risk a duplicate, so the unit must stay down until reconciliation.
+EQUITY_PAPER_UNRESOLVED_EXIT_CODE = 2
 
 #: Width of the label column in the backtest report.
 _LABEL_WIDTH = 23
@@ -1685,6 +1724,310 @@ def equity_shadow(
         typer.echo("")
         typer.secho("SHADOW STOPPED ON A FATAL ERROR", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE)
+
+
+def _echo_equity_paper_banner(
+    runtime: EquityPaperRuntime,
+    *,
+    once: bool,
+    lock: Path,
+    database: Path,
+    shadow_database: Path,
+    crypto_database: Path,
+    account_number: str,
+) -> None:
+    policy = runtime.policy
+    typer.echo("AUTO TRADER - EQUITY EDA-1 PAPER RUNTIME")
+    typer.echo("")
+    typer.echo(_field("Environment", "ALPACA PAPER ONLY - NO REAL MONEY"))
+    typer.echo(_field("Account", account_number))
+    typer.echo(_field("Decision Universe", ", ".join(PAPER_DECISION_ORDER)))
+    typer.echo(_field("Rollout Stage", runtime._config.stage))
+    typer.echo(_field("Execution Universe", ", ".join(runtime.execution_universe)))
+    typer.echo(_field("Sizing Policy", policy.policy_id))
+    typer.echo(_field("Policy Hash", policy.config_hash()[:16]))
+    typer.echo(_field("Per-Symbol Cap", f"{policy.per_symbol_cap:%}"))
+    typer.echo(_field("Total Account Cap", f"{policy.total_cap:%}"))
+    typer.echo(_field("Session", "US regular hours, broker calendar"))
+    typer.echo(_field("Mode", "single cycle" if once else "daemon"))
+    typer.echo(_field("Database", str(database)))
+    typer.echo(_field("Shadow (read-only)", str(shadow_database)))
+    typer.echo(_field("Crypto Safety (read-only)", str(crypto_database)))
+    typer.echo(_field("Lock", str(lock)))
+    typer.echo("")
+    typer.secho("PAPER EXECUTION ENABLED", bold=True)
+    typer.secho(
+        "Targets that differ from broker truth by a whole share may be submitted",
+        bold=True,
+    )
+    typer.secho("to the PAPER account. There is no live path.", bold=True)
+    typer.echo("")
+
+
+def _echo_equity_paper_summary(runtime: EquityPaperRuntime) -> None:
+    beat = runtime.heartbeat
+    typer.echo("")
+    typer.echo("EQUITY PAPER SUMMARY")
+    typer.echo(_field("State", beat.state.value))
+    typer.echo(_field("Cycles Started", str(beat.cycles_started)))
+    typer.echo(_field("Cycles Completed", str(beat.cycles_completed)))
+    typer.echo(_field("Orders Submitted", str(beat.orders_submitted)))
+    typer.echo(_field("Shadow/Paper Mismatches", str(runtime.parity_mismatches)))
+
+
+@app.command(name="equity-paper")
+def equity_paper(
+    once: bool = typer.Option(
+        False,
+        "--once",
+        help="Process the current cycle once and exit, without waiting.",
+    ),
+    confirm_paper_runtime: str = typer.Option(
+        "",
+        "--confirm-paper-runtime",
+        help=(
+            "Required confirmation token. The literal word PAPER, and nothing else. "
+            "There is no live option to confirm."
+        ),
+    ),
+    stage: str = typer.Option(
+        "A",
+        "--stage",
+        help=(
+            "Rollout stage, which selects the execution universe: "
+            "A = SPY; B = SPY, QQQ, IWM; C = all ten. The decision universe is "
+            "always all ten."
+        ),
+    ),
+    sizing_policy: str = typer.Option(
+        "",
+        "--sizing-policy",
+        help=(
+            "The frozen shared-account allocation policy. One of: "
+            + ", ".join(POLICY_IDS)
+            + ". Required: there is no default sizing policy."
+        ),
+    ),
+    safety_delay: float = typer.Option(
+        DEFAULT_SAFETY_DELAY.total_seconds(),
+        "--safety-delay",
+        help="Seconds to wait after a 15-minute boundary before a closed bar is fetchable.",
+    ),
+    lookback_bars: int = typer.Option(
+        DEFAULT_SHADOW_LOOKBACK_BARS,
+        "--lookback-bars",
+        help=(
+            f"Completed base bars fetched per cycle, between {MIN_SHADOW_LOOKBACK_BARS} "
+            f"and {MAX_SHADOW_LOOKBACK_BARS}."
+        ),
+    ),
+    state_sessions: int = typer.Option(
+        DEFAULT_STATE_SESSIONS,
+        "--state-sessions",
+        help=(
+            f"Completed sessions behind the EDA-1 regime state, between "
+            f"{MIN_STATE_SESSIONS} and {MAX_STATE_SESSIONS}."
+        ),
+    ),
+    allow_missing_shadow: bool = typer.Option(
+        False,
+        "--allow-missing-shadow",
+        help=(
+            "Treat a bar the shadow has not recorded as comparable rather than as a "
+            "mismatch. Weakens the parity gate; intended for a host where the shadow "
+            "is deliberately not running."
+        ),
+    ),
+    database: Annotated[
+        Path,
+        typer.Option(
+            "--db",
+            help=(
+                "The equity paper runtime's own operational store. Never the crypto "
+                "store: this lineage would migrate it and break the crypto service."
+            ),
+        ),
+    ] = EQUITY_PAPER_DATABASE_PATH,
+    shadow_database: Annotated[
+        Path,
+        typer.Option(
+            "--shadow-db",
+            help="The shadow store, opened read-only for the decision parity check.",
+        ),
+    ] = EQUITY_PAPER_SHADOW_DATABASE_PATH,
+    crypto_database: Annotated[
+        Path,
+        typer.Option(
+            "--crypto-db",
+            help=(
+                "The crypto operational store, opened READ-ONLY to read its account "
+                "safety row. One account carries both books, so an ambiguous crypto "
+                "order must stop this runtime too. Never migrated: opened with a "
+                "read-only URI and a single SELECT, never through this package's "
+                "normal open path."
+            ),
+        ),
+    ] = DEFAULT_DATABASE_PATH,
+) -> None:
+    """Run EDA-1 against the **PAPER** broker on completed regular-session bars.
+
+    The research champion's decision logic is used exactly as validated - V3
+    evaluated by the shadow's own panel, EDA-1 derived by the shadow's own
+    overlay recorder, replay-verified on every bar. What this command adds is
+    the execution path the champion deliberately does not have: a frozen
+    shared-account allocator, the Risk Engine, a desired-versus-broker-actual
+    delta, a durable order intent, and the validated equity execution boundary.
+
+    \b
+    The gates, all of which must be open, none of which has a live counterpart:
+      * AUTOTRADER_PAPER_TRADING_ENABLED=true in the environment
+      * --confirm-paper-runtime PAPER on the command line
+      * --sizing-policy naming a frozen allocation policy
+      * the trading client provably reaching the paper host
+      * the account that answers carrying the paper namespace prefix
+      * the broker's own calendar and clock saying the session is open
+      * no order intent in this store with an unsettled broker outcome
+
+    \b
+    Target semantics, not a signal stream. For each symbol the runtime computes
+    a desired share count and subtracts what the broker says it holds:
+      desired == actual  -> no order, and this is the normal case
+      desired >  actual  -> BUY the difference
+      desired <  actual  -> SELL only the excess
+      desired == 0       -> close the long, and never further
+
+    Every bar's EDA-1 answer is compared against the independently computed
+    shadow row for the same bar. A symbol whose two answers disagree is
+    excluded from mutation for that bar and the disagreement is recorded as
+    SHADOW_PAPER_DECISION_MISMATCH.
+
+    Exits 0 on a clean stop, 1 on a controlled refusal or fatal failure, and 2
+    when an order intent has no settled broker outcome - reconcile this store
+    before starting again.
+    """
+    _configure_runtime_logging(verbose=False)
+
+    try:
+        require_paper_trading_enabled()
+        require_confirmation(confirm_paper_runtime or None)
+    except ExecutionError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_PAPER_REFUSED_EXIT_CODE) from None
+
+    if not sizing_policy:
+        typer.secho(
+            "Refusing to start without --sizing-policy. The shared-account allocation "
+            "policy is a validated, frozen choice and this runtime has no default: a "
+            "default here would be a sizing policy nobody selected. Known policies: "
+            + ", ".join(POLICY_IDS),
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=EQUITY_PAPER_REFUSED_EXIT_CODE)
+
+    code_sha: str | None = None
+    try:
+        from autotrader.smoke.gitinfo import git_state
+
+        code_sha = git_state(Path(".")).sha
+    except Exception:  # noqa: BLE001 - provenance is recorded, never required
+        code_sha = None
+
+    try:
+        config = EquityPaperConfig(
+            policy=AllocationPolicy(policy_id=sizing_policy),
+            stage=stage,
+            safety_delay=timedelta(seconds=safety_delay),
+            lookback_bars=lookback_bars,
+            state_sessions=state_sessions,
+            code_sha=code_sha,
+            require_parity=not allow_missing_shadow,
+        )
+    except (ScheduleError, EquityError, AllocationError) as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_PAPER_REFUSED_EXIT_CODE) from None
+
+    try:
+        initialize_database(database)
+    except StateError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_PAPER_REFUSED_EXIT_CODE) from None
+
+    lock = RuntimeLock(lock_path_for(database, scope=EQUITY_PAPER_LOCK_SCOPE))
+    try:
+        lock.acquire()
+    except RuntimeLockError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_PAPER_REFUSED_EXIT_CODE) from None
+
+    shutdown = ShutdownRequest()
+    shutdown.install()
+    exit_code = 0
+    try:
+        with connect(database) as connection:
+            try:
+                trading_client = create_paper_trading_client()
+                account_number = require_paper_account(trading_client)
+            except (ExecutionError, EquityPaperError) as error:
+                typer.secho(str(error), fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=EQUITY_PAPER_REFUSED_EXIT_CODE) from None
+
+            def broker_state() -> tuple[float, dict[str, object]]:
+                """Account equity and every open position, from the broker.
+
+                Read fresh on every cycle rather than cached: the allocator's
+                budget depends on what the crypto book holds right now, and a
+                remembered figure would size an equity order against exposure
+                that has since changed.
+                """
+                account = fetch_paper_account_state(trading_client)
+                return account.equity, dict(fetch_paper_positions(trading_client))
+
+            calendar = AlpacaMarketCalendar()
+            runtime = EquityPaperRuntime(
+                connection,
+                market_data=ShadowEquityBars(calendar),
+                regime_data=RegimeEquityBars(calendar),
+                calendar=calendar,
+                gateway=AlpacaEquityPaperGateway(trading_client=trading_client),
+                parity=SqliteShadowParity(shadow_database),
+                config=config,
+                broker_state=broker_state,
+                external_safety=SqliteExternalSafety(crypto_database),
+                shutdown=shutdown,
+            )
+            try:
+                runtime.start()
+            except PaperIntegrityError as error:
+                typer.secho(str(error), fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=EQUITY_PAPER_UNRESOLVED_EXIT_CODE) from None
+            _echo_equity_paper_banner(
+                runtime,
+                once=once,
+                lock=lock.path,
+                database=database,
+                shadow_database=shadow_database,
+                crypto_database=crypto_database,
+                account_number=account_number,
+            )
+            try:
+                if once:
+                    runtime.run_cycle()
+                else:
+                    runtime.run_forever()
+            finally:
+                runtime.stop()
+            _echo_equity_paper_summary(runtime)
+            if runtime.state is RuntimeState.FAILED:
+                exit_code = EQUITY_PAPER_REFUSED_EXIT_CODE
+    finally:
+        shutdown.restore()
+        lock.release()
+
+    if exit_code:
+        typer.echo("")
+        typer.secho("EQUITY PAPER RUNTIME STOPPED ON A FATAL ERROR", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=exit_code)
 
 
 #: The research command group. Registered here rather than defined here: study

@@ -1,0 +1,36 @@
+# Hourly reconciliation of the equity paper operational store.
+#
+# Install to /usr/lib/systemd/system/autotrader-equity-paper-reconcile.timer:
+#   systemctl enable --now autotrader-equity-paper-reconcile.timer
+#
+# CADENCE. Hourly, matching the crypto store's. What goes stale without it is
+# the audit trail and the freshness of the evidence behind Account Safety;
+# exposure caps are enforced against positions read from the broker on every
+# submission, so a stale local snapshot never sizes an order.
+#
+# PHASE. At :22:30 with at most a minute of jitter. Two reasons for that number
+# rather than the crypto store's :07:30. The runtimes wake at :00/:15/:30/:45
+# plus five seconds and may submit within the following second, and
+# reconciliation must not run while a submission is in flight - so a pass has to
+# sit near the middle of a quarter-hour, more than six minutes from a boundary
+# in both directions. And the two reconcile passes should not run together: they
+# read the same broker account through the same provider allowance, and
+# separating them by a quarter of an hour keeps either one's provider calls out
+# of the other's window.
+#
+# NO OVERLAP. systemd will not start a second instance of a oneshot service
+# while one is running; a trigger arriving during a slow pass is dropped and
+# logged rather than queued.
+
+[Unit]
+Description=Hourly AutoTrader reconciliation (equity paper store)
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+
+[Timer]
+OnCalendar=*-*-* *:22:30
+RandomizedDelaySec=60
+Persistent=true
+Unit=autotrader-equity-paper-reconcile.service
+
+[Install]
+WantedBy=timers.target

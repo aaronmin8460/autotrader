@@ -1,0 +1,70 @@
+# AutoTrader reconciliation - EQUITY PAPER operational store, PAPER only.
+#
+# Install to /usr/lib/systemd/system/autotrader-equity-paper-reconcile.service,
+# alongside autotrader-equity-paper-reconcile.timer.
+#
+# The crypto store has its own reconcile unit against its own venv, and the two
+# must not be swapped. Each operational database is opened only by a runtime
+# whose declared SCHEMA_VERSION matches it: the crypto store is schema 6 and is
+# reconciled by /opt/autotrader/venv; this store is schema 7 and is reconciled
+# by /opt/autotrader-equity-paper/venv. Pointing the v6 reconciler at this store
+# would refuse to open it, and pointing this one at the crypto store would
+# migrate it and break the running crypto service.
+#
+# Reconciliation cannot submit, cancel or replace an order - the module imports
+# no submission function, no order-request type and no client factory that
+# builds a request, and a source-level test asserts each is absent from its
+# executable code. A recurring pass therefore cannot place a duplicate order
+# however often it runs.
+
+[Unit]
+Description=AutoTrader reconciliation - equity paper store (Alpaca PAPER)
+Documentation=file:/opt/autotrader/app/docs/DEPLOYMENT.md
+ConditionPathExists=/etc/autotrader/autotrader-equity-paper.env
+ConditionPathExists=/opt/autotrader-equity-paper/venv/bin/autotrader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ateqpaper
+Group=ateqpaper
+WorkingDirectory=/opt/autotrader-equity-paper/app
+
+EnvironmentFile=/etc/autotrader/autotrader-equity-paper.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-paper.secrets.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+ExecStart=/opt/autotrader-equity-paper/venv/bin/autotrader reconcile --db ${AUTOTRADER_EQUITY_PAPER_DB}
+
+# Fail visibly: exit 1 when the pass could not establish broker truth, exit 2
+# when something is UNRESOLVED and a human must settle it. Both leave the unit
+# `failed`. Nothing retries; the next scheduled run is the retry.
+TimeoutStartSec=300
+
+StateDirectory=autotrader-equity-paper
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity-paper-reconcile
