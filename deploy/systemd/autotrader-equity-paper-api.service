@@ -1,0 +1,81 @@
+# AutoTrader EQUITY PAPER dashboard API - read-only, 127.0.0.1:8002.
+#
+# Install to /usr/lib/systemd/system/autotrader-equity-paper-api.service.
+#
+# A third API process rather than more routes on either existing one, and the
+# reason is identity rather than code. autotrader-dashboard-api reads the
+# crypto operational store as `autotrader`. autotrader-equity-shadow-api reads
+# the shadow record as `atshadow`, a user that cannot open the crypto store at
+# all. This one reads the equity paper store as `ateqpaper`.
+#
+# Serving all three records from one process would give whichever identity it
+# ran as the union of their reach - and one of those three stores is schema 6
+# while the process that would serve it is schema 7. The split is what makes
+# the separation kernel-enforced rather than conventional.
+#
+# It is a READER of a record written by a process that can trade. That makes
+# the GET-only property load-bearing here in a way it is not on the shadow API:
+# the absence of a write route is the only thing between a dashboard viewer and
+# a broker order. `ALLOWED_METHODS` is asserted against the assembled route
+# table in the test suite.
+#
+# This unit reads NO activation file and NO credentials. It opens SQLite files
+# and serves them; it never contacts the broker, so it is given nothing to lose.
+
+[Unit]
+Description=AutoTrader Equity Paper API (read-only, 127.0.0.1)
+Documentation=file:/opt/autotrader-equity-paper/app/docs/DEPLOYMENT.md
+After=network.target
+
+ConditionPathExists=/etc/autotrader/autotrader-equity-paper.env
+ConditionPathExists=/opt/autotrader-equity-paper/venv/bin/python
+
+[Service]
+Type=simple
+User=ateqpaper
+Group=ateqpaper
+# Read the crypto store's position snapshot, so the page can show the
+# ACCOUNT-WIDE exposure the 30% ceiling actually applies to. Read-only: the
+# group grants DAC read, and ProtectSystem=strict makes write impossible.
+SupplementaryGroups=autotrader atshadow
+WorkingDirectory=/opt/autotrader-equity-paper/app
+
+EnvironmentFile=/etc/autotrader/autotrader-equity-paper.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# No --host argument, deliberately: the entry point hardcodes 127.0.0.1, and a
+# host flag here would be a second way to get that wrong.
+ExecStart=/opt/autotrader-equity-paper/venv/bin/python -m autotrader.dashboard.equity_paper_api --port ${AUTOTRADER_EQUITY_PAPER_API_PORT}
+
+# A viewer, not a trader. Nothing it does can be left half-finished, so unlike
+# the runtimes it restarts unconditionally: a dashboard that is down teaches an
+# operator nothing, and there is no state for a retry to corrupt.
+Restart=always
+RestartSec=5
+
+StateDirectory=autotrader-equity-paper
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity-paper-api
