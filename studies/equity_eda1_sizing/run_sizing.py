@@ -15,6 +15,14 @@ from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
+
+from autotrader.equity.allocation import (
+    POLICY_EQUAL_ACTIVE,
+    POLICY_FIXED_PRO_RATA,
+    POLICY_RESERVED_UNIVERSE,
+    AllocationPolicy,
+)
+from autotrader.research.costs import EQUITY_COST, STRESS_COST, ZERO_COST, CostModel
 from studies.equity_eda1_sizing import STUDY_SYMBOLS, WINDOW_NAMES
 from studies.equity_eda1_sizing.evidence import (
     default_datasets,
@@ -28,14 +36,6 @@ from studies.equity_eda1_sizing.simulate import (
     SimulationResult,
     simulate,
 )
-
-from autotrader.equity.allocation import (
-    POLICY_EQUAL_ACTIVE,
-    POLICY_FIXED_PRO_RATA,
-    POLICY_RESERVED_UNIVERSE,
-    AllocationPolicy,
-)
-from autotrader.research.costs import EQUITY_COST, STRESS_COST, ZERO_COST, CostModel
 
 #: The predeclared external-exposure stress scenarios (ledger §L4). Account
 #: contention, not realized crypto history.

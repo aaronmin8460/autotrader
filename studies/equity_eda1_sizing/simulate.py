@@ -41,11 +41,11 @@ from decimal import Decimal, localcontext
 from enum import Enum
 
 import pandas as pd
-from studies.equity_eda1_sizing import STUDY_SYMBOLS
 
 from autotrader.equity.allocation import AllocationPolicy, target_weights, whole_shares
 from autotrader.research.costs import CostModel, Side
 from autotrader.research.metrics import EQUITY_15M, PerformanceMetrics, compute_metrics
+from studies.equity_eda1_sizing import STUDY_SYMBOLS
 
 #: The research simulator's working precision, matched so money arithmetic here
 #: rounds the way money arithmetic there does.

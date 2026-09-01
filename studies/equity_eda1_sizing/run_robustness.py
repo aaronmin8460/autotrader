@@ -13,15 +13,6 @@ from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
-from studies.equity_eda1_sizing import STUDY_SYMBOLS, WINDOW_NAMES
-from studies.equity_eda1_sizing.evidence import stance_frame, verify_wiring
-from studies.equity_eda1_sizing.run_sizing import (
-    price_frames,
-    window_bounds,
-    window_returns,
-    write_json,
-)
-from studies.equity_eda1_sizing.simulate import RebalanceRule, simulate
 
 from autotrader.equity.allocation import (
     POLICY_IDS,
@@ -31,6 +22,15 @@ from autotrader.equity.allocation import (
 from autotrader.execution.paper import PaperAccountState, PaperPosition, build_risk_context
 from autotrader.research.costs import EQUITY_COST
 from autotrader.risk import RiskRequest, RiskSide, evaluate_risk
+from studies.equity_eda1_sizing import STUDY_SYMBOLS, WINDOW_NAMES
+from studies.equity_eda1_sizing.evidence import stance_frame, verify_wiring
+from studies.equity_eda1_sizing.run_sizing import (
+    price_frames,
+    window_bounds,
+    window_returns,
+    write_json,
+)
+from studies.equity_eda1_sizing.simulate import RebalanceRule, simulate
 
 #: The ten-symbol study's luckiest symbol, named in the deep-architecture
 #: program's own leave-one-out attack. Dropping it is criterion 9.

@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 
 import pandas as pd
-from studies.equity_eda1_sizing import STUDY_SYMBOLS, WINDOW_NAMES
 
 from autotrader.decision.contract import DecisionSignal
 from autotrader.equity.regime import (
@@ -29,6 +28,7 @@ from autotrader.equity.regime import (
     source_stance,
 )
 from autotrader.equity.session import market_date
+from studies.equity_eda1_sizing import STUDY_SYMBOLS, WINDOW_NAMES
 
 
 class EvidenceError(Exception):
