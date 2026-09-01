@@ -52,6 +52,44 @@ from studies.equity_v1_v5.scoring import COST_MODELS
 OUT_DIR = Path(REPORT_ROOT) / "phase5"
 
 
+def _install_three_directory_stances() -> None:
+    """Extend the stance search with this program's own drive artifacts.
+
+    The inherited loader searches the frozen U10 decisions and the prior
+    program's 16-symbol drive; the U45∖U30 stances live in this program's
+    dataset root (ledger §L13). Patch the module-level loader with a
+    three-directory version; prior directories stay read-only.
+    """
+    import pandas as pd
+
+    import studies.equity_eda1_nextgen.run_phase234 as rp
+    from studies.equity_10_full.windows import FULL_WINDOWS
+    from studies.equity_asset_character import CHARACTER_DATASETS
+    from studies.equity_deep_arch.overlay import source_stance
+    from studies.equity_v1_v5.scoring import frame_to_decisions
+
+    own_drive = Path(CHARACTER_DATASETS) / "v3-decisions"
+
+    def load_stance3(symbol: str, frame) -> dict:
+        records = []
+        for window in FULL_WINDOWS:
+            for directory in (rp.FROZEN_DECISIONS, rp.DRIVE_DECISIONS, own_drive):
+                path = directory / f"{symbol}_{window.name}_V3.parquet"
+                if path.exists():
+                    records.extend(frame_to_decisions(pd.read_parquet(path)))
+                    break
+            else:
+                raise SystemExit(f"No V3 series for {symbol}/{window.name}.")
+        ordered = sorted(records, key=lambda record: record.timestamp)
+        stances = source_stance(ordered)
+        return {pd.Timestamp(r.timestamp): s for r, s in zip(ordered, stances, strict=True)}
+
+    rp.load_stance = load_stance3
+
+
+_install_three_directory_stances()
+
+
 def surviving_features() -> tuple[str, ...]:
     stability = json.loads((Path(REPORT_ROOT) / "phase2" / "stability.json").read_text())
     return tuple(stability["surviving_structural_features"])
@@ -60,7 +98,13 @@ def surviving_features() -> tuple[str, ...]:
 class TiltContext:
     """Everything one universe's tilted replays share, loaded once."""
 
-    def __init__(self, universe_name: str) -> None:
+    def __init__(
+        self,
+        universe_name: str,
+        *,
+        fit_records: list[dict] | None = None,
+        z_structural=None,
+    ) -> None:
         from studies.equity_eda1_nextgen.universe import INCUMBENTS
 
         self.universe_name = universe_name
@@ -68,9 +112,13 @@ class TiltContext:
         self.context = UniverseContext(members)
         self.marks, self.regime_of, _ = load_marks_regimes()
         panel = load_panel()
-        self.z_structural = cross_sectional_z(panel, surviving_features())
+        self.z_structural = (
+            z_structural
+            if z_structural is not None
+            else cross_sectional_z(panel, surviving_features())
+        )
         self.z_state = cross_sectional_z(panel, STATE_FEATURES)
-        self.fit_records = load_fit_records()
+        self.fit_records = fit_records if fit_records is not None else load_fit_records()
         u45 = load_universe("u50")
         tables = {s: symbol_sessions(load_frame(s)) for s in u45}
         series = {s: build_series(t, tables["SPY"]) for s, t in tables.items()}
@@ -107,7 +155,7 @@ class TiltContext:
         """(active weights, reserved weights) for the sessions of one mark."""
         symbols = [s for s in self.context.universe if s not in exclude_symbols]
         fit = governing_fit(self.fit_records, mark)
-        if fit is None:
+        if fit is None or scheme == "EQUAL":
             equal = tilted_weights(symbols, {})
             return equal, equal
 
@@ -156,12 +204,21 @@ class TiltContext:
         lambda_override: float | None = None,
         clip_override: tuple[float, float] | None = None,
         exclude_symbols: frozenset[str] = frozenset(),
+        delay_one_session: bool = False,
     ) -> dict[str, object]:
         by_mark: dict[date, tuple[dict[str, float], dict[str, float]]] = {}
         active_of: dict[date, dict[str, float]] = {}
         reserved_of: dict[date, dict[str, float]] = {}
+        ordered_sessions = sorted(self.context.sessions)
+        delayed_of = {
+            current: self.mark_of_session.get(previous)
+            for previous, current in zip(ordered_sessions[:-1], ordered_sessions[1:], strict=False)
+        }
         for session in self.context.sessions:
-            mark = self.mark_of_session.get(session)
+            if delay_one_session:
+                mark = delayed_of.get(session)
+            else:
+                mark = self.mark_of_session.get(session)
             if mark is None:
                 mark = self.marks[0]
             if mark not in by_mark:

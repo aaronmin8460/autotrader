@@ -545,3 +545,92 @@ def test_build_targets_tilted_participate_vs_defensive():
     assert targets["AAA"][stamps[1]] == pytest.approx(0.04)  # defensive, stance 1
     assert targets["AAA"][stamps[2]] == pytest.approx(0.0)  # defensive, stance 0
     assert targets["AAA"][stamps[3]] == pytest.approx(0.07)
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical models (ledger §L10, §L14)
+# ---------------------------------------------------------------------------
+
+from studies.equity_asset_character.hierarchical import (  # noqa: E402
+    PooledRow,
+    build_design,
+    demeaned_targets,
+    ridge_fit,
+    walk_forward_ic,
+)
+
+
+def test_ridge_recovers_coefficients_at_tiny_penalty():
+    rng = np.random.default_rng(47)
+    x = rng.standard_normal((500, 2))
+    y = 2.0 * x[:, 0] - 1.0 * x[:, 1]
+    matrix = np.hstack([np.ones((500, 1)), x])
+    beta = ridge_fit(matrix, y, np.full(3, 1e-10))
+    assert beta[1] == pytest.approx(2.0, abs=1e-6)
+    assert beta[2] == pytest.approx(-1.0, abs=1e-6)
+
+
+def test_symbol_effects_are_strongly_shrunk():
+    marks = _monthly_marks(20)
+    rng = np.random.default_rng(53)
+    rows = []
+    for mark in marks:
+        for i in range(20):
+            symbol = f"S{i:02d}"
+            # A pure symbol effect with no feature signal.
+            rows.append(
+                PooledRow(
+                    mark=mark,
+                    symbol=symbol,
+                    target=(1.0 if i == 0 else -1.0 / 19) + 0.01 * rng.standard_normal(),
+                    window_closes=mark,
+                    features={"f": float(rng.standard_normal())},
+                )
+            )
+    symbols = sorted({row.symbol for row in rows})
+    symbol_index = {s: i for i, s in enumerate(symbols)}
+    matrix, penalties = build_design(rows, ["f"], symbol_index)
+    beta = ridge_fit(matrix, np.array([row.target for row in rows]), penalties)
+    # The S00 dummy coefficient is shrunk far below the raw effect size (1.0).
+    assert abs(beta[2 + symbol_index["S00"]]) < 0.25
+
+
+def test_walk_forward_excludes_leaking_rows():
+    """A row whose forward window crosses the fit date must not train."""
+    marks = _monthly_marks(30)
+    fit_mark = marks[20]
+    rng = np.random.default_rng(59)
+    rows = []
+    for mark in marks[:16]:  # clean training rows: target = +2 x
+        for i in range(25):
+            x = float(rng.standard_normal())
+            rows.append(
+                PooledRow(mark, f"S{i:02d}", 2.0 * x, mark, {"x": x})
+            )
+    # A poisoned batch just before the fit whose window crosses it: target = −50 x.
+    poison_mark = marks[19]
+    for i in range(25):
+        x = float(rng.standard_normal())
+        rows.append(
+            PooledRow(poison_mark, f"S{i:02d}", -50.0 * x, marks[21], {"x": x})
+        )
+    # Scoring rows after the fit.
+    for mark in marks[21:25]:
+        for i in range(25):
+            x = float(rng.standard_normal())
+            rows.append(PooledRow(mark, f"S{i:02d}", 2.0 * x, mark, {"x": x}))
+    result = walk_forward_ic(
+        rows, ["x"], [fit_mark], marks, with_symbol_effects=False
+    )
+    # If the poisoned rows leaked, the sign flips and IC goes to −1.
+    assert result["mean_ic"] > 0.9
+
+
+def test_demeaned_targets_zero_mean_per_mark():
+    marks = [date(2023, 1, 2)]
+    forward = {
+        (marks[0], f"S{i:02d}"): (float(i), date(2023, 2, 1)) for i in range(12)
+    }
+    out = demeaned_targets(forward, marks)
+    values = [v[0] for v in out.values()]
+    assert abs(float(np.mean(values))) < 1e-12
