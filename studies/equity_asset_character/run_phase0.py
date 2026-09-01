@@ -149,9 +149,7 @@ def run_compare() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--stage", required=True, choices=("b1", "bridge", "base-u30", "compare")
-    )
+    parser.add_argument("--stage", required=True, choices=("b1", "bridge", "base-u30", "compare"))
     arguments = parser.parse_args()
     started = time.perf_counter()
     {"b1": run_b1, "bridge": run_bridge, "base-u30": run_base_u30, "compare": run_compare}[

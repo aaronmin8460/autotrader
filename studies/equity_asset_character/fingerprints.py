@@ -80,8 +80,7 @@ def symbol_sessions(frame: pd.DataFrame) -> pd.DataFrame:
             "open": frame["open"].to_numpy(dtype="float64"),
             "close": frame["close"].to_numpy(dtype="float64"),
             "notional": (
-                frame["close"].to_numpy(dtype="float64")
-                * frame["volume"].to_numpy(dtype="float64")
+                frame["close"].to_numpy(dtype="float64") * frame["volume"].to_numpy(dtype="float64")
             ),
         }
     )
@@ -114,7 +113,11 @@ def build_series(table: pd.DataFrame, spy_table: pd.DataFrame) -> SymbolSeries:
     sessions = np.asarray(table["session"].tolist(), dtype=object)
     closes = table["close"].to_numpy(dtype="float64")
     spy_map = dict(
-        zip(spy_table["session"].tolist(), spy_table["close"].to_numpy(dtype="float64"))
+        zip(
+            spy_table["session"].tolist(),
+            spy_table["close"].to_numpy(dtype="float64"),
+            strict=True,
+        )
     )
     shared_mask = np.array([day in spy_map for day in sessions], dtype=bool)
     shared_dates = sessions[shared_mask]
@@ -177,9 +180,7 @@ def structural_at(series: SymbolSeries, mark: date) -> dict[str, float]:
         out["reversal_126"] = _reversal(r)
     if pend >= WINDOW_6M + 20:
         r = series.paired_own_returns[pend - (WINDOW_6M + 20) : pend]
-        rolling = np.array(
-            [r[i : i + 21].std(ddof=1) for i in range(len(r) - 20)], dtype="float64"
-        )
+        rolling = np.array([r[i : i + 21].std(ddof=1) for i in range(len(r) - 20)], dtype="float64")
         out["vol_of_vol_126"] = float(rolling.std(ddof=1)) * np.sqrt(ANNUALIZE)
 
     # --- own-axis block ---
@@ -246,9 +247,7 @@ def state_at(series: SymbolSeries, mark: date, beta_252: float) -> dict[str, flo
         out["resid_21"] = own21 - beta_252 * spy21
     if pend >= WINDOW_12M + 20:
         r = series.paired_own_returns[pend - (WINDOW_12M + 20) : pend]
-        rolling = np.array(
-            [r[i : i + 21].std(ddof=1) for i in range(len(r) - 20)], dtype="float64"
-        )
+        rolling = np.array([r[i : i + 21].std(ddof=1) for i in range(len(r) - 20)], dtype="float64")
         median = float(np.median(rolling))
         if median > 0.0:
             out["vol_ratio"] = float(rolling[-1] / median)
@@ -277,9 +276,7 @@ def fingerprint_panel(
     if spy_symbol not in tables:
         raise FingerprintError(f"{spy_symbol} session table is required.")
     spy_table = tables[spy_symbol]
-    series = {
-        symbol: build_series(tables[symbol], spy_table) for symbol in sorted(tables)
-    }
+    series = {symbol: build_series(tables[symbol], spy_table) for symbol in sorted(tables)}
     rows: list[dict[str, object]] = []
     for mark in marks:
         for symbol in sorted(tables):

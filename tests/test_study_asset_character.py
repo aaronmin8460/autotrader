@@ -11,7 +11,6 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 import pytest
-
 from studies.equity_asset_character.fingerprints import (
     STRUCTURAL_FEATURES,
     build_series,
@@ -116,9 +115,7 @@ def test_fingerprint_causality_future_perturbation(sessions, spy_table):
     past = structural_at(
         build_series(symbol_sessions(_bar_frame(sessions, past_closes)), spy_table), mark
     )
-    assert any(
-        not np.isnan(base[f]) and base[f] != past[f] for f in STRUCTURAL_FEATURES
-    )
+    assert any(not np.isnan(base[f]) and base[f] != past[f] for f in STRUCTURAL_FEATURES)
 
 
 def test_state_causality_future_perturbation(sessions, spy_table):
@@ -198,9 +195,7 @@ def test_cross_sectional_z_contemporaneous_only():
 
 def test_cross_sectional_z_min_symbols_guard():
     marks = [date(2022, 1, 3)]
-    rows = [
-        {"mark": marks[0], "symbol": f"S{i}", "beta_252": float(i)} for i in range(10)
-    ]
+    rows = [{"mark": marks[0], "symbol": f"S{i}", "beta_252": float(i)} for i in range(10)]
     panel = pd.DataFrame(rows).set_index(["mark", "symbol"])
     z = cross_sectional_z(panel, ["beta_252"], min_symbols=20)
     assert z["beta_252"].isna().all()
@@ -237,9 +232,7 @@ from studies.equity_asset_character.archetypes import (  # noqa: E402
 def _blobs(seed: int = 5, per_cluster: int = 12) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     centers = np.array([[0.0, 0.0], [8.0, 8.0], [-8.0, 8.0]])
-    data = np.vstack(
-        [center + 0.5 * rng.standard_normal((per_cluster, 2)) for center in centers]
-    )
+    data = np.vstack([center + 0.5 * rng.standard_normal((per_cluster, 2)) for center in centers])
     truth = np.repeat(np.arange(3), per_cluster)
     return data, truth
 
@@ -295,9 +288,7 @@ def _z_panel(marks, n_symbols=30, seed=31, shift_from=None, shift_symbols=()):
                 value = value + 100.0
             if symbol in shift_symbols:
                 value = value + 100.0
-            rows.append(
-                {"mark": mark, "symbol": symbol, "f1": value[0], "f2": value[1]}
-            )
+            rows.append({"mark": mark, "symbol": symbol, "f1": value[0], "f2": value[1]})
     return pd.DataFrame(rows).set_index(["mark", "symbol"]).sort_index()
 
 
@@ -327,9 +318,7 @@ def test_train_only_clustering_future_perturbation_invariant():
     marks = _monthly_marks(30)
     fit_mark = marks[15]
     clean = fit_archetypes(_z_panel(marks), ("f1", "f2"), fit_mark, marks)
-    shifted = fit_archetypes(
-        _z_panel(marks, shift_from=fit_mark), ("f1", "f2"), fit_mark, marks
-    )
+    shifted = fit_archetypes(_z_panel(marks, shift_from=fit_mark), ("f1", "f2"), fit_mark, marks)
     assert clean.labels == shifted.labels
     assert clean.centroids == shifted.centroids
     assert clean.k == shifted.k
@@ -409,3 +398,150 @@ def test_assign_nan_vector_gets_no_archetype():
     )
     assert fit.assign(np.array([float("nan"), 1.0])) is None
     assert fit.assign(np.array([4.9, 5.2])) == 1
+
+
+# ---------------------------------------------------------------------------
+# Allocation (ledger §L8, §L9, §L14)
+# ---------------------------------------------------------------------------
+
+from studies.equity_asset_character.allocation import (  # noqa: E402
+    archetype_multipliers,
+    build_targets_tilted,
+    governing_marks,
+    response_estimates,
+    state_multipliers,
+    tilted_weights,
+)
+from studies.equity_asset_character.response import ForwardObservation  # noqa: E402
+
+
+def test_tilted_weights_symmetry_and_renormalization():
+    symbols = ["AAA", "BBB", "CCC", "DDD"]
+    mults = {"AAA": 1.4, "BBB": 1.4, "CCC": 0.6, "DDD": 0.6}
+    weights = tilted_weights(symbols, mults)
+    # Same multiplier ⇒ same weight (symmetry).
+    assert weights["AAA"] == weights["BBB"]
+    assert weights["CCC"] == weights["DDD"]
+    # Renormalized to the base total (no cap binding at 4 names × 10 %... cap
+    # binds at 0.10: base = 0.10, so up-tilts cap out and total ≤ base total).
+    base_total = min(1.0 / 4, 0.10) * 4
+    assert sum(weights.values()) <= base_total + 1e-9
+    assert max(weights.values()) <= 0.10 + 1e-12
+
+
+def test_tilted_weights_uncapped_universe_preserves_total():
+    symbols = [f"S{i:02d}" for i in range(26)]
+    mults = {s: (1.4 if i % 2 else 0.6) for i, s in enumerate(symbols)}
+    weights = tilted_weights(symbols, mults)
+    base_total = min(1.0 / 26, 0.10) * 26
+    assert sum(weights.values()) == pytest.approx(base_total)
+    assert max(weights.values()) <= 0.10 + 1e-12
+    # No ticker-specific constants: equal multipliers ⇒ equal weights.
+    odd = {w for s, w in weights.items() if mults[s] == 1.4}
+    assert len({round(w, 15) for w in odd}) == 1
+
+
+def test_tilted_weights_all_one_is_equal_base():
+    symbols = [f"S{i}" for i in range(26)]
+    weights = tilted_weights(symbols, {})
+    assert all(w == pytest.approx(min(1.0 / 26, 0.10)) for w in weights.values())
+
+
+def _fit_record():
+    return {
+        "fit_mark": "2023-02-01",
+        "centroids_z": [[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]],
+        "features": ["beta_252", "vol_126"],
+        "raw_feature_medians": {
+            "0": {"beta_252": 0.5, "vol_126": 0.2},
+            "1": {"beta_252": 1.0, "vol_126": 0.3},
+            "2": {"beta_252": 1.8, "vol_126": 0.5},
+        },
+    }
+
+
+def test_a1b_multipliers_participate_only_and_clipped():
+    fit = _fit_record()
+    mults = archetype_multipliers("A1_B", fit, "PARTICIPATE", {})
+    mean = (0.5 + 1.0 + 1.8) / 3
+    assert mults[0] == pytest.approx(max(0.5 / mean, 0.6))
+    assert mults[2] == pytest.approx(min(1.8 / mean, 1.4))
+    defensive = archetype_multipliers("A1_B", fit, "DEFENSIVE", {})
+    assert all(v == 1.0 for v in defensive.values())
+
+
+def test_a1p_defensive_is_neutral_a1r_is_not():
+    fit = _fit_record()
+    estimates = {"DEFENSIVE": {0: -0.05, 1: 0.00, 2: 0.25}}
+    p = archetype_multipliers("A1_P", fit, "DEFENSIVE", estimates)
+    assert all(v == 1.0 for v in p.values())
+    r = archetype_multipliers("A1_R", fit, "DEFENSIVE", estimates)
+    assert r[2] > 1.0 > r[0]
+    assert all(0.6 <= v <= 1.4 for v in r.values())
+
+
+def test_response_estimates_purge_excludes_windows_crossing_fit():
+    fit = _fit_record()
+    marks = [date(2022, 6, 1), date(2023, 1, 15)]
+    rows = []
+    for mark in marks:
+        rows.append({"mark": mark, "symbol": "AAA", "beta_252": 0.0, "vol_126": 0.0})
+    z_panel = pd.DataFrame(rows).set_index(["mark", "symbol"]).sort_index()
+    observations = [
+        # Window closes before the fit date: included.
+        ForwardObservation(marks[0], "AAA", 21, 0.10, 0.02, date(2022, 7, 1)),
+        # Window closes after the fit date: must be purged.
+        ForwardObservation(marks[1], "AAA", 21, 9.99, 0.00, date(2023, 2, 14)),
+    ]
+    regimes = {marks[0]: "PARTICIPATE", marks[1]: "PARTICIPATE"}
+    estimates = response_estimates(fit, z_panel, observations, regimes)
+    assert set(estimates) == {"PARTICIPATE"}
+    assert estimates["PARTICIPATE"][0] == pytest.approx((0.10 - 0.02) * 12)
+    assert 9.99 * 12 not in estimates["PARTICIPATE"].values()
+
+
+def test_governing_marks():
+    sessions = [date(2022, 1, d) for d in (3, 4, 5, 6, 7)]
+    marks = [date(2022, 1, 3), date(2022, 1, 6)]
+    of = governing_marks(sessions, marks)
+    assert of[date(2022, 1, 5)] == date(2022, 1, 3)
+    assert of[date(2022, 1, 6)] == date(2022, 1, 6)
+    assert of[date(2022, 1, 7)] == date(2022, 1, 6)
+
+
+def test_state_multipliers_band_and_neutral_nan():
+    mark = date(2023, 2, 1)
+    rows = [
+        {"mark": mark, "symbol": "AAA", "rs_63": 3.0, "vol_ratio": float("nan")},
+        {"mark": mark, "symbol": "BBB", "rs_63": -3.0, "vol_ratio": 0.0},
+    ]
+    z_state = pd.DataFrame(rows).set_index(["mark", "symbol"]).sort_index()
+    m = state_multipliers("A2_M", z_state, mark, ["AAA", "BBB", "CCC"])
+    assert m["AAA"] == pytest.approx(1.15)  # clipped at the band
+    assert m["BBB"] == pytest.approx(0.85)
+    assert m["CCC"] == 1.0  # absent symbol is neutral
+    q = state_multipliers("A2_Q", z_state, mark, ["AAA", "BBB"])
+    assert q["AAA"] == 1.0  # NaN vol_ratio is neutral
+
+
+def test_build_targets_tilted_participate_vs_defensive():
+    sessions = _weekdays(date(2022, 1, 3), 4)
+    closes = np.array([100.0, 101.0, 102.0, 103.0])
+    frame = _bar_frame(sessions, closes, bars_per_session=1)
+    stamps = [pd.Timestamp(ts) for ts in frame["timestamp"]]
+    participate = {sessions[0]: True, sessions[1]: False, sessions[2]: False, sessions[3]: True}
+    stance = {"AAA": {stamps[1]: 1, stamps[2]: 0}}
+    active = {s: {"AAA": 0.07} for s in sessions}
+    reserved = {s: {"AAA": 0.04} for s in sessions}
+    targets = build_targets_tilted(
+        {"AAA": frame},
+        sessions,
+        participate,
+        stance,
+        active_weight_of=active,
+        reserved_weight_of=reserved,
+    )
+    assert targets["AAA"][stamps[0]] == pytest.approx(0.07)  # participate
+    assert targets["AAA"][stamps[1]] == pytest.approx(0.04)  # defensive, stance 1
+    assert targets["AAA"][stamps[2]] == pytest.approx(0.0)  # defensive, stance 0
+    assert targets["AAA"][stamps[3]] == pytest.approx(0.07)

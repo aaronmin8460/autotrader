@@ -25,9 +25,10 @@ K_CANDIDATES: tuple[int, ...] = (3, 4, 5, 6)
 MIN_CLUSTER_MEMBERS = 3
 MIN_TRAIN_MARKS = 6
 
-#: Walk-forward fit schedule (§L5): initial fit at the first mark ≥ this
-#: date, then the first mark of each later calendar year.
-INITIAL_FIT_FROM = date(2022, 7, 1)
+#: Walk-forward fit schedule (§L5 + dated amendment): initial fit at the
+#: first mark ≥ this date (the earliest with MIN_TRAIN_MARKS complete
+#: 252-fingerprint training marks), then the first mark of each later year.
+INITIAL_FIT_FROM = date(2022, 8, 1)
 ANNUAL_FIT_YEARS: tuple[int, ...] = (2023, 2024, 2025, 2026)
 
 
@@ -86,9 +87,7 @@ def kmeans(data: np.ndarray, k: int, *, seed: int = KMEANS_SEED) -> tuple[np.nda
         if label not in mapping:
             mapping[label] = len(mapping)
         canonical[i] = mapping[label]
-    centroids = np.vstack(
-        [data[canonical == j].mean(axis=0) for j in range(canonical.max() + 1)]
-    )
+    centroids = np.vstack([data[canonical == j].mean(axis=0) for j in range(canonical.max() + 1)])
     return canonical, centroids
 
 
@@ -101,9 +100,9 @@ def ward(data: np.ndarray, k: int) -> np.ndarray:
         best = (float("inf"), -1, -1)
         for a in range(len(clusters)):
             for b in range(a + 1, len(clusters)):
-                merge_cost = (
-                    sizes[a] * sizes[b] / (sizes[a] + sizes[b])
-                ) * float(((centroids[a] - centroids[b]) ** 2).sum())
+                merge_cost = (sizes[a] * sizes[b] / (sizes[a] + sizes[b])) * float(
+                    ((centroids[a] - centroids[b]) ** 2).sum()
+                )
                 if merge_cost < best[0]:
                     best = (merge_cost, a, b)
         _, a, b = best
@@ -138,9 +137,7 @@ def silhouette(data: np.ndarray, labels: np.ndarray) -> float:
             scores[i] = 0.0
             continue
         a = distances[i][own_mask & (np.arange(n) != i)].mean()
-        b = min(
-            distances[i][labels == other].mean() for other in unique if other != own
-        )
+        b = min(distances[i][labels == other].mean() for other in unique if other != own)
         scores[i] = (b - a) / max(a, b) if max(a, b) > 0 else 0.0
     return float(scores.mean())
 

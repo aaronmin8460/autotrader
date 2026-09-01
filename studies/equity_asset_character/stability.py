@@ -61,9 +61,7 @@ def rank_stability(
         gate_median = by_lag[f"lag_{STRUCTURAL_GATE_LAG}"]["median"]  # type: ignore[index]
         report[feature] = {
             **by_lag,
-            "structural": bool(
-                not np.isnan(gate_median) and gate_median >= STRUCTURAL_GATE_MIN
-            ),
+            "structural": bool(not np.isnan(gate_median) and gate_median >= STRUCTURAL_GATE_MIN),
         }
     return report
 
