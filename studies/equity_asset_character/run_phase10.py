@@ -65,9 +65,7 @@ def main() -> None:
             continue
         labels = retro_labels(fit, z_panel, mark)
         mults = archetype_multipliers(arguments.scheme, fit, "PARTICIPATE", {})
-        multiplier_of = {
-            s: mults.get(labels[s], 1.0) if s in labels else 1.0 for s in universe
-        }
+        multiplier_of = {s: mults.get(labels[s], 1.0) if s in labels else 1.0 for s in universe}
         weights = tilted_weights(universe, multiplier_of)
         equal = tilted_weights(universe, {})
         counted_marks += 1
@@ -85,12 +83,8 @@ def main() -> None:
         previous_weights = weights
 
     loso_path = Path(REPORT_ROOT) / "phase9" / f"loso_{arguments.universe}_{arguments.scheme}.json"
-    loso = (
-        json.loads(loso_path.read_text())["loso"] if loso_path.exists() else {}
-    )
-    a1 = json.loads(
-        (Path(REPORT_ROOT) / "phase5" / f"a1_{arguments.universe}.json").read_text()
-    )
+    loso = json.loads(loso_path.read_text())["loso"] if loso_path.exists() else {}
+    a1 = json.loads((Path(REPORT_ROOT) / "phase5" / f"a1_{arguments.universe}.json").read_text())
     full_net = a1[arguments.scheme]["equity-marketable"]["net_return"]
 
     per_symbol: dict[str, object] = {}

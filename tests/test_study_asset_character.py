@@ -604,33 +604,25 @@ def test_walk_forward_excludes_leaking_rows():
     for mark in marks[:16]:  # clean training rows: target = +2 x
         for i in range(25):
             x = float(rng.standard_normal())
-            rows.append(
-                PooledRow(mark, f"S{i:02d}", 2.0 * x, mark, {"x": x})
-            )
+            rows.append(PooledRow(mark, f"S{i:02d}", 2.0 * x, mark, {"x": x}))
     # A poisoned batch just before the fit whose window crosses it: target = −50 x.
     poison_mark = marks[19]
     for i in range(25):
         x = float(rng.standard_normal())
-        rows.append(
-            PooledRow(poison_mark, f"S{i:02d}", -50.0 * x, marks[21], {"x": x})
-        )
+        rows.append(PooledRow(poison_mark, f"S{i:02d}", -50.0 * x, marks[21], {"x": x}))
     # Scoring rows after the fit.
     for mark in marks[21:25]:
         for i in range(25):
             x = float(rng.standard_normal())
             rows.append(PooledRow(mark, f"S{i:02d}", 2.0 * x, mark, {"x": x}))
-    result = walk_forward_ic(
-        rows, ["x"], [fit_mark], marks, with_symbol_effects=False
-    )
+    result = walk_forward_ic(rows, ["x"], [fit_mark], marks, with_symbol_effects=False)
     # If the poisoned rows leaked, the sign flips and IC goes to −1.
     assert result["mean_ic"] > 0.9
 
 
 def test_demeaned_targets_zero_mean_per_mark():
     marks = [date(2023, 1, 2)]
-    forward = {
-        (marks[0], f"S{i:02d}"): (float(i), date(2023, 2, 1)) for i in range(12)
-    }
+    forward = {(marks[0], f"S{i:02d}"): (float(i), date(2023, 2, 1)) for i in range(12)}
     out = demeaned_targets(forward, marks)
     values = [v[0] for v in out.values()]
     assert abs(float(np.mean(values))) < 1e-12
