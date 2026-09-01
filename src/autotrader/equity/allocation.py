@@ -41,7 +41,12 @@ from decimal import ROUND_FLOOR, Decimal
 
 from autotrader.equity import EQUITY_SYMBOLS, EquityError, normalize_symbol
 from autotrader.execution.models import OrderSide
-from autotrader.risk.engine import MAX_POSITION_FRACTION, MAX_TOTAL_EXPOSURE_FRACTION
+from autotrader.risk.engine import (
+    DEFAULT_POLICY,
+    MAX_POSITION_FRACTION,
+    MAX_TOTAL_EXPOSURE_FRACTION,
+    RiskPolicy,
+)
 
 #: Policy A - the available account budget split equally across the symbols that
 #: are actually LONG, subject to the per-symbol ceiling. Budget-filling: a flat
@@ -59,11 +64,59 @@ POLICY_FIXED_PRO_RATA = "B_FIXED_PRO_RATA"
 #: per-symbol behaviour restated under a cap.
 POLICY_RESERVED_UNIVERSE = "C_RESERVED_UNIVERSE"
 
+#: The fractional 90%-target policy: policy C's reserved-universe shape under
+#: the account-utilization constants below, with fractional share targets and
+#: an explicit no-trade deadband in place of the whole-share floor. The
+#: operator-authorized successor to `C_RESERVED_UNIVERSE`; the old policy stays
+#: in the registry, hash-stable, as the rollback target.
+POLICY_FRACTIONAL_RESERVED_90 = "EDA1_FRACTIONAL_RESERVED_90"
+
 POLICY_IDS: tuple[str, ...] = (
     POLICY_EQUAL_ACTIVE,
     POLICY_FIXED_PRO_RATA,
     POLICY_RESERVED_UNIVERSE,
+    POLICY_FRACTIONAL_RESERVED_90,
 )
+
+# --------------------------------------------------------------------------
+# The EDA1_FRACTIONAL_RESERVED_90 constants, named once, here.
+#
+# Nothing below is scattered as a literal through the runtime: the allocator
+# budget, the Risk policy, the deadband and the dashboard all read these
+# names. `config_hash` covers every one of them.
+# --------------------------------------------------------------------------
+
+#: The account gross exposure the policy AIMS for. The equity budget is
+#: `max(0, TARGET_ACCOUNT_GROSS - X)` where X is all non-equity exposure, so
+#: the target is an account-wide target, never "90% equity plus whatever else".
+TARGET_ACCOUNT_GROSS = Decimal("0.90")
+
+#: The account gross exposure no new entry may ever project past. Enforced by
+#: the Risk Engine against broker truth on every order, both books counted.
+HARD_ACCOUNT_GROSS_CAP = Decimal("0.95")
+
+#: The hard per-symbol ceiling. Assignment sizes at B/N <= 9%, so this cap
+#: never binds at assignment; it bounds drift, and Risk enforces it per order.
+HARD_SYMBOL_GROSS_CAP = Decimal("0.11")
+
+#: The frozen slot count. One reserved slot per universe symbol; a FLAT
+#: symbol's slot stays cash and is never redistributed to the LONG ones.
+RESERVED_EQUITY_SLOTS = 10
+
+#: The deadband's absolute floor: an adjustment moving less than this many
+#: dollars is not an order. Also the broker's own floor for a fractional order.
+REBALANCE_MIN_ABSOLUTE_NOTIONAL = Decimal("1")
+
+#: The deadband's relative floor: an adjustment smaller than this fraction of
+#: the symbol's reserved slot is not an order. Transitions are exempt - a
+#: LONG -> FLAT exit is always submitted in full, and an entry is its whole
+#: slot and clears this floor trivially.
+REBALANCE_MIN_SLOT_FRACTION = Decimal("0.01")
+
+#: Fractional share targets are floored to this increment. This system's own
+#: quantum - the broker publishes no equity trade increment - chosen at the
+#: precision the broker reports positions in.
+FRACTIONAL_SHARE_INCREMENT = Decimal("0.000000001")
 
 #: Weights are quantized to this many decimal places, rounding **down**.
 #:
@@ -105,6 +158,19 @@ class AllocationPolicy:
     total_cap: Decimal = Decimal(str(MAX_TOTAL_EXPOSURE_FRACTION))
     universe_size: int = len(EQUITY_SYMBOLS)
     fixed_target: Decimal = DEFAULT_FIXED_TARGET
+    #: The account gross the budget aims for, when it is deliberately below the
+    #: hard cap. None means the two coincide, which is every legacy policy -
+    #: and keeps every legacy policy's canonical JSON, and therefore its frozen
+    #: `config_hash`, byte-identical to what the sizing study published.
+    target_gross: Decimal | None = None
+    #: Whether targets are fractional share quantities. False is the legacy
+    #: whole-share floor, which doubles as the legacy no-trade band.
+    fractional: bool = False
+    #: The deadband floors. Zero (the legacy value) means no deadband - the
+    #: whole-share floor is the legacy band, and a fractional policy must carry
+    #: real floors or a 15-minute runtime churns on every price tick.
+    deadband_min_notional: Decimal = _ZERO
+    deadband_slot_fraction: Decimal = _ZERO
 
     def __post_init__(self) -> None:
         if self.policy_id not in POLICY_IDS:
@@ -124,9 +190,54 @@ class AllocationPolicy:
             raise AllocationError(
                 f"fixed_target must be a fraction in (0, 1], got {self.fixed_target}."
             )
+        if self.target_gross is not None and not _ZERO < self.target_gross <= self.total_cap:
+            raise AllocationError(
+                f"target_gross must be a fraction in (0, total_cap={self.total_cap}], got "
+                f"{self.target_gross}: a target past the hard cap would be a cap the "
+                "allocator plans to violate."
+            )
+        if self.deadband_min_notional < _ZERO or self.deadband_slot_fraction < _ZERO:
+            raise AllocationError("Deadband floors cannot be negative.")
+        if self.fractional and self.deadband_min_notional <= _ZERO:
+            raise AllocationError(
+                "A fractional policy must carry a positive deadband_min_notional: "
+                "without the whole-share floor there is no other no-trade band."
+            )
+        if self.policy_id == POLICY_FRACTIONAL_RESERVED_90 and (
+            not self.fractional or self.target_gross is None
+        ):
+            raise AllocationError(
+                f"{POLICY_FRACTIONAL_RESERVED_90} names a frozen fractional parameter "
+                "set; construct it through allocation_policy_for() rather than with "
+                "field defaults that would silently mean the legacy behaviour under "
+                "the new name."
+            )
+
+    @property
+    def budget_target(self) -> Decimal:
+        """The gross the budget is computed against: the target, else the cap."""
+        return self.target_gross if self.target_gross is not None else self.total_cap
 
     def to_json_dict(self) -> dict[str, object]:
-        """The policy as canonical JSON-able data. The basis of `config_hash`."""
+        """The policy as canonical JSON-able data. The basis of `config_hash`.
+
+        Legacy policies emit exactly the five fields the sizing study hashed,
+        so `C_RESERVED_UNIVERSE` still digests to `c47288c2...`. The fractional
+        policy emits its own complete parameter set - every constant that
+        changes its behaviour is in its hash.
+        """
+        if self.policy_id == POLICY_FRACTIONAL_RESERVED_90:
+            return {
+                "policy_id": self.policy_id,
+                "per_symbol_cap": str(self.per_symbol_cap),
+                "total_cap": str(self.total_cap),
+                "target_gross": str(self.budget_target),
+                "universe_size": self.universe_size,
+                "fractional": self.fractional,
+                "fractional_increment": str(FRACTIONAL_SHARE_INCREMENT),
+                "deadband_min_notional": str(self.deadband_min_notional),
+                "deadband_slot_fraction": str(self.deadband_slot_fraction),
+            }
         return {
             "policy_id": self.policy_id,
             "per_symbol_cap": str(self.per_symbol_cap),
@@ -152,17 +263,20 @@ def available_budget_fraction(
 ) -> Decimal:
     """The share of account equity this book may hold, given what else does.
 
-    ``max(0, total_cap - external)``. The external figure is every non-equity
-    position the account already carries - in this deployment, the crypto book -
-    measured against the same equity. Clamped at zero: a crypto position that
-    has drifted past the total ceiling on its own leaves the equity book with no
-    budget, not a negative one.
+    ``max(0, budget_target - external)``. The budget target is the total cap
+    for every legacy policy and `TARGET_ACCOUNT_GROSS` for the fractional
+    policy - the 90% aim, not the 95% hard cap, so the account-wide target is
+    equity budget plus non-equity exposure, never "the target plus crypto".
+    The external figure is every non-equity position the account already
+    carries, measured against the same equity. Clamped at zero: a non-equity
+    book that has drifted past the target on its own leaves the equity book
+    with no budget, not a negative one.
     """
     if external_exposure_fraction < _ZERO:
         raise AllocationError(
             f"external_exposure_fraction cannot be negative, got {external_exposure_fraction}."
         )
-    return max(_ZERO, policy.total_cap - external_exposure_fraction)
+    return max(_ZERO, policy.budget_target - external_exposure_fraction)
 
 
 def target_weights(
@@ -198,7 +312,11 @@ def target_weights(
 
     if policy.policy_id == POLICY_EQUAL_ACTIVE:
         weight = min(budget / Decimal(count), policy.per_symbol_cap)
-    elif policy.policy_id == POLICY_RESERVED_UNIVERSE:
+    elif policy.policy_id in (POLICY_RESERVED_UNIVERSE, POLICY_FRACTIONAL_RESERVED_90):
+        # One reserved slot per universe symbol, used while LONG and left idle
+        # while FLAT. The fractional policy is the same shape under its own
+        # constants: budget/N <= 9% sits below the 11% hard cap by design, so
+        # the min() is a guarantee rather than an active clamp.
         weight = min(budget / Decimal(policy.universe_size), policy.per_symbol_cap)
     elif policy.policy_id == POLICY_FIXED_PRO_RATA:
         desired_total = policy.fixed_target * Decimal(count)
@@ -224,6 +342,21 @@ def whole_shares(notional: Decimal, price: Decimal) -> Decimal:
     if notional <= _ZERO:
         return _ZERO
     return (notional / price).to_integral_value(rounding=ROUND_FLOOR)
+
+
+def fractional_shares(notional: Decimal, price: Decimal) -> Decimal:
+    """How many fractional shares `notional` buys at `price`, rounding **down**.
+
+    The fractional counterpart of `whole_shares`, floored to
+    `FRACTIONAL_SHARE_INCREMENT` for the same reason that one floors to an
+    integer: the broker must never be asked for more than the target justified,
+    and a target must be an exact quantity, not a division's repeating tail.
+    """
+    if price <= _ZERO:
+        raise AllocationError(f"Cannot size a target at a non-positive price {price}.")
+    if notional <= _ZERO:
+        return _ZERO
+    return (notional / price).quantize(FRACTIONAL_SHARE_INCREMENT, rounding=ROUND_FLOOR)
 
 
 @dataclass(frozen=True)
@@ -345,7 +478,11 @@ def plan_allocation(
                 )
             price = Decimal(price)
             notional = policy_notional(weight, account_equity)
-            target = whole_shares(notional, price)
+            target = (
+                fractional_shares(notional, price)
+                if policy.fractional
+                else whole_shares(notional, price)
+            )
         else:
             # A target of zero needs no price: the delta is the whole position.
             price = Decimal(reference_prices.get(symbol, _ZERO))
@@ -362,6 +499,21 @@ def plan_allocation(
         else:
             side = None
             delta = _ZERO
+
+        # The fractional deadband. The whole-share floor is the legacy no-trade
+        # band; fractional targets move with every tick, so an *adjustment* is
+        # an order only when it clears both floors. A LONG -> FLAT transition
+        # (weight zero against a held position) is exempt and always exits in
+        # full, and an entry from zero is its whole slot, which clears the
+        # relative floor trivially and the absolute one whenever the slot does.
+        if policy.fractional and side is not None and weight > _ZERO and price > _ZERO:
+            floor = max(
+                policy.deadband_min_notional,
+                policy.deadband_slot_fraction * notional,
+            )
+            if delta * price < floor:
+                side = None
+                delta = _ZERO
 
         allocations.append(
             SymbolAllocation(
@@ -390,6 +542,46 @@ def policy_notional(weight: Decimal, account_equity: Decimal) -> Decimal:
     return weight * account_equity
 
 
+def allocation_policy_for(policy_id: str) -> AllocationPolicy:
+    """The frozen parameter set a policy id names. The one construction path.
+
+    A legacy id gets the sizing study's exact configuration - defaults drawn
+    from the Risk Engine constants, hash-stable. The fractional id gets the
+    named constants above, so no caller can assemble it with a different cap
+    or a different deadband and still call it by this name.
+    """
+    if policy_id == POLICY_FRACTIONAL_RESERVED_90:
+        return AllocationPolicy(
+            policy_id=POLICY_FRACTIONAL_RESERVED_90,
+            per_symbol_cap=HARD_SYMBOL_GROSS_CAP,
+            total_cap=HARD_ACCOUNT_GROSS_CAP,
+            target_gross=TARGET_ACCOUNT_GROSS,
+            universe_size=RESERVED_EQUITY_SLOTS,
+            fractional=True,
+            deadband_min_notional=REBALANCE_MIN_ABSOLUTE_NOTIONAL,
+            deadband_slot_fraction=REBALANCE_MIN_SLOT_FRACTION,
+        )
+    return AllocationPolicy(policy_id=policy_id)
+
+
+def risk_policy_for(policy: AllocationPolicy) -> RiskPolicy:
+    """The Risk Engine limits an allocation policy is evaluated under.
+
+    The fractional policy carries the hard caps - 11% per symbol, 95% account-
+    wide - into Risk, where they are enforced against broker truth on every
+    order, both books counted. The daily-loss halt is **unchanged at 2%**:
+    raising exposure is not a reason to relax the halt, and this function has
+    no way to express a different value. Every legacy policy keeps the default
+    5%/30%/2% engine policy exactly as validated.
+    """
+    if policy.policy_id == POLICY_FRACTIONAL_RESERVED_90:
+        return RiskPolicy(
+            max_position_fraction=float(policy.per_symbol_cap),
+            max_total_exposure_fraction=float(policy.total_cap),
+        )
+    return DEFAULT_POLICY
+
+
 def external_exposure_fraction_from(
     *,
     account_equity: float | Decimal,
@@ -414,7 +606,15 @@ def external_exposure_fraction_from(
 
 __all__ = [
     "DEFAULT_FIXED_TARGET",
+    "FRACTIONAL_SHARE_INCREMENT",
+    "HARD_ACCOUNT_GROSS_CAP",
+    "HARD_SYMBOL_GROSS_CAP",
     "POLICY_EQUAL_ACTIVE",
+    "POLICY_FRACTIONAL_RESERVED_90",
+    "REBALANCE_MIN_ABSOLUTE_NOTIONAL",
+    "REBALANCE_MIN_SLOT_FRACTION",
+    "RESERVED_EQUITY_SLOTS",
+    "TARGET_ACCOUNT_GROSS",
     "WEIGHT_QUANTUM",
     "POLICY_FIXED_PRO_RATA",
     "POLICY_IDS",
@@ -423,10 +623,13 @@ __all__ = [
     "AllocationPlan",
     "AllocationPolicy",
     "SymbolAllocation",
+    "allocation_policy_for",
     "available_budget_fraction",
     "external_exposure_fraction_from",
+    "fractional_shares",
     "plan_allocation",
     "policy_notional",
+    "risk_policy_for",
     "target_weights",
     "whole_shares",
 ]

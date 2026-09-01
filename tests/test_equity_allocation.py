@@ -38,6 +38,7 @@ from autotrader.equity.allocation import (
     POLICY_RESERVED_UNIVERSE,
     AllocationError,
     AllocationPolicy,
+    allocation_policy_for,
     available_budget_fraction,
     external_exposure_fraction_from,
     plan_allocation,
@@ -58,7 +59,7 @@ EXTERNALS = (
     Decimal("0.45"),
 )
 
-ALL_POLICIES = tuple(AllocationPolicy(policy_id=policy_id) for policy_id in POLICY_IDS)
+ALL_POLICIES = tuple(allocation_policy_for(policy_id) for policy_id in POLICY_IDS)
 
 PRICES = {
     symbol: Decimal(price)
@@ -207,9 +208,11 @@ def test_no_weight_exceeds_the_per_symbol_cap_and_no_total_exceeds_the_account_c
 def test_an_external_book_that_has_eaten_the_whole_ceiling_leaves_no_budget(
     policy: AllocationPolicy,
 ) -> None:
-    """A crypto position past the total cap leaves zero budget, never a negative one."""
+    """A crypto position past the budget target leaves zero budget, never a negative one."""
     weights = target_weights(
-        policy, active_symbols=EQUITY_SYMBOLS, external_exposure_fraction=Decimal("0.45")
+        policy,
+        active_symbols=EQUITY_SYMBOLS,
+        external_exposure_fraction=policy.budget_target + Decimal("0.15"),
     )
     assert set(weights.values()) == {Decimal(0)}
 
