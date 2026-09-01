@@ -43,7 +43,12 @@ from enum import Enum
 import pandas as pd
 from studies.equity_eda1_sizing import STUDY_SYMBOLS
 
-from autotrader.equity.allocation import AllocationPolicy, target_weights, whole_shares
+from autotrader.equity.allocation import (
+    AllocationPolicy,
+    fractional_shares,
+    target_weights,
+    whole_shares,
+)
 from autotrader.research.costs import CostModel, Side
 from autotrader.research.metrics import EQUITY_15M, PerformanceMetrics, compute_metrics
 
@@ -72,6 +77,13 @@ class RebalanceRule(Enum):
     #: variant: act only when the target *weight* changes from the weight last
     #: acted on for that symbol, holding the share count constant in between.
     WEIGHT_CHANGE = "weight_change"
+
+    #: The fractional-policy rule: fractional share targets, and an adjustment
+    #: becomes an order only when it clears the policy's own deadband floors
+    #: (absolute dollars AND fraction of the reserved slot). A transition to
+    #: weight zero is exempt and always exits in full - the same exemption the
+    #: production allocator carries. Requires a policy with `fractional` set.
+    FRACTIONAL_DEADBAND = "fractional_deadband"
 
 
 @dataclass
@@ -326,6 +338,17 @@ def simulate(
                 elif rule is RebalanceRule.WEIGHT_CHANGE and weight == acted_weight[symbol]:
                     # Held constant between weight changes, by the L2 rule.
                     continue
+                elif rule is RebalanceRule.FRACTIONAL_DEADBAND:
+                    target = fractional_shares(weight * equity, mark)
+                    floor = max(
+                        policy.deadband_min_notional,
+                        policy.deadband_slot_fraction * weight * equity,
+                    )
+                    if abs(target - held[symbol]) * mark < floor:
+                        # Inside the deadband: not an order. The exemption for
+                        # weight zero is structural - that case took the branch
+                        # above and never reaches this floor.
+                        continue
                 else:
                     target = whole_shares(weight * equity, mark)
                 if target != held[symbol]:

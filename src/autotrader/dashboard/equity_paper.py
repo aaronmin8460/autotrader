@@ -33,7 +33,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from autotrader.equity import EQUITY_SYMBOLS
-from autotrader.equity.allocation import AllocationPolicy
+from autotrader.equity.allocation import AllocationPolicy, allocation_policy_for
 from autotrader.equity.paper import (
     EVENT_PAPER_CYCLE,
     EVENT_PAPER_PARITY_MISMATCH,
@@ -328,6 +328,14 @@ class ExposurePanel:
     equity_exposure_note: str
     per_symbol_cap: str
     total_account_cap: str
+    #: The gross the budget AIMS for, below the hard cap - for the fractional
+    #: policy 90% against the 95% cap; for legacy policies the two coincide.
+    target_account_gross: str
+    #: One hundred percent minus the target: what the policy deliberately
+    #: leaves in cash when nothing else competes for the account.
+    cash_reserve_target: str
+    #: Whether targets are fractional share quantities.
+    fractional_mode: bool
     daily_loss_halt: str
 
 
@@ -542,6 +550,9 @@ def build_exposure(
         ),
         per_symbol_cap=f"{policy.per_symbol_cap:%}",
         total_account_cap=f"{policy.total_cap:%}",
+        target_account_gross=f"{policy.budget_target:%}",
+        cash_reserve_target=f"{(1 - policy.budget_target):%}",
+        fractional_mode=bool(policy.fractional),
         daily_loss_halt="2%",
     )
 
@@ -654,13 +665,13 @@ def build_overview(
     resolved_policy = policy
     if resolved_policy is None and service.sizing_policy:
         try:
-            resolved_policy = AllocationPolicy(policy_id=service.sizing_policy)
+            resolved_policy = allocation_policy_for(service.sizing_policy)
         except Exception:  # noqa: BLE001 - an unknown policy name reads as unknown
             resolved_policy = None
     if resolved_policy is None:
         # The caps are the Risk Engine's whatever the page knows about the
         # policy, so an unreadable policy name never understates a ceiling.
-        resolved_policy = AllocationPolicy(policy_id="C_RESERVED_UNIVERSE")
+        resolved_policy = allocation_policy_for("C_RESERVED_UNIVERSE")
     crypto = read_crypto_exposure(
         crypto_path if crypto_path is not None else crypto_database_path()
     )
