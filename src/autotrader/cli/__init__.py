@@ -46,6 +46,11 @@ from typing import Annotated
 import typer
 
 from autotrader import __version__
+from autotrader.account.lock import (
+    AccountExecutionLock,
+    CompositeAccountLock,
+    account_lock_path_for,
+)
 from autotrader.backtest import (
     DEFAULT_INITIAL_CASH,
     STRATEGY_NAME,
@@ -72,7 +77,7 @@ from autotrader.equity import EQUITY_SYMBOLS, EQUITY_TIMEFRAME, EquityError
 from autotrader.equity.allocation import (
     POLICY_IDS,
     AllocationError,
-    AllocationPolicy,
+    allocation_policy_for,
 )
 from autotrader.equity.data import FEED as EQUITY_FEED
 from autotrader.equity.data import download_bars as download_equity_bars
@@ -112,7 +117,11 @@ from autotrader.equity.shadow import (
     ShadowIntegrityError,
 )
 from autotrader.execution import paper as paper_execution
-from autotrader.execution.equity import AlpacaMarketCalendar, execute_equity_paper_order
+from autotrader.execution.equity import (
+    AlpacaMarketCalendar,
+    execute_equity_paper_order,
+    fetch_open_paper_orders,
+)
 from autotrader.execution.models import ExecutionError, format_quantity, parse_quantity
 from autotrader.execution.paper import (
     AmbiguousSubmissionError,
@@ -1935,7 +1944,7 @@ def equity_paper(
 
     try:
         config = EquityPaperConfig(
-            policy=AllocationPolicy(policy_id=sizing_policy),
+            policy=allocation_policy_for(sizing_policy),
             stage=stage,
             safety_delay=timedelta(seconds=safety_delay),
             lookback_bars=lookback_bars,
@@ -1983,16 +1992,39 @@ def equity_paper(
                 account = fetch_paper_account_state(trading_client)
                 return account.equity, dict(fetch_paper_positions(trading_client))
 
+            def open_orders():
+                """The broker's open orders, for the in-flight-mutation guard."""
+                return fetch_open_paper_orders(trading_client)
+
+            # One account, two operational stores, two lock files that both
+            # mean "this account's order path". The other product's lock is
+            # taken read-only and FIRST, then this store's own - the fixed
+            # order that cannot deadlock, because the other product only ever
+            # takes its own. This restores the cross-service serialization the
+            # store split removed: while this runtime decides and submits, the
+            # other runtime's critical section waits, and vice versa.
+            shared_account_lock = CompositeAccountLock(
+                (
+                    AccountExecutionLock(account_lock_path_for(crypto_database), read_only=True),
+                    AccountExecutionLock(account_lock_path_for(database)),
+                )
+            )
+
             calendar = AlpacaMarketCalendar()
             runtime = EquityPaperRuntime(
                 connection,
                 market_data=ShadowEquityBars(calendar),
                 regime_data=RegimeEquityBars(calendar),
                 calendar=calendar,
-                gateway=AlpacaEquityPaperGateway(trading_client=trading_client),
+                gateway=AlpacaEquityPaperGateway(
+                    trading_client=trading_client,
+                    account_lock=shared_account_lock,
+                    policy=config.policy,
+                ),
                 parity=SqliteShadowParity(shadow_database),
                 config=config,
                 broker_state=broker_state,
+                open_orders=open_orders,
                 external_safety=SqliteExternalSafety(crypto_database),
                 shutdown=shutdown,
             )

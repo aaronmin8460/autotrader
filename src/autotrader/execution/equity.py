@@ -63,18 +63,19 @@ from alpaca.common.exceptions import APIError
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import AssetClass, AssetStatus, TimeInForce
+from alpaca.trading.enums import AssetClass, AssetStatus, QueryOrderStatus, TimeInForce
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.models import Asset
-from alpaca.trading.requests import GetCalendarRequest, MarketOrderRequest
+from alpaca.trading.requests import GetCalendarRequest, GetOrdersRequest, MarketOrderRequest
 
 from autotrader.account.budget import (
     EQUITY_EXECUTION_TRADING_CALLS,
     EXECUTION_MARKET_DATA_CALLS,
 )
 from autotrader.account.execution import account_execution_section
-from autotrader.account.lock import AccountExecutionLock
+from autotrader.account.lock import AccountExecutionLock, CompositeAccountLock
 from autotrader.equity import EQUITY_SYMBOLS, EquityError, normalize_symbol
+from autotrader.equity.allocation import FRACTIONAL_SHARE_INCREMENT
 from autotrader.equity.data import FEED, create_client
 from autotrader.equity.session import (
     MarketSession,
@@ -109,8 +110,9 @@ from autotrader.execution.paper import (
     require_tradable_account,
     resolve_daily_baseline_equity,
     submit_order_intent,
+    to_wire_quantity,
 )
-from autotrader.risk import RiskRequest, RiskSide, evaluate_risk
+from autotrader.risk import DEFAULT_POLICY, RiskPolicy, RiskRequest, RiskSide, evaluate_risk
 from autotrader.state import sqlite as state
 
 #: The only time in force Equity V0.2 sends.
@@ -131,6 +133,14 @@ MINIMUM_SHARE_QUANTITY = Decimal(1)
 
 #: The share quantum. Whole shares, so a quantity is quantized down to this.
 SHARE_INCREMENT = Decimal(1)
+
+#: The smallest notional the broker accepts for a fractional equity order, in
+#: USD. A broker-boundary fact like the crypto module's $10 floor, written down
+#: once: the broker does not report it in equity asset metadata. A **full
+#: exit** is exempt on this side - a position must always be closable, so a
+#: dust-sized close is attempted and a broker refusal of it is a definite,
+#: recorded rejection rather than a position this system silently keeps.
+MINIMUM_FRACTIONAL_ORDER_NOTIONAL = Decimal("1")
 
 #: How many extra days a calendar fetch reaches past what was asked for, so a
 #: runtime that asks about "today" every fifteen minutes does not re-ask the
@@ -169,6 +179,15 @@ class EquityAssetSpec:
     status: str
     tradable: bool
     fractionable: bool
+
+
+@dataclass(frozen=True)
+class OpenOrderRecord:
+    """One order the broker reports as open, as the mutation guard sees it."""
+
+    symbol: str
+    side: str
+    client_order_id: str
 
 
 @dataclass(frozen=True)
@@ -315,6 +334,38 @@ def require_market_open(client: TradingClient) -> MarketClock:
             "session."
         )
     return clock
+
+
+def fetch_open_paper_orders(client: TradingClient) -> tuple[OpenOrderRecord, ...]:
+    """Every order the broker currently reports as open, normalized. Read-only.
+
+    The mutation guard's source of truth. Any failure raises rather than
+    returning an empty tuple: "I could not list the open orders" and "there are
+    none" are different answers, and the caller treats the first as a reason to
+    submit nothing.
+    """
+    try:
+        orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
+    except APIError as error:
+        raise UnsupportedBrokerStateError(
+            f"Could not read the broker's open orders: {_api_error_text(error)}. "
+            "Nothing was submitted."
+        ) from None
+    except Exception as error:  # noqa: BLE001 - an unreadable answer must fail closed
+        raise UnsupportedBrokerStateError(
+            f"Could not read the broker's open orders: {type(error).__name__}. "
+            "Nothing was submitted."
+        ) from None
+    records = []
+    for order in orders or ():
+        records.append(
+            OpenOrderRecord(
+                symbol=str(getattr(order, "symbol", "")),
+                side=_enum_value(getattr(order, "side", "")),
+                client_order_id=str(getattr(order, "client_order_id", "")),
+            )
+        )
+    return tuple(records)
 
 
 def fetch_reference_price(client: StockHistoricalDataClient, symbol: str) -> float:
@@ -468,6 +519,59 @@ def normalize_share_quantity(quantity: Decimal, symbol: str) -> Decimal:
     return shares
 
 
+def normalize_fractional_share_quantity(
+    quantity: Decimal,
+    asset: EquityAssetSpec,
+    *,
+    reference_price: float,
+    side: OrderSide,
+    position_quantity: Decimal,
+) -> Decimal:
+    """Round `quantity` **down** to the fractional increment, or refuse it.
+
+    The fractional counterpart of `normalize_share_quantity`, and the one place
+    the fractional-order rules live:
+
+    - the asset must report itself **fractionable** right now - a policy that
+      requires fractional sizing must stop, naming the symbol, rather than
+      quietly fall back to whole shares the sizing was not computed for;
+    - rounding is always down, so the broker is never asked for more than risk
+      approved;
+    - an order worth less than `MINIMUM_FRACTIONAL_ORDER_NOTIONAL` is refused
+      locally before any broker request exists - except a SELL that closes the
+      whole position, which is always attempted: a floor that trapped an open
+      position would be a safety defect, exactly as the risk engine's exit
+      rules state.
+    """
+    if not asset.fractionable:
+        raise EquityAssetNotTradableError(
+            f"{asset.symbol} is not fractionable at the broker right now, and this "
+            "order was sized under a fractional policy. Nothing was submitted: "
+            "falling back to whole shares would send a quantity the sizing never "
+            "computed. Fractional activation requires every universe symbol to be "
+            "fractionable."
+        )
+    amount = require_quantity(quantity, "quantity")
+    shares = amount.quantize(FRACTIONAL_SHARE_INCREMENT, rounding=ROUND_FLOOR)
+    if shares <= _ZERO:
+        raise QuantityBelowMinimumError(
+            f"{format_quantity(amount)} {asset.symbol} rounds down to zero at the "
+            f"{format_quantity(FRACTIONAL_SHARE_INCREMENT)}-share increment. No order "
+            "was submitted."
+        )
+    full_exit = side is OrderSide.SELL and position_quantity > _ZERO and shares >= position_quantity
+    if not full_exit:
+        price = Decimal(str(require_reference_price(reference_price, "reference_price")))
+        if shares * price < MINIMUM_FRACTIONAL_ORDER_NOTIONAL:
+            raise QuantityBelowMinimumError(
+                f"{format_quantity(shares)} {asset.symbol} is worth less than the "
+                f"broker's ${format_quantity(MINIMUM_FRACTIONAL_ORDER_NOTIONAL)} "
+                "fractional-order minimum at the current price. No order was "
+                "submitted: rounding up would exceed what risk approved."
+            )
+    return shares
+
+
 def to_wire_shares(quantity: Decimal) -> float:
     """Render a whole-share quantity as the float the SDK's request field takes.
 
@@ -507,6 +611,27 @@ def build_equity_market_order_request(intent: OrderIntent) -> MarketOrderRequest
     )
 
 
+def build_fractional_equity_market_order_request(intent: OrderIntent) -> MarketOrderRequest:
+    """The fractional-quantity translation of an approved equity intent.
+
+    Identical to `build_equity_market_order_request` in every field except the
+    quantity conversion: `to_wire_quantity` carries an exact fractional Decimal
+    into the SDK's float field with the never-round-up guard the crypto path
+    already proved. `notional` is still never set - the quantity form is the
+    one that keeps sizing under the risk engine's authority, and the two forms
+    are never mixed in one order. DAY time in force is also what the broker
+    requires of a fractional order, so the equity boundary's existing lifetime
+    rule and the broker's fractional rule are the same rule here.
+    """
+    return MarketOrderRequest(
+        symbol=intent.symbol,
+        qty=to_wire_quantity(intent.approved_quantity),
+        side=AlpacaOrderSide.BUY if intent.side is OrderSide.BUY else AlpacaOrderSide.SELL,
+        time_in_force=EQUITY_ORDER_TIME_IN_FORCE,
+        client_order_id=intent.client_order_id,
+    )
+
+
 def _to_risk_side(side: OrderSide) -> RiskSide:
     """Translate an execution side into the risk engine's vocabulary."""
     return RiskSide.BUY if side is OrderSide.BUY else RiskSide.SELL
@@ -529,9 +654,18 @@ def execute_equity_paper_order(
     trading_enabled: bool = True,
     strategy_run_id: int | None = None,
     now: datetime | None = None,
-    account_lock: AccountExecutionLock | None = None,
+    account_lock: AccountExecutionLock | CompositeAccountLock | None = None,
+    risk_policy: RiskPolicy = DEFAULT_POLICY,
+    fractional: bool = False,
 ) -> PaperExecutionResult:
     """Run the full paper execution pipeline for one equity order.
+
+    `risk_policy` carries the ceilings this order is evaluated under - the
+    validated 5%/30% default, or the fractional policy's 11%/95% hard caps.
+    The daily-loss fraction inside it is never varied by any caller in this
+    repository. `fractional` selects the quantity normalization: the legacy
+    whole-share floor, or the fractional increment with the broker's $1 floor
+    and the fractionable-asset requirement.
 
     The order of operations is the safety contract, and it is C7's with one
     step inserted:
@@ -627,6 +761,7 @@ def execute_equity_paper_order(
                 requested_quantity=quantity,
             ),
             context,
+            risk_policy,
         )
 
         # Recorded from what the broker actually reports, before anything is
@@ -673,7 +808,16 @@ def execute_equity_paper_order(
                 **common,  # type: ignore[arg-type]
             )
 
-        share_quantity = normalize_share_quantity(decision.approved_quantity, asset.symbol)
+        if fractional:
+            share_quantity = normalize_fractional_share_quantity(
+                decision.approved_quantity,
+                asset,
+                reference_price=reference_price,
+                side=order_side,
+                position_quantity=held.quantity if held is not None else _ZERO,
+            )
+        else:
+            share_quantity = normalize_share_quantity(decision.approved_quantity, asset.symbol)
 
         intent = OrderIntent(
             symbol=ticker,
@@ -718,7 +862,11 @@ def execute_equity_paper_order(
             intent,
             order_intent_id,
             now=moment,
-            build_request=build_equity_market_order_request,
+            build_request=(
+                build_fractional_equity_market_order_request
+                if fractional
+                else build_equity_market_order_request
+            ),
         )
         snapshot = submission.snapshot
         prefix = (
@@ -757,6 +905,7 @@ def equity_positions(
 __all__ = [
     "CALENDAR_FETCH_PAD_DAYS",
     "EQUITY_ORDER_TIME_IN_FORCE",
+    "MINIMUM_FRACTIONAL_ORDER_NOTIONAL",
     "MINIMUM_SHARE_QUANTITY",
     "REFERENCE_PRICE_FEED",
     "SHARE_INCREMENT",
@@ -767,16 +916,20 @@ __all__ = [
     "MarketClock",
     "MarketClosedError",
     "MarketSession",
+    "OpenOrderRecord",
     "PaperAccountState",
     "UnsupportedBrokerStateError",
     "build_equity_market_order_request",
+    "build_fractional_equity_market_order_request",
     "create_market_data_client",
     "equity_positions",
     "execute_equity_paper_order",
     "fetch_equity_asset",
     "fetch_market_clock",
+    "fetch_open_paper_orders",
     "fetch_reference_price",
     "market_date",
+    "normalize_fractional_share_quantity",
     "normalize_share_quantity",
     "require_market_open",
     "to_wire_shares",

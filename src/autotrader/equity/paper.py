@@ -84,6 +84,7 @@ from autotrader.equity.allocation import (
     SymbolAllocation,
     external_exposure_fraction_from,
     plan_allocation,
+    risk_policy_for,
 )
 from autotrader.equity.regime import (
     EDA1_ENGINE_VERSION,
@@ -114,6 +115,7 @@ from autotrader.equity.shadow import (
 )
 from autotrader.execution.equity import (
     MarketClosedError,
+    OpenOrderRecord,
     equity_positions,
     execute_equity_paper_order,
 )
@@ -211,6 +213,7 @@ class Disposition(Enum):
     UNRESOLVED_INTENT = "UNRESOLVED_INTENT"
     MARKET_CLOSED = "MARKET_CLOSED"
     ACCOUNT_UNSAFE = "ACCOUNT_UNSAFE"
+    EXTERNAL_ORDER_OPEN = "EXTERNAL_ORDER_OPEN"
     FAILED = "FAILED"
     NO_DECISION = "NO_DECISION"
 
@@ -591,11 +594,18 @@ class AlpacaEquityPaperGateway:
     """The real gateway: the validated equity execution boundary, unchanged.
 
     Deliberately thin. Every safety step - the account read, the position read,
-    the short refusal, the risk evaluation, the whole-share floor, the broker
+    the short refusal, the risk evaluation, the quantity floor, the broker
     clock gate, the durable intent before the request, the exactly-once
     submission, the never-retry-an-ambiguous-outcome rule - belongs to
     `execute_equity_paper_order` and is not re-implemented, re-ordered or
     relaxed here.
+
+    `policy` selects the Risk limits and the quantity form for every order this
+    gateway submits: the legacy policies keep the validated whole-share
+    5%/30% path bit for bit, and the fractional policy carries its 11%/95%
+    hard caps and fractional normalization into the boundary. Deriving both
+    from the one policy object here is what makes it impossible to run
+    fractional sizing under the legacy caps or vice versa.
     """
 
     def __init__(
@@ -604,10 +614,12 @@ class AlpacaEquityPaperGateway:
         trading_client: object | None = None,
         data_client: object | None = None,
         account_lock: object | None = None,
+        policy: AllocationPolicy | None = None,
     ) -> None:
         self._trading_client = trading_client
         self._data_client = data_client
         self._account_lock = account_lock
+        self._policy = policy
 
     def execute(
         self,
@@ -619,6 +631,10 @@ class AlpacaEquityPaperGateway:
         now: datetime,
         strategy_run_id: int | None,
     ) -> PaperExecutionResult:
+        fractional = bool(self._policy.fractional) if self._policy is not None else False
+        kwargs: dict[str, object] = {}
+        if self._policy is not None:
+            kwargs["risk_policy"] = risk_policy_for(self._policy)
         return execute_equity_paper_order(
             connection,
             symbol=symbol,
@@ -629,6 +645,8 @@ class AlpacaEquityPaperGateway:
             now=now,
             strategy_run_id=strategy_run_id,
             account_lock=self._account_lock,  # type: ignore[arg-type]
+            fractional=fractional,
+            **kwargs,  # type: ignore[arg-type]
         )
 
 
@@ -653,6 +671,20 @@ def require_paper_account(client: object) -> str:
             "namespace prefix. Nothing was fetched and no order was submitted."
         )
     return number
+
+
+def foreign_open_order_symbols(
+    open_orders: tuple[OpenOrderRecord, ...],
+) -> tuple[str, ...]:
+    """The broker symbols carrying an open order, normalized for matching.
+
+    By the time this guard runs the local store holds zero unresolved intents,
+    so *every* open order at the broker is exposure in flight that this cycle's
+    account read cannot see settled - the other product's, an operator's, or a
+    slow fill of this system's own DAY order. Which one it is does not change
+    the safe answer.
+    """
+    return tuple(sorted({broker_symbol_key(order.symbol) for order in open_orders}))
 
 
 def non_equity_exposure(positions: Mapping[str, object]) -> float:
@@ -700,6 +732,7 @@ class EquityPaperRuntime:
         parity: ShadowParitySource,
         config: EquityPaperConfig,
         broker_state: Callable[[], tuple[float, dict[str, object]]],
+        open_orders: Callable[[], tuple[OpenOrderRecord, ...]] | None = None,
         external_safety: ExternalSafetySource | None = None,
         checkpoint: ProcessedBarCheckpoint | None = None,
         regime_spec: ParticipationSpec | None = None,
@@ -717,6 +750,7 @@ class EquityPaperRuntime:
         self._gateway = gateway
         self._parity = parity
         self._broker_state = broker_state
+        self._open_orders = open_orders
         self._external_safety = external_safety
         self._checkpoint: ProcessedBarCheckpoint = (
             checkpoint if checkpoint is not None else SqliteCheckpoint(connection)
@@ -832,6 +866,8 @@ class EquityPaperRuntime:
             sizing_config_hash=policy.config_hash(),
             per_symbol_cap=str(policy.per_symbol_cap),
             total_cap=str(policy.total_cap),
+            target_gross=str(policy.budget_target),
+            fractional=policy.fractional,
             lookback_bars=self._config.lookback_bars,
             state_sessions=self._config.state_sessions,
             code_sha=self._config.code_sha,
@@ -1477,6 +1513,50 @@ class EquityPaperRuntime:
             )
             return
 
+        # The open-order guard. The store is clean of unresolved intents (the
+        # gate above), so any order the broker reports open is exposure in
+        # flight this cycle's snapshot cannot see settled: no BUY may be sized
+        # over it, and no SELL may stack onto a symbol that carries one. An
+        # unreadable answer blocks everything - "I could not check" is not
+        # "there are none".
+        buy_block_reason: str | None = None
+        sell_blocked: tuple[str, ...] = ()
+        if self._open_orders is not None:
+            try:
+                open_orders = self._open_orders()
+            except Exception as error:  # noqa: BLE001 - an unreadable answer fails closed
+                reason = (
+                    f"The broker's open-order list could not be read "
+                    f"({type(error).__name__}: {error}); no mutation is safe while the "
+                    "set of in-flight orders is unknown."
+                )
+                for outcome in tradable:
+                    outcome.disposition = Disposition.EXTERNAL_ORDER_OPEN
+                    outcome.message = reason
+                log_event(
+                    self._logger,
+                    "open_order_guard_unreadable",
+                    level=logging.ERROR,
+                    detail=reason,
+                )
+                return
+            if open_orders:
+                sell_blocked = foreign_open_order_symbols(open_orders)
+                buy_block_reason = (
+                    f"{len(open_orders)} order(s) are open at the broker "
+                    f"({', '.join(sell_blocked)}) while this store holds no unresolved "
+                    "intent, so they are exposure in flight this snapshot cannot see "
+                    "settled. No BUY is sized over them; SELLs proceed except on the "
+                    "symbols that carry one."
+                )
+                log_event(
+                    self._logger,
+                    "open_order_guard_engaged",
+                    level=logging.WARNING,
+                    open_symbols=",".join(sell_blocked),
+                    detail=buy_block_reason,
+                )
+
         account_equity, positions = self._broker_state()
         external = external_exposure_fraction_from(
             account_equity=account_equity,
@@ -1535,6 +1615,21 @@ class EquityPaperRuntime:
                 outcome.target_weight = _ZERO
                 outcome.target_quantity = _ZERO
                 outcome.actual_quantity = actual.get(outcome.symbol, _ZERO)
+                continue
+            if allocation.orders and (
+                (allocation.side is OrderSide.BUY and buy_block_reason is not None)
+                or broker_symbol_key(outcome.symbol) in sell_blocked
+            ):
+                outcome.disposition = Disposition.EXTERNAL_ORDER_OPEN
+                outcome.target_weight = allocation.target_weight
+                outcome.target_quantity = allocation.target_quantity
+                outcome.actual_quantity = allocation.actual_quantity
+                outcome.delta_quantity = allocation.delta_quantity
+                outcome.side = allocation.side.value if allocation.side is not None else None
+                outcome.message = buy_block_reason or (
+                    f"An order is open at the broker for {outcome.symbol}; no second "
+                    "mutation is stacked onto it."
+                )
                 continue
             self._apply(outcome, allocation, moment, report)
 
@@ -1785,9 +1880,11 @@ __all__ = [
     "NotPaperAccountError",
     "PaperIntegrityError",
     "ParityRecord",
+    "OpenOrderRecord",
     "ShadowParitySource",
     "SqliteShadowParity",
     "SymbolOutcome",
+    "foreign_open_order_symbols",
     "non_equity_exposure",
     "require_paper_account",
 ]

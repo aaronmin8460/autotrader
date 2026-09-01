@@ -144,6 +144,7 @@ def make_asset(
     asset_class: str = "us_equity",
     status: AssetStatus = AssetStatus.ACTIVE,
     tradable: bool = True,
+    fractionable: bool = True,
 ) -> Asset:
     """An Alpaca `Asset` shaped exactly as the equity endpoint returns one.
 
@@ -160,7 +161,7 @@ def make_asset(
         marginable=True,
         shortable=True,
         easy_to_borrow=True,
-        fractionable=True,
+        fractionable=fractionable,
     )
 
 
@@ -320,7 +321,10 @@ def run_execution(
     price: float | None = REFERENCE_PRICE,
     dry_run: bool = False,
     now: datetime = T0,
+    fractional: bool = False,
+    risk_policy=None,
 ):
+    extra = {} if risk_policy is None else {"risk_policy": risk_policy}
     return execute_equity_paper_order(
         connection,
         symbol=symbol,
@@ -330,6 +334,8 @@ def run_execution(
         data_client=FakeDataClient(price),  # type: ignore[arg-type]
         dry_run=dry_run,
         now=now,
+        fractional=fractional,
+        **extra,
     )
 
 

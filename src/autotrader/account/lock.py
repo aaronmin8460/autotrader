@@ -121,11 +121,25 @@ class AccountExecutionLock:
         timeout_seconds: float = DEFAULT_ACCOUNT_LOCK_TIMEOUT_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        read_only: bool = False,
     ) -> None:
+        """`read_only` takes the same exclusive kernel lock through a read-only
+        descriptor on a file that must already exist.
+
+        This is how one service contends on *another* service's lock file: the
+        peer's store directory is mounted read-only into this one's sandbox, so
+        the file can be opened but never created, truncated, or written. The
+        `flock` primitive does not care - an exclusive lock on a read-only
+        descriptor excludes the peer's writable one identically. A file that is
+        missing or unreadable **fails closed**: "I could not contend with the
+        other service" and "there is no other service" are different answers,
+        and only one of them may precede an order.
+        """
         if timeout_seconds < 0:
             raise ValueError(f"timeout_seconds must not be negative, got {timeout_seconds}.")
         self.path = Path(path)
         self.timeout_seconds = timeout_seconds
+        self.read_only = read_only
         self._sleep = sleep
         self._monotonic = monotonic
         self._descriptor: int | None = None
@@ -147,8 +161,21 @@ class AccountExecutionLock:
             self._depth += 1
             return
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+        if self.read_only:
+            try:
+                descriptor = os.open(self.path, os.O_RDONLY)
+            except OSError as error:
+                raise AccountExecutionLockError(
+                    f"The peer account execution lock {self.path} could not be opened "
+                    f"read-only ({error.strerror or error}). Cross-service order "
+                    "serialization cannot be proven without it, so nothing was "
+                    "submitted. The peer service creates this file on its first "
+                    "execution; a missing file means the peer's store path is wrong "
+                    "or its boundary has never run."
+                ) from None
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
         deadline = self._monotonic() + self.timeout_seconds
         while True:
             try:
@@ -172,10 +199,13 @@ class AccountExecutionLock:
                 continue
             break
 
-        # Written for a human reading the file, never read back as authority -
-        # the lock itself is the authority.
-        os.ftruncate(descriptor, 0)
-        os.write(descriptor, f"{os.getpid()}\n".encode())
+        if not self.read_only:
+            # Written for a human reading the file, never read back as
+            # authority - the lock itself is the authority. A read-only holder
+            # cannot write and does not need to: the peer's own PID note is
+            # simply left in place.
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, f"{os.getpid()}\n".encode())
         self._descriptor = descriptor
         self._depth = 1
 
@@ -209,6 +239,74 @@ class AccountExecutionLock:
         traceback: TracebackType | None,
     ) -> None:
         """Always release, including when the body raised."""
+        self.release()
+
+
+class CompositeAccountLock:
+    """Several account execution locks held as one, in one fixed order.
+
+    Exists for the split-store deployment: one broker account, two operational
+    stores, and therefore two lock files that both mean "this account's order
+    path". A runtime that must exclude the *other* service takes the peer's
+    lock and then its own, always in the order the constructor received them,
+    and releases in reverse. The peer never takes this side's lock, so the
+    fixed order cannot form a cycle.
+
+    Acquisition is all-or-nothing: a failure on the second lock releases the
+    first before the error propagates, so a refused critical section leaves
+    nothing held.
+    """
+
+    def __init__(self, locks: tuple[AccountExecutionLock, ...]) -> None:
+        if not locks:
+            raise ValueError("CompositeAccountLock needs at least one lock.")
+        self._locks = tuple(locks)
+        self._depth = 0
+
+    @property
+    def held(self) -> bool:
+        """Whether this object currently holds every constituent lock."""
+        return self._depth > 0
+
+    @property
+    def locks(self) -> tuple[AccountExecutionLock, ...]:
+        return self._locks
+
+    def acquire(self) -> None:
+        if self._depth > 0:
+            self._depth += 1
+            return
+        taken: list[AccountExecutionLock] = []
+        try:
+            for lock in self._locks:
+                lock.acquire()
+                taken.append(lock)
+        except BaseException:
+            for lock in reversed(taken):
+                lock.release()
+            raise
+        self._depth = 1
+
+    def release(self) -> None:
+        if self._depth == 0:
+            return
+        if self._depth > 1:
+            self._depth -= 1
+            return
+        self._depth = 0
+        for lock in reversed(self._locks):
+            lock.release()
+
+    def __enter__(self) -> CompositeAccountLock:
+        self.acquire()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         self.release()
 
 
@@ -247,6 +345,7 @@ __all__ = [
     "DEFAULT_ACCOUNT_LOCK_TIMEOUT_SECONDS",
     "AccountExecutionLock",
     "AccountExecutionLockError",
+    "CompositeAccountLock",
     "account_execution_lock",
     "account_lock_path_for",
     "database_path_of",

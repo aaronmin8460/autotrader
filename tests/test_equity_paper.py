@@ -263,6 +263,8 @@ def build_paper(
     clock: FakeClock | None = None,
     calendar: FakeCalendar | None = None,
     bars: FakeEquityBars | None = None,
+    policy: AllocationPolicy | None = None,
+    open_orders=None,
 ) -> EquityPaperRuntime:
     return EquityPaperRuntime(
         connection,
@@ -274,12 +276,13 @@ def build_paper(
         external_safety=external if external is not None else SafeExternal(),
         regime_spec=FIXTURE_SPEC,
         config=EquityPaperConfig(
-            policy=POLICY,
+            policy=policy if policy is not None else POLICY,
             stage=stage,
             require_parity=require_parity,
             parity_price_tolerance=parity_price_tolerance,
         ),
         broker_state=broker if broker is not None else FakeBrokerState(),
+        open_orders=open_orders,
         clock=clock if clock is not None else FakeClock(),
         sleep=lambda seconds: None,
         shutdown=ShutdownRequest(),
