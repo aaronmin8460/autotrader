@@ -91,10 +91,17 @@ def build_context(
     return context
 
 
+def membership_for(context: UniverseContext, rule: str):
+    """Membership + slot count for a rule name; `ALL` = full universe."""
+    if rule == "ALL":
+        members = {session: tuple(context.universe) for session in context.sessions}
+        return members, len(context.universe)
+    return selection_rules(context)[rule], int(rule.rsplit("top", 1)[1])
+
+
 def run_combo(universe_name: str, rule: str, allocator: str) -> None:
     context = build_context(universe_name, regime="b1")
-    membership = selection_rules(context)[rule]
-    top_n = int(rule.rsplit("top", 1)[1])
+    membership, top_n = membership_for(context, rule)
     weights = weights_for(context, membership, allocator, top_n)
     payload = {
         "universe": context.universe,
@@ -142,8 +149,7 @@ def run_attack(
         context.participate = {
             row["session"]: bool(row["participate"]) for _, row in series.iterrows()
         }
-    membership = selection_rules(context)[rule]
-    top_n = int(rule.rsplit("top", 1)[1])
+    membership, top_n = membership_for(context, rule)
     weights = weights_for(context, membership, allocator, top_n)
     tag = "_".join(
         filter(
