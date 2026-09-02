@@ -17,7 +17,7 @@ from typing import Annotated, Any
 
 from fastapi import FastAPI, Query
 
-from autotrader.dashboard import account_orders, equity_paper, service_units
+from autotrader.dashboard import account_orders, equity_paper, realized_pnl, service_units
 
 #: Loopback only, and not configurable here. Making "listen on every interface"
 #: a one-flag decision is how an unauthenticated internal tool ends up on a
@@ -165,6 +165,70 @@ def create_app() -> FastAPI:
             now=datetime.now(UTC),
             limit=limit,
         )
+
+    # ----------------------------------------------------------------------
+    # Realized P&L
+    #
+    # Accounting, served from a store no trading process writes and this
+    # process cannot write either. Reads only, like everything else here, but
+    # with one extra property worth stating: these routes describe a ledger
+    # that is subordinate to the broker. When the two disagree the payload's
+    # `status` says `MISMATCH` or `UNKNOWN`, and a renderer must show that
+    # rather than the figures beside it.
+    # ----------------------------------------------------------------------
+
+    @application.get(f"{_API_PREFIX}/realized-pnl/summary", tags=["realized-pnl"])
+    def realized_pnl_summary() -> realized_pnl.RealizedPnlPanel:
+        """Realized trade P&L today and since tracking started, with status.
+
+        Not the daily account P&L, which is account equity against the stored
+        UTC-day baseline and belongs to the risk engine; not unrealized P&L,
+        which is the broker's figure over broker positions. Three different
+        measurements, and `components_are_independent` says on the wire that
+        they are not required to sum.
+        """
+        return realized_pnl.build_panel(now=datetime.now(UTC))
+
+    @application.get(f"{_API_PREFIX}/realized-pnl/by-symbol", tags=["realized-pnl"])
+    def realized_pnl_by_symbol() -> dict[str, Any]:
+        """Per-symbol realized totals joined to the cost basis the ledger holds."""
+        return {"symbols": realized_pnl.build_by_symbol(now=datetime.now(UTC))}
+
+    @application.get(f"{_API_PREFIX}/realized-pnl/events", tags=["realized-pnl"])
+    def realized_pnl_events(
+        symbol: Annotated[
+            str | None, Query(description="Restrict to one symbol.", max_length=16)
+        ] = None,
+        limit: Annotated[
+            int,
+            Query(
+                ge=1,
+                le=realized_pnl.MAX_EVENT_LIMIT,
+                description="Realized events to return, newest first.",
+            ),
+        ] = realized_pnl.DEFAULT_EVENT_LIMIT,
+    ) -> dict[str, Any]:
+        """Realized events, newest first. One row per broker-confirmed sale.
+
+        Deliberately *events*, not trades. This book trims on drift, so a
+        symbol can produce many sales without closing anything, and round-trip
+        trade boundaries are not something this system defines.
+        """
+        key = symbol.strip().upper() if symbol else None
+        return {"events": realized_pnl.build_events(symbol=key, limit=limit)}
+
+    @application.get(f"{_API_PREFIX}/realized-pnl/status", tags=["realized-pnl"])
+    def realized_pnl_status() -> dict[str, Any]:
+        """The accounting horizon and the ledger-against-broker verdict."""
+        return {
+            "status": realized_pnl.build_status(),
+            "reconciliation": realized_pnl.build_reconciliation(),
+        }
+
+    @application.get(f"{_API_PREFIX}/symbols/{{symbol}}/realized-pnl", tags=["realized-pnl"])
+    def symbol_realized_pnl(symbol: str) -> realized_pnl.SymbolRealizedPanel:
+        """One symbol's realized totals and its realized-event history."""
+        return realized_pnl.build_symbol_panel(symbol, now=datetime.now(UTC))
 
     return application
 
