@@ -589,6 +589,55 @@ def test_decimal_text_never_uses_exponent_notation() -> None:
     assert store.decimal_text(Decimal("1E-9")) == "0.000000001"
 
 
+def test_the_ledger_is_readable_when_nothing_is_writing_it(tmp_path: Path) -> None:
+    """The production defect this pins, exactly.
+
+    The dashboard reader runs under `ProtectSystem=strict` with no write access
+    to the ledger's directory. A WAL database cannot be opened read-only unless
+    a `-shm` side file already exists, and creating one needs that write
+    access - so under WAL the API could read the ledger only during the few
+    seconds every five minutes that the writer was running, and reported it
+    unreadable the rest of the time.
+
+    Two assertions, because either alone would pass under a configuration that
+    breaks in production: no side files survive the writer closing, and a
+    read-only open works with none present.
+    """
+    path = tmp_path / "ledger.db"
+    with store.connect(path) as connection:
+        store.initialize(connection)
+        store.record_fill(connection, fill("e1", SIDE_BUY, "10", "100"), now=T0)
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].upper() != "WAL"
+
+    leftovers = [
+        candidate.name
+        for candidate in tmp_path.iterdir()
+        if candidate.name.startswith("ledger.db-")
+    ]
+    assert leftovers == [], leftovers
+
+    with store.connect_read_only(path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM accounting_fills").fetchone()[0] == 1
+
+
+def test_a_ledger_left_in_wal_by_an_older_build_is_converted_on_open(
+    tmp_path: Path,
+) -> None:
+    """Opening for writing repairs the mode, so no manual migration is needed."""
+    path = tmp_path / "ledger.db"
+    legacy = sqlite3.connect(path)
+    legacy.execute("PRAGMA journal_mode = WAL").fetchone()
+    legacy.execute("CREATE TABLE placeholder (id INTEGER PRIMARY KEY)")
+    legacy.commit()
+    legacy.close()
+
+    with store.connect(path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].upper() == "DELETE"
+
+    assert not (tmp_path / "ledger.db-wal").exists()
+    assert not (tmp_path / "ledger.db-shm").exists()
+
+
 def test_the_read_only_connection_cannot_write(tmp_path: Path) -> None:
     path = tmp_path / "ledger.db"
     with store.connect(path) as connection:

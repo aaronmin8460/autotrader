@@ -175,7 +175,19 @@ that only understands the version it was installed at.
 | `accounting_reconciliation_runs` / `_symbols` | one row per pass / per symbol |
 
 `accounting_fills` and `realized_pnl_events` have no UPDATE path in the module
-at all. Recording a fill, writing its realized event and advancing the cost
+at all.
+
+**A rollback journal, not WAL** — the one place this store departs from the
+operational stores' convention, and it is deliberate. A `mode=ro` connection to
+a WAL database must *create* the `-shm` side file when no writer is holding
+one, which needs write access to the directory. The dashboard reader runs under
+`ProtectSystem=strict` with no write access there, so under WAL it could read
+the ledger only during the few seconds every five minutes that the writer was
+running, and correctly reported `DATABASE_UNREADABLE` the rest of the time.
+WAL's benefit — concurrent reads during a write — is worth nothing at a
+five-minute write cadence, and its cost here was the reader. Opening for
+writing sets the mode on every connection, so a ledger created under WAL by an
+older build is converted in place with no manual migration. Recording a fill, writing its realized event and advancing the cost
 basis are one `BEGIN IMMEDIATE`: a crash between them leaves none of them, so a
 fill can never exist without the state transition it caused.
 

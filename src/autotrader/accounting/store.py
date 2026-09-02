@@ -21,6 +21,23 @@ read back with `Decimal(text)`, which round-trips exactly. The CHECK
 constraints CAST to REAL, which is a coarse guard against a writer that
 bypassed this module storing something absurd - the cast is not the value.
 
+**A rollback journal, not WAL** - the one place this store deliberately
+departs from the operational stores' convention. A `mode=ro` connection to a
+WAL database has to *create* the `-shm` side file if no writer is currently
+holding one, which needs write access to the directory. The dashboard reader
+is a least-privilege process under `ProtectSystem=strict` with no write access
+to the ledger's directory, so under WAL it could read the ledger only while a
+writer happened to be running - which is a few seconds in every five minutes.
+It failed closed and reported the ledger unreadable the rest of the time,
+which is the correct behaviour for a wrong configuration and not a
+configuration to keep.
+
+WAL buys concurrent reads during a write. Here the writer is a oneshot that
+runs for about a second every five minutes and the reader polls every thirty,
+so that is worth approximately nothing, and it costs the reader the ability to
+open the file at all. A rollback journal needs no side file, so the read-only
+viewer works whether or not anything is writing.
+
 **Append-only where it matters.** `accounting_fills` and
 `realized_pnl_events` have no UPDATE path in this module at all.
 `position_cost_basis` is derived current state and is rewritten as the ledger
@@ -328,14 +345,27 @@ _TABLE_NAMES: tuple[str, ...] = (
 # --------------------------------------------------------------------------
 
 
+#: The ledger's journal mode. **Not** WAL - see the module docstring. A
+#: read-only connection must be able to open this file when nothing is writing
+#: it, and a WAL database cannot be opened read-only without creating a side
+#: file the least-privilege reader is not allowed to create.
+JOURNAL_MODE = "DELETE"
+
+
 @contextmanager
 def connect(path: str | Path) -> Iterator[sqlite3.Connection]:
-    """Open the accounting database with foreign keys, WAL and a busy timeout."""
+    """Open the accounting database for writing: foreign keys, journal, timeout.
+
+    Setting `journal_mode` on every connection, rather than once at creation,
+    is what converts a ledger that was created under WAL by an older build -
+    and would therefore be unreadable by the dashboard - back to a mode the
+    reader can open. The pragma checkpoints and removes the side files.
+    """
     connection = sqlite3.connect(Path(path), isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000)
     try:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL").fetchone()
+        connection.execute(f"PRAGMA journal_mode = {JOURNAL_MODE}").fetchone()
         connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         yield connection
     finally:
@@ -348,7 +378,9 @@ def connect_read_only(path: str | Path) -> Iterator[sqlite3.Connection]:
 
     A viewer opening this file must not be able to create it, migrate it or
     write to it, so it gets a `mode=ro` URI and `query_only`, not the helper
-    above with good intentions.
+    above with good intentions. That is the reason the ledger does not use
+    WAL: this connection has to work when the writer is not running, from a
+    process with no write access to the directory the file is in.
     """
     uri = f"file:{quote(str(Path(path).resolve()))}?mode=ro"
     connection = sqlite3.connect(
@@ -803,6 +835,7 @@ def high_water_mark(connection: sqlite3.Connection) -> str | None:
 
 __all__ = [
     "ACCOUNTING_SCHEMA_VERSION",
+    "JOURNAL_MODE",
     "FILL_SOURCES",
     "RECON_CLEAN",
     "RECON_DEGRADED",
