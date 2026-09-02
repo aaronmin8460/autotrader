@@ -1,0 +1,96 @@
+# AutoTrader EQUITY A1-B SHADOW - frozen A1-B U30 allocation, OBSERVATION ONLY.
+#
+# This unit starts a process that CANNOT submit, cancel or replace an order.
+# That is not a configuration of this file; it is a property of the program.
+# `autotrader equity-a1b-shadow` holds no execution path: its runtime
+# constructor takes no gateway, its module imports nothing from the execution
+# layer or the broker trading SDK, its observation table refuses any non-NULL
+# order linkage by CHECK constraint, and after every cycle it re-verifies that
+# its database holds zero order intents and stops if that is ever untrue.
+#
+# Defence in depth, in the four places it can be placed:
+#
+#   1. the program      - no execution seam to disable (source-pinned tests)
+#   2. this unit        - loads NO activation file; there is no
+#                         AUTOTRADER_PAPER_TRADING_ENABLED and no
+#                         --confirm-paper token anywhere in ExecStart
+#   3. the identity     - runs as `ata1bshadow`, which cannot read any
+#                         trading activation or secrets file and cannot open
+#                         the trading, paper, crypto, or sibling-shadow
+#                         databases
+#   4. the database     - its own file, which the program refuses if it has
+#                         ever held an order intent, and whose mark states it
+#                         refuses if they were computed under another policy
+#
+# Deliberately a NEW unit beside — never a modification of — the validated
+# `autotrader-equity-shadow.service` (V3 + EDA-1). The two observers answer
+# different research questions and share nothing writable.
+
+[Unit]
+Description=A1-B U30 Equity Shadow - ZERO ORDER MUTATION
+After=network-online.target
+Wants=network-online.target
+
+# An unconfigured host is an unfinished install, not a crash to retry.
+ConditionPathExists=/etc/autotrader/autotrader-a1b-shadow.env
+ConditionPathExists=/opt/autotrader-equity-a1b-shadow/venv/bin/autotrader
+
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ata1bshadow
+Group=ata1bshadow
+WorkingDirectory=/opt/autotrader-equity-a1b-shadow/app
+
+# Two files, and there is no third. The trading runtimes read a third -
+# autotrader.trading.env, the activation file - and its absence here is the
+# point: there is no gate to open because there is nothing to authorize.
+EnvironmentFile=/etc/autotrader/autotrader-a1b-shadow.env
+EnvironmentFile=/etc/autotrader/autotrader-a1b-shadow.secrets.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+ExecStart=/opt/autotrader-equity-a1b-shadow/venv/bin/autotrader equity-a1b-shadow --db ${AUTOTRADER_EQUITY_A1B_SHADOW_DB}
+
+# Exit 0 is a clean stop (including a closed market), exit 1 is a controlled
+# refusal or a fatal failure and is worth a bounded retry.
+# RestartPreventExitStatus=2 is kept for the same reason the sibling keeps it:
+# a future exit-code change must not turn a safety halt into a retry loop.
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+
+StateDirectory=autotrader-equity-a1b-shadow
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity-a1b-shadow
+
+[Install]
+WantedBy=multi-user.target
