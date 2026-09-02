@@ -20,18 +20,22 @@
 import { useCallback, useMemo, useState } from "react";
 
 import { PaperExposure, PaperHeaderStrip, PaperOrders, PaperRegime, PaperSafety, TargetVsActual } from "@/components/EquityPaper";
+import { RealizedStrip } from "@/components/RealizedPnl";
 import { Footer, Nav } from "@/components/Nav";
 import { SymbolDetail } from "@/components/SymbolDetail";
 import { useOverview } from "@/lib/api";
 import { useChartBatch, type ChartRange } from "@/lib/charts";
 import { useAccountOrders } from "@/lib/orders";
 import { PAPER_POLL_INTERVAL_MS, usePaperOverview } from "@/lib/paper";
+import { realizedBySymbol } from "@/lib/pnl";
+import { useRealizedPnl } from "@/lib/realized";
 import { equityOf, targetVsActual } from "@/lib/portfolio";
 
 export default function EquityPaperPage() {
   const { data, loading, connected, lastSuccessAt } = usePaperOverview();
   const { data: account } = useOverview();
   const { data: orders } = useAccountOrders();
+  const { data: realized } = useRealizedPnl();
   const [sparkRange, setSparkRange] = useState<ChartRange>("1D");
   const [selected, setSelected] = useState<string | null>(null);
 
@@ -42,6 +46,19 @@ export default function EquityPaperPage() {
   const symbols = useMemo(() => rows.map((row) => row.symbol), [rows]);
   const { series: sparklines } = useChartBatch(symbols, sparkRange);
   const equity = equityOf(account?.metrics ?? null);
+  const realizedRows = useMemo(() => realizedBySymbol(realized), [realized]);
+  // The equity book's open unrealized P&L, from the broker's own per-position
+  // figure. Summed over equity rows only, because the realized figure beside
+  // it is the equity ledger's - pairing an account-wide unrealized with an
+  // equity-only realized would invite exactly the arithmetic the strip says
+  // not to do.
+  const unrealized = useMemo(() => {
+    const rows = (account?.positions?.rows ?? []).filter(
+      (row) => row.asset_class === "EQUITY" && row.unrealized_pnl !== null,
+    );
+    if (rows.length === 0) return null;
+    return rows.reduce((total, row) => total + (row.unrealized_pnl ?? 0), 0);
+  }, [account]);
   const close = useCallback(() => setSelected(null), []);
 
   return (
@@ -65,6 +82,14 @@ export default function EquityPaperPage() {
           <>
             <PaperHeaderStrip service={data?.service ?? null} regime={data?.regime ?? null} policy={data?.policy} generatedAt={data?.generated_at ?? null} />
 
+            <RealizedStrip
+              panel={realized}
+              dailyPnl={account?.metrics?.daily_pnl ?? null}
+              dailyPnlFraction={account?.metrics?.daily_pnl_fraction ?? null}
+              unrealized={unrealized}
+              generatedAt={account?.generated_at ?? null}
+            />
+
             <TargetVsActual
               rows={rows}
               sparklines={sparklines}
@@ -73,6 +98,8 @@ export default function EquityPaperPage() {
               onSelect={setSelected}
               generatedAt={account?.generated_at ?? data?.generated_at ?? null}
               brokerAvailable={account?.positions?.source === "BROKER"}
+              realized={realizedRows}
+              accountingStatus={realized?.status ?? null}
             />
 
             <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,420px)]">

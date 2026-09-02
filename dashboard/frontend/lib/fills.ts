@@ -15,6 +15,15 @@ export interface Fill {
   price: number | null;
   quantity: string;
   label: string;
+  /**
+   * The broker's own order id, or null when the broker never answered.
+   *
+   * Carried so a SELL marker can be joined to the realized-P&L event it
+   * produced. It is the only identifier the two records provably share -
+   * matching on time and symbol would attach the wrong figure to one of
+   * several sales inside the same minute.
+   */
+  orderId: string | null;
 }
 
 export function fillsFor(panel: AccountOrdersPanel | null, symbol: string): Fill[] {
@@ -34,6 +43,7 @@ export function fillsFor(panel: AccountOrdersPanel | null, symbol: string): Fill
       price: row.average_fill_price,
       quantity: row.filled_quantity ?? row.quantity,
       label: `${row.side} ${row.filled_quantity ?? row.quantity} · EQUITY PAPER fill`,
+      orderId: row.broker_order_id,
     }));
 }
 

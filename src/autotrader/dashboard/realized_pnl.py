@@ -53,6 +53,7 @@ class RealizedPnlPanel:
     success, and no zero standing in for "not known".
     """
 
+    generated_at: str
     available: bool
     unavailable_reason: str | None
     summary: readmodel.RealizedSummary | None
@@ -67,6 +68,7 @@ class RealizedPnlPanel:
 class SymbolRealizedPanel:
     """One symbol's realized detail, for the drawer."""
 
+    generated_at: str
     available: bool
     unavailable_reason: str | None
     symbol: str
@@ -87,8 +89,9 @@ class ReconciliationRow:
     status: str
 
 
-def _unreadable_panel() -> RealizedPnlPanel:
+def _unreadable_panel(moment: datetime) -> RealizedPnlPanel:
     return RealizedPnlPanel(
+        generated_at=moment.astimezone(UTC).isoformat(),
         available=False,
         unavailable_reason=UNAVAILABLE_DATABASE_UNREADABLE,
         summary=None,
@@ -107,8 +110,9 @@ def build_panel(*, now: datetime | None = None, path: Path | None = None) -> Rea
         with _open(path) as connection:
             summary = readmodel.build_summary(connection, now=moment)
     except (sqlite3.Error, OSError, store.AccountingStoreError):
-        return _unreadable_panel()
+        return _unreadable_panel(moment)
     return RealizedPnlPanel(
+        generated_at=moment.astimezone(UTC).isoformat(),
         available=True,
         unavailable_reason=None,
         summary=summary,
@@ -184,6 +188,7 @@ def build_symbol_panel(
             status = readmodel.build_status(connection)
     except (sqlite3.Error, OSError, store.AccountingStoreError):
         return SymbolRealizedPanel(
+            generated_at=moment.astimezone(UTC).isoformat(),
             available=False,
             unavailable_reason=UNAVAILABLE_DATABASE_UNREADABLE,
             symbol=key,
@@ -192,6 +197,7 @@ def build_symbol_panel(
             status=None,
         )
     return SymbolRealizedPanel(
+        generated_at=moment.astimezone(UTC).isoformat(),
         available=True,
         unavailable_reason=None,
         symbol=key,

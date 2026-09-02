@@ -1079,3 +1079,119 @@ def test_reading_the_gate_does_not_give_the_dashboard_a_way_to_trade() -> None:
     exec_start = one(unit, "Service", "ExecStart") or ""
     assert "--confirm-paper" not in exec_start
     assert "crypto-run" not in exec_start and "equity-run" not in exec_start
+
+
+# ---------------------------------------------------------------------------
+# The realized-P&L accounting units
+#
+# An accounting job that runs beside a live trader, on the same host, with the
+# same broker credentials. Every property asserted here is one that a small
+# edit could remove: a venv path changed to the one the trader shares, a
+# StateDirectory widened to the trader's, an activation file loaded "so it can
+# see the config", a `Restart=always` copied in from a long-running unit.
+# ---------------------------------------------------------------------------
+
+ACCOUNTING_SERVICE = "autotrader-equity-accounting.service"
+ACCOUNTING_TIMER = "autotrader-equity-accounting.timer"
+
+#: The venv shared by the live equity paper trader. The accounting unit must
+#: not run out of it - see the drop-in that moved the API off it.
+TRADER_VENV = "/opt/autotrader-equity-paper/venv"
+DASHBOARD_VENV = "/opt/autotrader-dashboard/venv"
+
+
+def test_the_accounting_unit_runs_from_the_dashboard_venv_not_the_traders() -> None:
+    unit = parse_unit(SYSTEMD_ROOT / ACCOUNTING_SERVICE)
+    exec_start = one(unit, "Service", "ExecStart") or ""
+
+    assert exec_start.startswith(f"{DASHBOARD_VENV}/bin/autotrader"), exec_start
+    assert TRADER_VENV not in exec_start
+    assert one(unit, "Service", "WorkingDirectory") == "/opt/autotrader-dashboard/app"
+
+
+def test_the_accounting_unit_is_a_oneshot_that_never_restarts() -> None:
+    """A oneshot on a timer, so a failing pass stays visibly failed."""
+    unit = parse_unit(SYSTEMD_ROOT / ACCOUNTING_SERVICE)
+
+    assert one(unit, "Service", "Type") == "oneshot"
+    assert one(unit, "Service", "Restart") is None
+
+
+def test_the_accounting_unit_can_only_write_its_own_state_directory() -> None:
+    """Not the trader's, and not the observers'."""
+    unit = parse_unit(SYSTEMD_ROOT / ACCOUNTING_SERVICE)
+
+    assert directive(unit, "Service", "StateDirectory") == ["autotrader-accounting"]
+    assert one(unit, "Service", "ProtectSystem") == "strict"
+    assert directive(unit, "Service", "ReadWritePaths") == []
+
+
+def test_the_accounting_unit_runs_the_accounting_command_and_nothing_else() -> None:
+    unit = parse_unit(SYSTEMD_ROOT / ACCOUNTING_SERVICE)
+    exec_start = one(unit, "Service", "ExecStart") or ""
+
+    assert "equity-accounting sync" in exec_start
+    for forbidden in (
+        "equity-paper",
+        "crypto-run",
+        "equity-run",
+        "paper-submit",
+        "--confirm-paper",
+        "bootstrap",
+        "rebuild",
+    ):
+        assert forbidden not in exec_start.split("autotrader ", 1)[-1], forbidden
+
+
+def test_the_accounting_unit_does_not_load_the_submission_gate() -> None:
+    """It has no reason to know whether this host is armed, and must not be."""
+    unit = parse_unit(SYSTEMD_ROOT / ACCOUNTING_SERVICE)
+    files = directive(unit, "Service", "EnvironmentFile")
+
+    assert not [value for value in files if value.lstrip("-").endswith(ACTIVATION_BASENAME)]
+    for value in directive(unit, "Service", "Environment"):
+        assert not value.startswith("AUTOTRADER_PAPER_TRADING_ENABLED")
+
+
+def test_the_accounting_unit_carries_the_same_hardening_as_the_reconcile_unit() -> None:
+    accounting = parse_unit(SYSTEMD_ROOT / ACCOUNTING_SERVICE)
+    reference = parse_unit(SYSTEMD_ROOT / "autotrader-equity-paper-reconcile.service")
+
+    for key in (
+        "NoNewPrivileges",
+        "PrivateTmp",
+        "PrivateDevices",
+        "ProtectSystem",
+        "ProtectHome",
+        "ProtectKernelTunables",
+        "ProtectKernelModules",
+        "ProtectControlGroups",
+        "RestrictSUIDSGID",
+        "RestrictRealtime",
+        "RestrictNamespaces",
+        "LockPersonality",
+        "SystemCallArchitectures",
+    ):
+        assert one(accounting, "Service", key) == one(reference, "Service", key), key
+
+
+def test_the_accounting_timer_avoids_every_other_schedule_on_the_host() -> None:
+    """Its minutes must not collide with either reconcile pass or a bar boundary."""
+    unit = parse_unit(SYSTEMD_ROOT / ACCOUNTING_TIMER)
+    calendar = one(unit, "Timer", "OnCalendar") or ""
+
+    assert calendar == "*-*-* *:04/5:30"
+    minutes = set(range(4, 60, 5))
+    assert not minutes & {0, 15, 30, 45}, "would run inside a decision cycle"
+    assert not minutes & {7, 22}, "would run alongside a reconciliation pass"
+    assert one(unit, "Timer", "Persistent") == "true"
+    assert one(unit, "Timer", "Unit") == ACCOUNTING_SERVICE
+
+
+def test_the_accounting_database_is_not_an_operational_store() -> None:
+    """Its own file, so no accounting change can migrate a trader's schema."""
+    text = (ENV_ROOT / "autotrader-equity-paper.env.example").read_text()
+
+    assert "AUTOTRADER_EQUITY_ACCOUNTING_DB=/var/lib/autotrader-accounting/" in text
+    assert "AUTOTRADER_EQUITY_ACCOUNTING_DB=/var/lib/autotrader-equity-paper/" not in text
+    assert "AUTOTRADER_EQUITY_ACCOUNTING_DB=/var/lib/autotrader/" not in text

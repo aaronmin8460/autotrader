@@ -19,9 +19,12 @@ import { fillsFor, fillsWithin } from "@/lib/fills";
 import { money, percent, quantity, signTone, signedMoney, signedPercent, stampUtc } from "@/lib/format";
 import type { AccountOrdersPanel } from "@/lib/orders";
 import type { TargetVsActualRow } from "@/lib/portfolio";
+import { realizedForOrder, statusTone } from "@/lib/pnl";
+import { useSymbolRealized } from "@/lib/realized";
 import type { PositionRow } from "@/lib/types";
 
 import { LineChart } from "./charts/LineChart";
+import { RealizedEvents } from "./RealizedPnl";
 import { Drawer, Field, Pill, RangeSelector, Tag, cn, toneText } from "./ui";
 
 export function SymbolDetail({
@@ -45,6 +48,7 @@ export function SymbolDetail({
   const symbols = symbol ? [symbol] : [];
   const { series } = useChartBatch(symbols, range);
   const current = symbol ? series[symbol] : undefined;
+  const { data: realized } = useSymbolRealized(symbol);
 
   if (!symbol) return null;
 
@@ -52,6 +56,8 @@ export function SymbolDetail({
   const fills = fillsWithin(fillsFor(orders, symbol), current?.first_at ?? null, current?.last_at ?? null);
   const pnlTone = signTone(position?.unrealized_pnl);
   const crypto = position?.asset_class === "CRYPTO";
+  const events = realized?.events ?? [];
+  const accounting = realized?.status ?? null;
 
   return (
     <Drawer
@@ -62,6 +68,11 @@ export function SymbolDetail({
         <>
           {position ? <Tag tone={crypto ? "ATTENTION" : undefined}>{position.asset_class}</Tag> : null}
           <Tag title="Broker paper account. No real money.">Paper</Tag>
+          {accounting ? (
+            <Pill tone={statusTone(accounting.status)} title={accounting.message ?? accounting.tracking_label}>
+              Accounting {accounting.status}
+            </Pill>
+          ) : null}
         </>
       }
     >
@@ -80,6 +91,34 @@ export function SymbolDetail({
         </Field>
         <Field label="Average entry" title="The broker's average entry price for the open position.">
           <span className="num">{money(position?.average_entry_price)}</span>
+        </Field>
+        <Field
+          label="Accounting cost"
+          title="The ledger's own weighted-average cost, derived from broker-confirmed executions. It is shown beside the broker's figure rather than instead of it: when the two disagree, the accounting status says so and the broker is the one that is right."
+        >
+          {realized?.realized?.average_cost === null || realized?.realized?.average_cost === undefined ? (
+            <span className="text-ink-3">—</span>
+          ) : (
+            <span className="num">{money(realized.realized.average_cost)}</span>
+          )}
+        </Field>
+        <Field label="Realized today" title="What confirmed sales in this symbol released today. A purchase realizes nothing.">
+          {realized?.realized ? (
+            <span className={cn("num", toneText(signTone(realized.realized.realized_today)))}>
+              {signedMoney(realized.realized.realized_today)}
+            </span>
+          ) : (
+            <span className="text-ink-3">—</span>
+          )}
+        </Field>
+        <Field label="Realized since tracking" title={accounting?.tracking_label ?? "The ledger's tracking horizon."}>
+          {realized?.realized ? (
+            <span className={cn("num", toneText(signTone(realized.realized.realized_since_tracking)))}>
+              {signedMoney(realized.realized.realized_since_tracking)}
+            </span>
+          ) : (
+            <span className="text-ink-3">—</span>
+          )}
         </Field>
         <Field label="Unrealized P&L">
           {position?.unrealized_pnl === null || position?.unrealized_pnl === undefined ? (
@@ -115,7 +154,19 @@ export function SymbolDetail({
         <LineChart
           series={current}
           entryPrice={position?.average_entry_price ?? null}
-          markers={fills.map((fill) => ({ at: fill.at, side: fill.side, price: fill.price, label: fill.label }))}
+          markers={fills.map((fill) => {
+            // A SELL marker carries what that order realized, when the ledger
+            // holds an event for it. A BUY never does - a purchase releases
+            // nothing, and labelling one with a P&L figure would be a claim
+            // about money that did not move.
+            const released = realizedForOrder(events, fill.orderId, fill.side);
+            return {
+              at: fill.at,
+              side: fill.side,
+              price: fill.price,
+              label: released === null ? fill.label : `${fill.label} · Realized ${signedMoney(released)}`,
+            };
+          })}
         />
       </div>
 
@@ -135,6 +186,21 @@ export function SymbolDetail({
           </Field>
         </dl>
       ) : null}
+
+      <div className="mt-5">
+        <div className="flex items-center justify-between gap-3">
+          <h3 className="text-[12.5px] font-semibold text-ink">Realized events</h3>
+          <span className="text-[11px] text-ink-3">{accounting?.tracking_label ?? ""}</span>
+        </div>
+        <div className="mt-2">
+          <RealizedEvents
+            events={events}
+            realized={realized?.realized ?? null}
+            status={accounting}
+            generatedAt={generatedAt}
+          />
+        </div>
+      </div>
 
       <p className="mt-4 text-[11px] leading-snug text-ink-3">
         Read-only. Nothing on this panel can place, cancel or modify an order.

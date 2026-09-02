@@ -1,0 +1,109 @@
+# AutoTrader realized-P&L accounting synchronizer - EQUITY PAPER, PAPER only.
+#
+# Install to /usr/lib/systemd/system/autotrader-equity-accounting.service,
+# alongside autotrader-equity-accounting.timer.
+#
+# WHAT THIS IS
+#
+# A periodic oneshot that reads the broker's confirmed execution record and
+# folds it into a realized-P&L ledger, then compares that ledger against the
+# broker's positions. Accounting, and only accounting.
+#
+# WHAT IT CANNOT DO
+#
+# It cannot place, cancel or replace an order. The accounting package imports
+# no submission function and no order-request type, and a source-level test
+# asserts each name is absent from its executable code. It reaches the broker
+# through three read helpers - executions, order records, positions - and
+# nothing else.
+#
+# It cannot block trading. No trading runtime imports this package, reads its
+# database, or waits on this unit. If this unit is stopped, failing, or has
+# never run, the equity paper runtime is unaffected: it keeps trading with no
+# accounting, which is the correct direction for an accounting outage to fail.
+#
+# WHICH VENV, AND WHY IT MATTERS
+#
+# /opt/autotrader-dashboard/venv, never /opt/autotrader-equity-paper/venv. The
+# latter is shared with the live equity paper trading runtime as a non-editable
+# copy install, so a `pip install` into it leaves no `autotrader` package under
+# a running trader for the seconds between uninstall and install. This unit's
+# identity is still `ateqpaper`, so it can read that runtime's store.
+#
+# WHICH DATABASE, AND WHY IT IS ITS OWN
+#
+# /var/lib/autotrader-accounting/equity-accounting.db, with its own schema and
+# its own version counter. It is deliberately NOT a set of tables in an
+# operational store: those stores sit at two different schema versions and
+# every command in the trading lineage migrates them upward on open, so adding
+# accounting tables to that schema would mean a version bump that migrates a
+# running trader's database out from under it.
+#
+# The equity paper store is opened READ-ONLY, through a `mode=ro` URI and a
+# single SELECT, for one purpose - establishing which orders that runtime
+# placed. It is never initialized and never migrated from here.
+#
+# PROVIDER TRAFFIC
+#
+# Two to three reads per pass, twelve passes an hour: under half a request per
+# minute against an account whose runtimes are allowed a hundred and eighty.
+# The synchronizer additionally refuses to page past its own request ceiling
+# rather than returning a partial execution record, so a paging bug cannot
+# become a request storm against an account that is simultaneously trading.
+
+[Unit]
+Description=AutoTrader realized-P&L accounting sync - equity paper (Alpaca PAPER)
+Documentation=file:/opt/autotrader/app/docs/DASHBOARD_V2.md
+ConditionPathExists=/etc/autotrader/autotrader-equity-paper.env
+ConditionPathExists=/opt/autotrader-dashboard/venv/bin/autotrader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ateqpaper
+Group=ateqpaper
+WorkingDirectory=/opt/autotrader-dashboard/app
+
+EnvironmentFile=/etc/autotrader/autotrader-equity-paper.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-paper.secrets.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+ExecStart=/opt/autotrader-dashboard/venv/bin/autotrader equity-accounting sync --quiet
+
+# Exit 1 when reconciliation reports a quantity MISMATCH, which leaves the unit
+# `failed` and visible. That is deliberate: a ledger that disagrees with the
+# broker about how many shares exist is not a transient condition to retry
+# past. Nothing retries; the next scheduled run is the retry, and the dashboard
+# shows the status regardless of this unit's state.
+TimeoutStartSec=180
+
+# The ledger's own directory, created and owned by this unit's identity. The
+# equity paper runtime's StateDirectory is a different one and is not listed
+# here, so this unit cannot write into it.
+StateDirectory=autotrader-accounting
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity-accounting

@@ -19,6 +19,12 @@ that keeps every trading and observing venv untouched.
 Caddy publishes `:3000` only, behind `basic_auth`, GET/HEAD only, with
 `Cache-Control: no-store` on all five API prefixes and the measured CSP.
 
+One further unit is not a process: `autotrader-equity-accounting.timer` runs a
+five-minute oneshot out of the same dashboard venv, as `ateqpaper`, writing the
+realized-P&L ledger that `:8002` serves under `/api/equity-paper/realized-pnl/*`.
+It is accounting only and no trading decision reads it — see
+[EQUITY_REALIZED_PNL.md](EQUITY_REALIZED_PNL.md).
+
 ## The dashboard tree and venv
 
 `/opt/autotrader-dashboard/app` is a checkout of the dashboard branch and

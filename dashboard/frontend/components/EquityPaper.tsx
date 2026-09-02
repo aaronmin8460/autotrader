@@ -28,6 +28,8 @@ import type {
   PolicyPanel,
 } from "@/lib/paper";
 import type { TargetVsActualRow } from "@/lib/portfolio";
+import { statusTone } from "@/lib/pnl";
+import type { AccountingStatusPanel, SymbolRealized } from "@/lib/realized";
 
 import { Sparkline } from "./charts/Sparkline";
 import { Card, Empty, Field, Pill, RangeSelector, Status, Tag, Td, Th, cn, toneText } from "./ui";
@@ -119,6 +121,8 @@ export function TargetVsActual({
   onSelect,
   generatedAt,
   brokerAvailable,
+  realized,
+  accountingStatus,
 }: {
   rows: TargetVsActualRow[];
   sparklines: Readonly<Record<string, ChartSeries>>;
@@ -127,6 +131,15 @@ export function TargetVsActual({
   onSelect: (symbol: string) => void;
   generatedAt: string | null;
   brokerAvailable: boolean;
+  /** Per-symbol realized totals from the accounting ledger, keyed by symbol. */
+  realized?: Readonly<Record<string, SymbolRealized>>;
+  /**
+   * The ledger's verdict. Rendered in this header rather than only in the
+   * strip above, because these two columns are the ledger's numbers and a
+   * reader scanning the table must be able to see that they are in doubt
+   * without scrolling back up.
+   */
+  accountingStatus?: AccountingStatusPanel | null;
 }) {
   const open = (symbol: string) => (event: KeyboardEvent<HTMLTableRowElement>) => {
     if (event.key === "Enter" || event.key === " ") {
@@ -150,13 +163,18 @@ export function TargetVsActual({
             Recorded decision vs broker
           </Tag>
           {brokerAvailable ? null : <Pill tone="ATTENTION">Broker unreadable · actuals missing</Pill>}
+          {accountingStatus && accountingStatus.status !== "CLEAN" ? (
+            <Pill tone={statusTone(accountingStatus.status)} title={accountingStatus.message ?? undefined}>
+              Realized {accountingStatus.status}
+            </Pill>
+          ) : null}
           <RangeSelector options={["1D", "5D", "1M"] as const} value={sparkRange} onChange={onSparkRange} label="Trend range" />
         </>
       }
       bodyClassName=""
     >
       <div className="scroll-x">
-        <table className="w-full min-w-[980px] border-collapse">
+        <table className="w-full min-w-[1180px] border-collapse">
           <thead>
             <tr className="border-b border-line">
               <Th>Symbol</Th>
@@ -168,12 +186,15 @@ export function TargetVsActual({
               <Th align="right" title="Actual minus target. Inside the policy deadband no order is placed.">Delta</Th>
               <Th title="The decided side on the latest bar, or HOLD when no order was decided.">Action</Th>
               <Th align="right">Last decision</Th>
+              <Th align="right" title="What confirmed sales in this symbol released today, under weighted-average cost. A purchase realizes nothing.">Realized today</Th>
+              <Th align="right" title="Everything the ledger has recorded for this symbol since its tracking horizon.">Realized since start</Th>
               <Th align="right" title="Price only. No signal or target is drawn.">Trend {sparkRange}</Th>
             </tr>
           </thead>
           <tbody>
             {rows.map((row) => {
               const spark = sparklines[row.symbol];
+              const realizedRow = realized?.[row.symbol];
               return (
                 <tr
                   key={row.symbol}
@@ -213,6 +234,16 @@ export function TargetVsActual({
                   </Td>
                   <Td numeric className="text-ink-3">
                     {row.last_decision_at ? stampUtc(row.last_decision_at, generatedAt) : "—"}
+                  </Td>
+                  <Td numeric className={cn(realizedRow ? toneText(signTone(realizedRow.realized_today)) : "text-ink-3")}>
+                    {realizedRow ? signedMoney(realizedRow.realized_today) : "—"}
+                  </Td>
+                  <Td
+                    numeric
+                    className={cn(realizedRow ? toneText(signTone(realizedRow.realized_since_tracking)) : "text-ink-3")}
+                    title={realizedRow ? `${realizedRow.event_count} realized event(s); exact ${realizedRow.realized_since_tracking_exact}` : undefined}
+                  >
+                    {realizedRow ? signedMoney(realizedRow.realized_since_tracking) : "—"}
                   </Td>
                   <Td align="right">
                     <span className="inline-flex items-center justify-end gap-2">
