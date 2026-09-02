@@ -72,6 +72,16 @@ EQUITY_ASSET_CLASS = "us_equity"
 #: Two days spans a weekend, so a Monday run still re-reads Friday.
 DEFAULT_OVERLAP = timedelta(days=2)
 
+#: How much further back the **order** read reaches than the execution read.
+#:
+#: An execution is joined to its order for the asset class, and the two are not
+#: bounded by the same instant: an order submitted before the window can still
+#: produce an execution inside it. Today's orders are same-second market fills
+#: so it never happens, but an accounting ledger should not be correct only
+#: because of a property of the current order type. Thirty days is far wider
+#: than any order this account has held open, and the read is one request.
+ORDER_INDEX_LOOKBACK = timedelta(days=30)
+
 #: The client-order-id prefix this system mints. An order carrying it that is
 #: in no runtime store was placed by this system's tooling, by hand.
 SYSTEM_ORDER_PREFIX = "autotrader-"
@@ -188,6 +198,33 @@ class SyncResult:
     symbols_touched: tuple[str, ...] = field(default=())
 
 
+def _join(
+    executions: list[ConfirmedExecution],
+    index: Mapping[str, OrderRecord],
+    asset_class: str,
+) -> tuple[list[tuple[ConfirmedExecution, OrderRecord]], int, int]:
+    """Pair each execution with its order, and count the two ways that fails.
+
+    `out_of_scope` is an execution correctly identified as belonging to another
+    book. `unresolved` is an execution whose order could not be read at all -
+    which is **not** the same thing, and must never be treated as one: the
+    asset class is unknown, so accounting for it would mean guessing.
+    """
+    paired: list[tuple[ConfirmedExecution, OrderRecord]] = []
+    out_of_scope = 0
+    unresolved = 0
+    for execution in executions:
+        record = index.get(execution.broker_order_id)
+        if record is None:
+            unresolved += 1
+            continue
+        if record.asset_class != asset_class:
+            out_of_scope += 1
+            continue
+        paired.append((execution, record))
+    return paired, out_of_scope, unresolved
+
+
 def _window_start(connection: sqlite3.Connection, overlap: timedelta) -> datetime | None:
     """Where this run starts reading: before the newest row, or the beginning."""
     mark = store.high_water_mark(connection)
@@ -218,26 +255,27 @@ def synchronize(
     """
     started = now
     after = _window_start(connection, overlap)
+    orders_after = None if after is None else after - ORDER_INDEX_LOOKBACK
 
-    orders, order_requests = read_orders(after)
+    orders, order_requests = read_orders(orders_after)
     executions, execution_requests = read_executions(after)
     requests = order_requests + execution_requests
 
     index: Mapping[str, OrderRecord] = {record.broker_order_id: record for record in orders}
     runtime_ids = runtime_order_ids(runtime_store_path) if runtime_store_path else frozenset()
 
-    in_scope: list[tuple[ConfirmedExecution, OrderRecord]] = []
-    out_of_scope = 0
-    unresolved = 0
-    for execution in executions:
-        record = index.get(execution.broker_order_id)
-        if record is None:
-            unresolved += 1
-            continue
-        if record.asset_class != asset_class:
-            out_of_scope += 1
-            continue
-        in_scope.append((execution, record))
+    in_scope, out_of_scope, unresolved = _join(executions, index, asset_class)
+
+    if unresolved and orders_after is not None:
+        # An execution whose order is older than the widened lookback. Rather
+        # than report it unresolved - which would skip a real fill and mark the
+        # pass PARTIAL - re-read the whole order record once and try again.
+        # Bounded: one extra request, and only on a pass that found something
+        # it could not explain.
+        orders, extra_requests = read_orders(None)
+        requests += extra_requests
+        index = {record.broker_order_id: record for record in orders}
+        in_scope, out_of_scope, unresolved = _join(executions, index, asset_class)
 
     in_scope.sort(key=lambda pair: (pair[0].transaction_time, pair[0].activity_id))
 
@@ -318,6 +356,7 @@ def synchronize(
 
 __all__ = [
     "DEFAULT_OVERLAP",
+    "ORDER_INDEX_LOOKBACK",
     "EQUITY_ASSET_CLASS",
     "SYNC_FAILED",
     "SYNC_OK",

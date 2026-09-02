@@ -703,8 +703,19 @@ class Position:
         self.average_entry_price = Decimal(average)
 
 
-def readers(executions: list[Execution], orders: list[Order]):
-    calls = {"executions": 0, "orders": 0}
+def readers(
+    executions: list[Execution],
+    orders: list[Order],
+    *,
+    order_times: dict[str, datetime] | None = None,
+):
+    """Two readers that behave like the broker's, including its windowing.
+
+    `order_times` gives an order a submission time, so a test can build the
+    case the windows exist for: an execution inside the window whose order was
+    submitted before it.
+    """
+    calls = {"executions": 0, "orders": 0, "order_windows": []}
 
     def read_executions(after: datetime | None):
         calls["executions"] += 1
@@ -713,7 +724,10 @@ def readers(executions: list[Execution], orders: list[Order]):
 
     def read_orders(after: datetime | None):
         calls["orders"] += 1
-        return list(orders), 1
+        calls["order_windows"].append(after)
+        if after is None or order_times is None:
+            return list(orders), 1
+        return [o for o in orders if order_times.get(o.broker_order_id, T0) > after], 1
 
     return read_executions, read_orders, calls
 
@@ -897,6 +911,101 @@ def test_the_overlap_window_re_reads_before_the_high_water_mark(
 
     assert result.executions_imported == 1
     assert store.read_cost_basis(ledger, "SPY").quantity == Decimal("3")
+
+
+def test_the_order_index_reaches_further_back_than_the_execution_window(
+    ledger: sqlite3.Connection,
+) -> None:
+    """An order submitted before the window can still fill inside it.
+
+    Today's orders are same-second market fills so the two windows would agree
+    by accident. An accounting ledger should not be correct only because of a
+    property of the current order type.
+    """
+    orders = [Order("o1", "c1", "us_equity")]
+    read_executions, read_orders, calls = readers(
+        [Execution("a1", "o1", "SPY", "BUY", "1", "100", T0)], orders
+    )
+    ingest.synchronize(
+        ledger,
+        read_executions=read_executions,
+        read_orders=read_orders,
+        runtime_store_path=None,
+        now=T0,
+    )
+
+    read_executions, read_orders, calls = readers(
+        [Execution("a2", "o1", "SPY", "BUY", "1", "100", T0 + timedelta(minutes=1))], orders
+    )
+    ingest.synchronize(
+        ledger,
+        read_executions=read_executions,
+        read_orders=read_orders,
+        runtime_store_path=None,
+        now=T0,
+        overlap=timedelta(days=2),
+    )
+
+    # The window is computed from the ledger's newest row *before* this pass
+    # imports anything, so it is anchored on the first execution, not the
+    # second.
+    execution_window = T0 - timedelta(days=2)
+    assert calls["order_windows"] == [execution_window - ingest.ORDER_INDEX_LOOKBACK]
+
+
+def test_an_execution_older_than_the_order_lookback_triggers_one_full_reread(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Rather than skip a real fill, widen the order read once and retry.
+
+    Bounded to one extra request, and only on a pass that found something it
+    could not explain - so the normal case still costs two reads.
+    """
+    ancient = T0 - timedelta(days=400)
+    orders = [Order("o-ancient", "c1", "us_equity")]
+    read_executions, read_orders, calls = readers(
+        [Execution("a1", "o-ancient", "SPY", "BUY", "1", "100", T0)],
+        orders,
+        order_times={"o-ancient": ancient},
+    )
+    store.record_fill(ledger, fill("seed", SIDE_BUY, "1", "1"), now=T0)
+
+    result = ingest.synchronize(
+        ledger,
+        read_executions=read_executions,
+        read_orders=read_orders,
+        runtime_store_path=None,
+        now=T0,
+        overlap=timedelta(minutes=1),
+    )
+
+    assert calls["orders"] == 2
+    assert calls["order_windows"][-1] is None
+    assert result.unresolved_orders == 0
+    assert result.executions_imported == 1
+    assert result.status == ingest.SYNC_OK
+
+
+def test_an_execution_with_no_order_at_all_is_still_reported(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The retry must not turn "no such order" into silence."""
+    read_executions, read_orders, calls = readers(
+        [Execution("a1", "nowhere", "SPY", "BUY", "1", "100", T0)], []
+    )
+    store.record_fill(ledger, fill("seed", SIDE_BUY, "1", "1"), now=T0)
+
+    result = ingest.synchronize(
+        ledger,
+        read_executions=read_executions,
+        read_orders=read_orders,
+        runtime_store_path=None,
+        now=T0,
+        overlap=timedelta(minutes=1),
+    )
+
+    assert result.unresolved_orders == 1
+    assert result.status == ingest.SYNC_PARTIAL
 
 
 def test_a_refused_execution_makes_the_pass_partial(ledger: sqlite3.Connection) -> None:
