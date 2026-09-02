@@ -31,12 +31,26 @@ import { Card, Empty, Metric, Pill, Tag, Td, Th, cn, toneText } from "./ui";
 const INDEPENDENCE_NOTE =
   "Three different measurements, not three parts of one. Daily account P&L is account equity against the stored UTC-day baseline and covers the whole account, crypto included. Realized is what confirmed equity sales released. Unrealized is the broker's figure on open equity positions. They are not required to sum: overnight marks, fees, dividends and other account activity all sit between them.";
 
-function statusDetail(status: AccountingStatusPanel | null): string {
-  if (!status) return "The ledger could not be read.";
+function statusDetail(panel: RealizedPnlPanel | null): string {
+  if (!panel) return "The accounting ledger has not been read yet.";
+  if (!panel.available) {
+    return `The accounting ledger could not be read (${panel.unavailable_reason ?? "unknown reason"}), so there are no realized figures to show. This is not a value of zero.`;
+  }
+  const status = panel.status;
+  if (!status) return "The accounting ledger reported no status.";
   if (status.status === "CLEAN") {
     return `Ledger quantities match the broker on all ${status.symbols_checked} symbols.`;
   }
   return status.message ?? "The ledger and the broker do not agree.";
+}
+
+/**
+ * The word beside the figures. `UNKNOWN` when there is no ledger to ask,
+ * never a blank and never an implied CLEAN - a missing ledger is a state an
+ * operator has to see, not the absence of one.
+ */
+function statusWord(panel: RealizedPnlPanel | null): string {
+  return panel?.status?.status ?? "UNKNOWN";
 }
 
 /** The four-metric accounting strip. */
@@ -55,7 +69,7 @@ export function RealizedStrip({
 }) {
   const summary = panel?.summary ?? null;
   const status = panel?.status ?? null;
-  const tone = statusTone(status?.status);
+  const tone = statusTone(panel && panel.available ? status?.status : "UNKNOWN");
   const daily = dailyPnl?.available ? dailyPnl.value : null;
 
   return (
@@ -64,8 +78,8 @@ export function RealizedStrip({
       meta={
         <>
           <Tag title={INDEPENDENCE_NOTE}>Three separate measurements</Tag>
-          <Pill tone={tone} title={statusDetail(status)}>
-            Accounting {status?.status ?? "UNKNOWN"}
+          <Pill tone={tone} emphasis={tone !== "POSITIVE"} title={statusDetail(panel)}>
+            Accounting {statusWord(panel)}
           </Pill>
         </>
       }
@@ -122,11 +136,12 @@ export function RealizedStrip({
         />
       </div>
 
-      {status && status.status !== "CLEAN" ? (
+      {statusWord(panel) !== "CLEAN" ? (
         <p className={cn("mt-3 text-[11.5px] leading-snug", toneText(tone))}>
-          {statusDetail(status)} Realized figures on this page may be wrong while this says
-          {" "}
-          {status.status}.
+          {statusDetail(panel)}{" "}
+          {panel?.available
+            ? `Realized figures on this page may be wrong while this says ${statusWord(panel)}.`
+            : ""}
         </p>
       ) : null}
 
