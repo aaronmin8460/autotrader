@@ -145,7 +145,13 @@
 	# regression introduced by adding a page - which is why the list is
 	# explicit rather than a /api/* wildcard that would silently absorb a
 	# future route nobody reviewed.
-	@account path /api/dashboard/* /api/equity-shadow/* /api/equity-paper/*
+	#
+	# Dashboard V2 added two prefixes. /api/equity-a1b-shadow/* is a fourth
+	# observation record, this operator's data like the third. /api/market-charts/*
+	# is provider price bars and carries no account figure at all - it is listed
+	# anyway, because the rule worth having is "every API prefix is here", and a
+	# prefix that was allowed to fall outside it is how the next one does too.
+	@account path /api/dashboard/* /api/equity-shadow/* /api/equity-paper/* /api/equity-a1b-shadow/* /api/market-charts/*
 	header @account Cache-Control "no-store"
 
 	log {

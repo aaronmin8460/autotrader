@@ -1,0 +1,78 @@
+# /etc/systemd/system/autotrader-market-charts-api.service
+# AutoTrader MARKET CHARTS API - display bars for the dashboard, 127.0.0.1:8004.
+#
+# Install to /etc/systemd/system/autotrader-market-charts-api.service.
+#
+# The one dashboard process that talks to the market-data provider, and it
+# talks to nothing else. It opens no database - there is no StateDirectory
+# here and ProtectSystem=strict makes every path read-only - reads no account,
+# and serves price bars at display timeframes, batched per request, cached per
+# range, and capped per minute. The trading runtimes neither share its cache
+# nor depend on it; a failure here is a chart panel that reads "unavailable",
+# and nothing else on the host notices.
+#
+# It runs as `ateqpaper` because that identity already holds the paper
+# market-data credential, and a new identity would have meant a second copy of
+# the same key. What it does NOT get is the activation file: this process has
+# no order surface, and a process that cannot submit should not carry the
+# variable that authorizes one.
+#
+# It runs from the dedicated dashboard tree and virtualenv under
+# /opt/autotrader-dashboard, shared by no runtime and no observer.
+
+[Unit]
+Description=AutoTrader market charts API (read-only display bars, 127.0.0.1)
+Documentation=file:/opt/autotrader-dashboard/app/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+ConditionPathExists=/etc/autotrader/autotrader-equity-paper.env
+ConditionPathExists=/opt/autotrader-dashboard/venv/bin/python
+
+[Service]
+Type=simple
+User=ateqpaper
+Group=ateqpaper
+WorkingDirectory=/opt/autotrader-dashboard/app
+
+# Two files, not three. The credential is here because the chart layer reads
+# provider bars, which for equities require it. The activation file is
+# deliberately absent.
+EnvironmentFile=/etc/autotrader/autotrader-equity-paper.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-paper.secrets.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# No --host argument, deliberately: the entry point hardcodes 127.0.0.1. The
+# port is literal because it is part of the frontend's rewrite table.
+ExecStart=/opt/autotrader-dashboard/venv/bin/python -m autotrader.dashboard.charts_api --port 8004
+
+# A viewer, not a trader: restart unconditionally.
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-market-charts-api
+
+[Install]
+WantedBy=multi-user.target

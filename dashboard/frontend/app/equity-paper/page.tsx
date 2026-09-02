@@ -1,69 +1,101 @@
 "use client";
 
 /**
- * The Equity Paper page.
+ * Equity Paper: EDA-1 U10 live paper observability.
  *
- * The dashboard's third record, and the one that most needs to be told apart
- * from the other two. The crypto page shows a paper book that trades. The
- * shadow page shows an observation record whose figures are hypothetical and
- * whose order count is structurally zero. This page shows a paper book that
- * trades *equities*, against the same account as the crypto book: its
- * positions are real broker positions and its fills are real fills.
+ * The header strip says which record this is and states the deployed policy
+ * as the runtime announced it. Then what the runtime wants against what the
+ * broker holds, per symbol, with a price trend; then the regime and policy
+ * cards, the paper order log, and safety.
  *
- * Ordered by what could go wrong. The banner says which record this is. The
- * service card says which stage is live and which sizing policy is frozen,
- * because "EDA-1 is running" means something different on one symbol than on
- * ten. Exposure is account-wide. Then the targets, then what was actually
- * sent, then safety.
+ * Two records, joined in the browser: the paper API's recorded decisions and
+ * the operational API's broker read. The target is never recomputed here from
+ * the policy - it is the runtime's own row - and the actual is never taken
+ * from a snapshot when the broker can be read.
  *
  * There is no control here. No start, no stop, no stage advance, no cancel -
  * and no endpoint behind any of them.
  */
 
-import {
-  PaperBanner,
-  PaperExposure,
-  PaperOrders,
-  PaperRegime,
-  PaperSafety,
-  PaperService,
-  PaperTargets,
-} from "@/components/EquityPaper";
-import { ShadowNav } from "@/components/ShadowNav";
-import { usePaperOverview } from "@/lib/paper";
+import { useCallback, useMemo, useState } from "react";
+
+import { PaperExposure, PaperHeaderStrip, PaperOrders, PaperRegime, PaperSafety, TargetVsActual } from "@/components/EquityPaper";
+import { Footer, Nav } from "@/components/Nav";
+import { SymbolDetail } from "@/components/SymbolDetail";
+import { useOverview } from "@/lib/api";
+import { useChartBatch, type ChartRange } from "@/lib/charts";
+import { useAccountOrders } from "@/lib/orders";
+import { PAPER_POLL_INTERVAL_MS, usePaperOverview } from "@/lib/paper";
+import { equityOf, targetVsActual } from "@/lib/portfolio";
 
 export default function EquityPaperPage() {
   const { data, loading, connected, lastSuccessAt } = usePaperOverview();
+  const { data: account } = useOverview();
+  const { data: orders } = useAccountOrders();
+  const [sparkRange, setSparkRange] = useState<ChartRange>("1D");
+  const [selected, setSelected] = useState<string | null>(null);
+
+  const rows = useMemo(
+    () => targetVsActual(data?.targets ?? [], account?.positions ?? null, account?.metrics ?? null),
+    [data, account],
+  );
+  const symbols = useMemo(() => rows.map((row) => row.symbol), [rows]);
+  const { series: sparklines } = useChartBatch(symbols, sparkRange);
+  const equity = equityOf(account?.metrics ?? null);
+  const close = useCallback(() => setSelected(null), []);
 
   return (
     <div className="min-h-full">
-      <ShadowNav current="paper" connected={connected} lastSuccessAt={lastSuccessAt} />
+      <Nav
+        section="paper"
+        verdict={account?.system_state ?? null}
+        verdictTone={account?.system_state_tone ?? "MUTED"}
+        verdictTitle={account?.attention.join(" ") || "Broker account"}
+        badge={{ text: "Paper · no real money", title: "Orders on this page were really submitted, to a paper brokerage account. No real money is involved and this system has no live path." }}
+        connected={connected}
+        lastSuccessAt={lastSuccessAt}
+      />
 
-      <main className="mx-auto max-w-[1520px] space-y-4 px-5 py-5 sm:px-6">
-        <PaperBanner />
-
+      <main className="mx-auto max-w-[1720px] space-y-4 px-5 py-5 sm:px-6">
         {loading && !data ? (
           <div className="flex min-h-[30vh] items-center justify-center">
             <p className="text-[13px] text-ink-3">Reading the equity paper record…</p>
           </div>
         ) : (
           <>
-            <PaperService
-              service={data?.service ?? null}
-              generatedAt={data?.generated_at ?? null}
+            <PaperHeaderStrip service={data?.service ?? null} regime={data?.regime ?? null} policy={data?.policy} generatedAt={data?.generated_at ?? null} />
+
+            <TargetVsActual
+              rows={rows}
+              sparklines={sparklines}
+              sparkRange={sparkRange}
+              onSparkRange={setSparkRange}
+              onSelect={setSelected}
+              generatedAt={account?.generated_at ?? data?.generated_at ?? null}
+              brokerAvailable={account?.positions?.source === "BROKER"}
             />
 
             <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,420px)]">
-              <PaperExposure exposure={data?.exposure ?? null} />
+              <PaperExposure exposure={data?.exposure ?? null} policy={data?.policy} />
               <PaperRegime regime={data?.regime ?? null} />
             </div>
 
-            <PaperTargets targets={data?.targets ?? []} />
-            <PaperOrders orders={data?.orders ?? []} />
-            <PaperSafety safety={data?.safety ?? null} />
+            <PaperOrders orders={data?.orders ?? []} generatedAt={data?.generated_at ?? null} />
+            <PaperSafety safety={data?.safety ?? null} generatedAt={data?.generated_at ?? null} />
           </>
         )}
+        <Footer intervalSeconds={PAPER_POLL_INTERVAL_MS / 1000} />
       </main>
+
+      <SymbolDetail
+        symbol={selected}
+        onClose={close}
+        position={account?.positions?.rows.find((row) => row.symbol === selected) ?? null}
+        equity={equity}
+        target={rows.find((row) => row.symbol === selected) ?? null}
+        orders={orders}
+        generatedAt={account?.generated_at ?? null}
+      />
     </div>
   );
 }

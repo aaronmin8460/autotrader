@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 
-from autotrader.dashboard import equity_paper, service_units
+from autotrader.dashboard import account_orders, equity_paper, service_units
 
 #: Loopback only, and not configurable here. Making "listen on every interface"
 #: a one-flag decision is how an unauthenticated internal tool ends up on a
@@ -136,6 +136,35 @@ def create_app() -> FastAPI:
             "safety": page.safety,
             "unresolved_intents": page.service.unresolved_intents,
         }
+
+    @application.get(f"{_API_PREFIX}/policy", tags=["equity-paper"])
+    def policy() -> equity_paper.PolicyPanel | None:
+        """The deployed sizing policy's target and hard caps, as numbers."""
+        return build_overview().policy
+
+    @application.get(f"{_API_PREFIX}/account-orders", tags=["account"])
+    def account_wide_orders(
+        limit: Annotated[
+            int,
+            Query(
+                ge=1,
+                le=account_orders.MAX_LIMIT,
+                description="Rows to return, newest first, across both stores.",
+            ),
+        ] = account_orders.DEFAULT_LIMIT,
+    ) -> account_orders.AccountOrdersPanel:
+        """Recent orders across the whole account: crypto and equity paper, merged.
+
+        Served from this process because it is the one reader that can open
+        both order stores read-only. Rows are labelled with the store they came
+        from; no shadow record is an input.
+        """
+        return account_orders.build_account_orders(
+            crypto_path=equity_paper.crypto_database_path(),
+            paper_path=equity_paper.database_path(),
+            now=datetime.now(UTC),
+            limit=limit,
+        )
 
     return application
 

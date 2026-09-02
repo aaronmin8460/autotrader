@@ -51,7 +51,16 @@ See [Publishing the dashboard](../docs/DEPLOYMENT.md#publishing-the-dashboard).
 | `autotrader-equity.service` | `on-failure`, never on exit 2 | session logic is the app's, not a cron's |
 | `autotrader-dashboard-api.service` | `always` | `127.0.0.1:8000`, read-only |
 | `autotrader-dashboard-web.service` | `always` | `127.0.0.1:3000` |
+| `autotrader-equity-shadow-api.service` | `always` | `127.0.0.1:8001`, read-only, `atshadow` |
+| `autotrader-equity-paper-api.service` | `always` | `127.0.0.1:8002`, read-only, `ateqpaper`; drop-in `10-dashboard-venv.conf` runs it from `/opt/autotrader-dashboard/venv` |
+| `autotrader-equity-a1b-shadow-api.service` | `always` | `127.0.0.1:8003`, read-only, `ata1bshadow`, from `/opt/autotrader-dashboard/venv` |
+| `autotrader-market-charts-api.service` | `always` | `127.0.0.1:8004`, provider bars only, no store, `ateqpaper`, from `/opt/autotrader-dashboard/venv` |
 | `autotrader-backup.timer` | — | daily |
+
+`autotrader-dashboard-web.service.d/*.conf` are drop-ins that move the frontend
+build and hand it the loopback API origins; `30-dashboard-v2.conf` adds the two
+Dashboard V2 origins (`:8003`, `:8004`). None of the dashboard units is ordered
+before, after, bound to, or required by a trading or observing unit.
 
 `caddy.service.d/10-autotrader-web.conf` is a drop-in for the Caddy package's
 own unit, not an `autotrader-*` unit. It adds one `EnvironmentFile` and is

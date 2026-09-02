@@ -9,20 +9,15 @@
  * `/api/equity-shadow/*` is what two engines *would have* done, recorded by a
  * process that has no way to act. Mixing them on one payload would be the
  * first step towards mixing them on one screen.
- *
- * The poll is the same shape as `useOverview`: slow, single-endpoint, and
- * non-destructive on failure. Shadow cycles land every fifteen minutes during
- * a regular session, so there is even less to gain from a fast refresh here.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { usePoll, type PollState } from "./api";
+import type { Tone } from "./types";
 
 /** How often the page re-reads. Cycles are 15 minutes apart; this is plenty. */
 export const SHADOW_POLL_INTERVAL_MS = 15_000;
 
-const REQUEST_TIMEOUT_MS = 8_000;
-
-const ENDPOINT = "/api/equity-shadow/overview";
+export const SHADOW_ENDPOINT = "/api/equity-shadow/overview";
 
 export type ShadowStatus = "RUNNING" | "IDLE" | "STALE" | "STOPPED" | "UNAVAILABLE";
 
@@ -146,61 +141,21 @@ export interface ShadowOverview {
   comparison: ComparisonPanel;
 }
 
-export interface ShadowState {
-  data: ShadowOverview | null;
-  loading: boolean;
-  connected: boolean;
-  lastSuccessAt: string | null;
-}
+export type ShadowState = PollState<ShadowOverview>;
 
 export function useShadowOverview(): ShadowState {
-  const [data, setData] = useState<ShadowOverview | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [connected, setConnected] = useState(false);
-  const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
-  const inFlight = useRef(false);
-
-  const poll = useCallback(async () => {
-    if (inFlight.current) return;
-    inFlight.current = true;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    try {
-      const response = await fetch(ENDPOINT, {
-        cache: "no-store",
-        signal: controller.signal,
-        headers: { accept: "application/json" },
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const payload = (await response.json()) as ShadowOverview;
-      setData(payload);
-      setConnected(true);
-      setLastSuccessAt(payload.generated_at);
-    } catch {
-      // Non-destructive, exactly as on the operational page: the last known
-      // record stays on screen and the header says the poll stopped landing.
-      setConnected(false);
-    } finally {
-      clearTimeout(timer);
-      inFlight.current = false;
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void poll();
-    const interval = setInterval(() => void poll(), SHADOW_POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
-  }, [poll]);
-
-  return { data, loading, connected, lastSuccessAt };
+  return usePoll<ShadowOverview>(SHADOW_ENDPOINT, SHADOW_POLL_INTERVAL_MS);
 }
 
-/** How a shadow status should read. `IDLE` is not a fault and is not amber. */
-export function shadowTone(status: ShadowStatus): "POSITIVE" | "NEGATIVE" | "ATTENTION" | "MUTED" {
+/**
+ * How a shadow status should read. `RUNNING` is the observation colour, never
+ * green: an observer that is up is observing, not trading. `IDLE` is not a
+ * fault and is not amber.
+ */
+export function shadowTone(status: ShadowStatus): Tone {
   switch (status) {
     case "RUNNING":
-      return "POSITIVE";
+      return "SHADOW";
     case "IDLE":
       return "MUTED";
     case "STALE":
@@ -208,6 +163,11 @@ export function shadowTone(status: ShadowStatus): "POSITIVE" | "NEGATIVE" | "ATT
     default:
       return "NEGATIVE";
   }
+}
+
+/** The word for a shadow status on screen: a running observer is OBSERVING. */
+export function shadowStatusLabel(status: ShadowStatus): string {
+  return status === "RUNNING" ? "OBSERVING" : status;
 }
 
 /** Plain English for the machine reason on the status strip. */

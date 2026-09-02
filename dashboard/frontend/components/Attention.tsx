@@ -21,7 +21,7 @@ export function Attention({ overview }: { overview: Overview }) {
     <div
       role="status"
       className={cn(
-        "rounded-card border border-line bg-surface",
+        "card",
         "border-l-2 pr-4 pl-3.5",
         paused ? "tint-neg border-l-neg" : "border-l-warn",
       )}

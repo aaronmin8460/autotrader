@@ -1,23 +1,31 @@
+"use client";
+
 /**
  * What the account holds - the whole broker account, not one book.
  *
  * The scope label is load-bearing. This table is the paper brokerage account in
  * full, so crypto rows and Equity Paper rows appear in it together, and a
  * reader who assumes it is the crypto book will misread every total on it. The
- * `Class` column already distinguishes the rows; the header now says what the
- * set of rows is.
+ * `Class` column already distinguishes the rows; the header says what the set
+ * of rows is, and a crypto row is tagged distinctly.
  *
  * The broker is the authority and the panel says so in its header. When the
  * broker cannot be read it falls back to the local snapshot, labels it
  * `LOCAL`, and leaves price and P&L empty rather than deriving a market value
  * from an entry price - which would be a number that looks live and is not.
  *
- * A flat account gets a real empty state naming the symbols that are flat, not
- * a table of zero rows.
+ * Weight is market value over account equity, both from the same broker read.
+ * The trend column is a price sparkline from the chart layer and nothing
+ * else: no signal, no target, no stance. Rows open the symbol detail; they are
+ * focusable and answer Enter and Space, and they issue no request of their own.
  */
 
+import type { KeyboardEvent } from "react";
+
+import type { ChartRange, ChartSeries } from "@/lib/charts";
 import {
   money,
+  percent,
   quantity,
   signTone,
   signedMoney,
@@ -27,18 +35,32 @@ import {
 } from "@/lib/format";
 import type { PositionsPanel } from "@/lib/types";
 
-import { Card, Empty, Tag, Td, Th, cn, toneText } from "./ui";
+import { Sparkline } from "./charts/Sparkline";
+import { Card, Empty, RangeSelector, Tag, Td, Th, cn, toneText } from "./ui";
 
 export function Positions({
   panel,
   generatedAt,
+  equity,
+  sparklines,
+  sparkRange,
+  onSparkRange,
+  targetWeights,
+  onSelect,
 }: {
   panel: PositionsPanel | null;
   generatedAt: string | null;
+  equity: number | null;
+  sparklines: Readonly<Record<string, ChartSeries>>;
+  sparkRange: ChartRange;
+  onSparkRange: (range: ChartRange) => void;
+  /** The paper runtime's recorded target weight per equity symbol, for context. */
+  targetWeights: Readonly<Record<string, number | null>>;
+  onSelect: (symbol: string) => void;
 }) {
   if (!panel || panel.source === "UNAVAILABLE") {
     return (
-      <Card title="Positions" bodyClassName="">
+      <Card title="Broker account positions" bodyClassName="">
         <Empty
           headline="Positions cannot be read"
           detail="Neither the broker nor the local operational database answered."
@@ -49,39 +71,34 @@ export function Positions({
 
   const meta = (
     <>
-      <Tag title="Every position on the Alpaca paper account, crypto and equity together. Not one strategy's book.">
+      <Tag title="Every position on the broker paper account, crypto and equity together. Not one strategy's book.">
         Alpaca paper account
       </Tag>
-      <Tag title={panel.note ?? "Read live from the Alpaca paper account."}>{panel.source}</Tag>
+      <Tag title={panel.note ?? "Read live from the broker paper account."}>{panel.source}</Tag>
       {panel.as_of ? (
         <span className="num text-[11px] text-ink-3">{stampUtc(panel.as_of, generatedAt)} UTC</span>
       ) : null}
+      <RangeSelector options={["1D", "5D", "1M"] as const} value={sparkRange} onChange={onSparkRange} label="Trend range" />
     </>
   );
 
-  // An empty table means two different things depending on where the answer
-  // came from. The broker saying "nothing" is an account that is flat; the
-  // local snapshot saying "nothing" while the broker is unreadable is not a
-  // claim about the account at all, and must not be worded as one.
   if (panel.rows.length === 0) {
     const fromBroker = panel.source === "BROKER";
     return (
-      <Card title="Positions" meta={meta} bodyClassName="">
+      <Card title="Broker account positions" meta={meta} bodyClassName="">
         <Empty
           headline={fromBroker ? "No open positions" : "No local position snapshot"}
           detail={
             fromBroker ? (
               panel.flat_symbols.length ? (
-                `${panel.flat_symbols.join(", ")} ${
-                  panel.flat_symbols.length === 1 ? "is" : "are"
-                } flat.`
+                `${panel.flat_symbols.join(", ")} ${panel.flat_symbols.length === 1 ? "is" : "are"} flat.`
               ) : (
                 "The paper account holds nothing."
               )
             ) : (
               <>
-                {unavailableLabel(panel.unavailable_reason)}, so what the account currently holds
-                is unknown. Nothing has been written to the local snapshot either.
+                {unavailableLabel(panel.unavailable_reason)}, so what the account currently holds is
+                unknown. Nothing has been written to the local snapshot either.
               </>
             )
           }
@@ -90,13 +107,18 @@ export function Positions({
     );
   }
 
+  const open = (symbol: string) => (event: KeyboardEvent<HTMLTableRowElement>) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onSelect(symbol);
+    }
+  };
+
   return (
     <Card title="Broker account positions" meta={meta} bodyClassName="">
-      {panel.note ? (
-        <p className="border-b border-line px-4 py-2 text-[11.5px] text-ink-3">{panel.note}</p>
-      ) : null}
+      {panel.note ? <p className="px-4 pb-2 text-[11.5px] text-ink-3">{panel.note}</p> : null}
       <div className="scroll-x">
-        <table className="w-full min-w-[640px] border-collapse">
+        <table className="w-full min-w-[860px] border-collapse">
           <thead>
             <tr className="border-b border-line">
               <Th>Asset</Th>
@@ -104,21 +126,37 @@ export function Positions({
               <Th align="right">Quantity</Th>
               <Th align="right">Price</Th>
               <Th align="right">Market value</Th>
+              <Th align="right" title="Market value over account equity, from the same broker read. The small figure is the paper runtime's recorded target for the symbol.">
+                Weight
+              </Th>
               <Th align="right">Unrealized P&L</Th>
+              <Th align="right" title="Price only. Close prices from the chart layer; no signal, stance or target is drawn.">
+                Trend {sparkRange}
+              </Th>
               <Th align="right">Updated</Th>
             </tr>
           </thead>
           <tbody>
             {panel.rows.map((row) => {
               const tone = signTone(row.unrealized_pnl);
+              const weight = equity && row.market_value !== null ? row.market_value / equity : null;
+              const target = targetWeights[row.symbol] ?? null;
+              const crypto = row.asset_class === "CRYPTO";
               return (
                 <tr
                   key={row.symbol}
-                  className="border-b border-line last:border-0 hover:bg-sunken"
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Open ${row.symbol} detail`}
+                  onClick={() => onSelect(row.symbol)}
+                  onKeyDown={open(row.symbol)}
+                  className="row-link border-b border-line/70 last:border-0 hover:bg-surface-2"
                 >
                   <Td className="font-medium text-ink">{row.symbol}</Td>
                   <Td>
-                    <Tag>{row.asset_class}</Tag>
+                    <Tag tone={crypto ? "ATTENTION" : undefined} title={crypto ? "Crypto book. Traded 24/7 by the crypto paper runtime." : "Equity book. Traded by the EDA-1 paper runtime."}>
+                      {row.asset_class}
+                    </Tag>
                   </Td>
                   <Td numeric className="text-ink">
                     {quantity(row.quantity)}
@@ -129,17 +167,38 @@ export function Positions({
                   <Td numeric className={row.market_value === null ? "text-ink-3" : "text-ink"}>
                     {money(row.market_value)}
                   </Td>
+                  <Td numeric className="text-ink">
+                    {percent(weight, 2)}
+                    {target !== null ? (
+                      <span className="ml-1.5 text-[10.5px] text-ink-3" title="Recorded target weight">
+                        / {percent(target, 2)}
+                      </span>
+                    ) : null}
+                  </Td>
                   <Td numeric>
                     {row.unrealized_pnl === null ? (
                       <span className="text-ink-3">—</span>
                     ) : (
                       <span className={cn(toneText(tone))}>
                         {signedMoney(row.unrealized_pnl)}
-                        <span className="ml-1.5 text-[11px] text-ink-3">
-                          {signedPercent(row.unrealized_pnl_fraction)}
-                        </span>
+                        <span className="ml-1.5 text-[11px] text-ink-3">{signedPercent(row.unrealized_pnl_fraction)}</span>
                       </span>
                     )}
+                  </Td>
+                  <Td align="right">
+                    <span className="inline-flex items-center justify-end gap-2">
+                      <Sparkline series={sparklines[row.symbol]} />
+                      <span
+                        className={cn(
+                          "num w-[52px] text-[11px]",
+                          sparklines[row.symbol]?.change_fraction === undefined
+                            ? "text-ink-3"
+                            : toneText(signTone(sparklines[row.symbol]?.change_fraction ?? null)),
+                        )}
+                      >
+                        {sparklines[row.symbol]?.available ? signedPercent(sparklines[row.symbol]?.change_fraction) : ""}
+                      </span>
+                    </span>
                   </Td>
                   <Td numeric className="text-ink-3">
                     {stampUtc(row.updated_at, generatedAt)}
@@ -150,6 +209,9 @@ export function Positions({
           </tbody>
         </table>
       </div>
+      <p className="px-4 pt-2 pb-3 text-[11px] text-ink-3">
+        Select a row for the symbol detail and a larger chart.
+      </p>
     </Card>
   );
 }

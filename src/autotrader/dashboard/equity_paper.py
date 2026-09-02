@@ -41,6 +41,7 @@ from autotrader.equity.paper import (
     EVENT_PAPER_STOPPED,
     ROLLOUT_STAGES,
 )
+from autotrader.risk.engine import MAX_DAILY_LOSS_FRACTION
 
 #: Where to read the equity paper record from.
 PAPER_DATABASE_PATH_ENV = "AUTOTRADER_EQUITY_PAPER_DB"
@@ -71,6 +72,24 @@ HISTORY_MAX_LIMIT = 500
 
 UNAVAILABLE_DATABASE_UNREADABLE = "DATABASE_UNREADABLE"
 UNAVAILABLE_NOT_STARTED = "SERVICE_NEVER_STARTED"
+
+#: Where a target figure came from. A recorded decision is the runtime's own
+#: row; anything else is stated as such rather than shown as a target.
+TARGET_SOURCE_RECORDED = "RECORDED_DECISION"
+TARGET_SOURCE_FLAT = "STANCE_FLAT"
+TARGET_SOURCE_NOT_RECORDED = "NOT_RECORDED"
+
+#: Where the policy figures came from.
+POLICY_SOURCE_RUNTIME = "RUNTIME_START_EVENT"
+POLICY_SOURCE_FALLBACK = "FALLBACK_REGISTRY_DEFAULT"
+
+#: The fallback policy when the runtime's own name cannot be read. Its caps
+#: are the Risk Engine's, so an unreadable policy never understates a ceiling.
+FALLBACK_POLICY_ID = "C_RESERVED_UNIVERSE"
+
+#: How many of the newest target rows are read. One row per decided order;
+#: this covers several sessions of every symbol.
+TARGET_READ_LIMIT = 400
 
 _ZERO = Decimal(0)
 
@@ -148,6 +167,27 @@ class PaperSnapshot:
     reconciliation: tuple[sqlite3.Row, ...] = ()
     safety: sqlite3.Row | None = None
     unresolved_intents: int = 0
+    #: The runtime's own record of what it wanted per decided order, newest
+    #: first. Empty on a store that predates the table.
+    targets: tuple[sqlite3.Row, ...] = ()
+
+
+def _read_targets(connection: sqlite3.Connection) -> tuple[sqlite3.Row, ...]:
+    """The newest recorded targets, or nothing on a store without the table."""
+    try:
+        return tuple(
+            connection.execute(
+                "SELECT id, client_order_id, symbol, side, target_weight, target_notional,"
+                " target_quantity, broker_quantity, requested_delta, approved_quantity,"
+                " risk_reason_code, reference_price, account_equity, external_exposure,"
+                " budget_fraction, bar_timestamp, decided_at, sizing_policy,"
+                " sizing_config_hash"
+                " FROM equity_paper_targets ORDER BY id DESC LIMIT ?",
+                (TARGET_READ_LIMIT,),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return ()
 
 
 def read_paper(path: str | Path) -> PaperSnapshot:
@@ -230,6 +270,7 @@ def read_paper(path: str | Path) -> PaperSnapshot:
                 "SELECT COUNT(*) FROM order_intents"
                 " WHERE status IN ('CREATED', 'SUBMITTING', 'UNKNOWN')"
             ).fetchone()[0]
+            targets = _read_targets(connection)
     except sqlite3.Error:
         return PaperSnapshot(ok=False, reason=UNAVAILABLE_DATABASE_UNREADABLE)
 
@@ -245,6 +286,7 @@ def read_paper(path: str | Path) -> PaperSnapshot:
         reconciliation=reconciliation,
         safety=safety,
         unresolved_intents=int(unresolved),
+        targets=targets,
     )
 
 
@@ -340,8 +382,46 @@ class ExposurePanel:
 
 
 @dataclass(frozen=True)
+class PolicyPanel:
+    """The deployed sizing policy's figures, as numbers the risk panel can use.
+
+    Read from the runtime's own start event (the policy id it announced) and
+    resolved in the allocation registry, so the target and the two hard caps
+    on screen are the ones the running process sizes and Risk enforces - not a
+    module constant that a different runtime happens to carry.
+
+    `target_slot_weight` is the per-symbol target when nothing outside the
+    equity book uses the account: `target_gross / universe_size`. The
+    runtime's actual per-order budget is `max(0, target_gross - X) /
+    universe_size`, with X the non-equity exposure at decision time, and each
+    recorded target row carries the X it was sized under.
+    """
+
+    policy_id: str
+    config_hash: str | None
+    source: str
+    authoritative: bool
+    target_gross: float
+    hard_gross_cap: float
+    hard_symbol_cap: float
+    cash_reserve_target: float
+    target_slot_weight: float
+    universe_size: int
+    fractional: bool
+    daily_loss_halt: float
+    note: str
+
+
+@dataclass(frozen=True)
 class TargetRow:
-    """One symbol: what EDA-1 wants, what the account holds, what Risk allowed."""
+    """One symbol: what EDA-1 wants, what the account holds, what Risk allowed.
+
+    The target fields come from the runtime's own `equity_paper_targets` row -
+    the newest decided order for the symbol - and are `None` when no row
+    exists. A flat stance is a target of zero, stated as such. Nothing here is
+    recomputed from the policy: the row is what the runtime actually wanted,
+    sized under the exposure it actually saw.
+    """
 
     symbol: str
     in_execution_universe: bool
@@ -354,6 +434,17 @@ class TargetRow:
     reference_close: float | None
     actual_quantity: str
     last_risk_reason: str | None
+    stance_label: str | None = None
+    target_weight: float | None = None
+    target_source: str = TARGET_SOURCE_NOT_RECORDED
+    target_notional: float | None = None
+    target_quantity: str | None = None
+    target_bar_timestamp: str | None = None
+    target_decided_at: str | None = None
+    target_external_exposure: float | None = None
+    last_order_side: str | None = None
+    last_order_client_order_id: str | None = None
+    action: str = "HOLD"
 
 
 @dataclass(frozen=True)
@@ -398,6 +489,7 @@ class EquityPaperOverview:
     targets: tuple[TargetRow, ...]
     orders: tuple[OrderRow, ...]
     safety: SafetyPanel
+    policy: PolicyPanel | None = None
 
 
 def _latest_event(snapshot: PaperSnapshot, event_type: str) -> sqlite3.Row | None:
@@ -557,6 +649,44 @@ def build_exposure(
     )
 
 
+def build_policy(policy: AllocationPolicy, service: ServicePanel) -> PolicyPanel:
+    """The policy's figures as numbers, labelled with where the name came from."""
+    authoritative = bool(service.sizing_policy) and service.sizing_policy == policy.policy_id
+    target = float(policy.budget_target)
+    return PolicyPanel(
+        policy_id=policy.policy_id,
+        config_hash=service.sizing_config_hash if authoritative else None,
+        source=POLICY_SOURCE_RUNTIME if authoritative else POLICY_SOURCE_FALLBACK,
+        authoritative=authoritative,
+        target_gross=target,
+        hard_gross_cap=float(policy.total_cap),
+        hard_symbol_cap=float(policy.per_symbol_cap),
+        cash_reserve_target=max(0.0, 1.0 - target),
+        target_slot_weight=(target / policy.universe_size) if policy.universe_size else 0.0,
+        universe_size=int(policy.universe_size),
+        fractional=bool(policy.fractional),
+        daily_loss_halt=float(MAX_DAILY_LOSS_FRACTION),
+        note=(
+            "Target gross is what the allocator aims for while every reserved slot is "
+            "active; the hard caps are what Risk refuses to project past, enforced per "
+            "order against broker truth with both books counted. The cash reserve is "
+            "one minus the target."
+            if authoritative
+            else "The runtime's policy name could not be read from its start event; these "
+            "are the fallback registry's figures and are not authoritative."
+        ),
+    )
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value))
+    except ValueError:
+        return None
+
+
 def build_targets(
     snapshot: PaperSnapshot, *, execution_universe: Sequence[str]
 ) -> tuple[TargetRow, ...]:
@@ -572,23 +702,72 @@ def build_targets(
         symbol = str(row["symbol"] or "")
         if symbol and symbol not in risk_by_symbol:
             risk_by_symbol[symbol] = str(row["reason_code"])
+    # Newest decided target per symbol. `targets` is already newest-first.
+    latest_target: dict[str, sqlite3.Row] = {}
+    for row in snapshot.targets:
+        symbol = str(row["symbol"])
+        if symbol not in latest_target:
+            latest_target[symbol] = row
 
     rows: list[TargetRow] = []
     for symbol in EQUITY_SYMBOLS:
         record = latest.get(symbol)
+        target = latest_target.get(symbol)
+        stance = int(record["eda1_stance"]) if record is not None else None
+        bar = str(record["bar_timestamp"]) if record is not None else None
+
+        if stance is None:
+            stance_label, weight, source = None, None, TARGET_SOURCE_NOT_RECORDED
+        elif stance == 0:
+            stance_label, weight, source = "FLAT", 0.0, TARGET_SOURCE_FLAT
+        elif target is not None:
+            stance_label = "LONG"
+            weight = _float_or_none(target["target_weight"])
+            source = TARGET_SOURCE_RECORDED if weight is not None else TARGET_SOURCE_NOT_RECORDED
+        else:
+            stance_label, weight, source = "LONG", None, TARGET_SOURCE_NOT_RECORDED
+
+        target_bar = None if target is None else str(target["bar_timestamp"] or "") or None
+        action = "HOLD"
+        if target is not None and bar is not None and target_bar == bar:
+            action = str(target["side"])
+
         rows.append(
             TargetRow(
                 symbol=symbol,
                 in_execution_universe=symbol in execution_universe,
-                bar_timestamp=str(record["bar_timestamp"]) if record is not None else None,
+                bar_timestamp=bar,
                 participate=bool(record["participate"]) if record is not None else None,
                 eda1_signal=str(record["eda1_signal"]) if record is not None else None,
-                eda1_stance=int(record["eda1_stance"]) if record is not None else None,
+                eda1_stance=stance,
                 v3_signal=str(record["v3_signal"]) if record is not None else None,
                 stances_agree=bool(record["stances_agree"]) if record is not None else None,
                 reference_close=record["reference_close"] if record is not None else None,
                 actual_quantity=held.get(symbol, "0"),
                 last_risk_reason=risk_by_symbol.get(symbol),
+                stance_label=stance_label,
+                target_weight=weight,
+                target_source=source,
+                target_notional=(
+                    None
+                    if target is None or stance != 1
+                    else _float_or_none(target["target_notional"])
+                ),
+                target_quantity=(
+                    None if target is None or stance != 1 else str(target["target_quantity"])
+                ),
+                target_bar_timestamp=target_bar,
+                target_decided_at=None if target is None else str(target["decided_at"]),
+                target_external_exposure=(
+                    None if target is None else _float_or_none(target["external_exposure"])
+                ),
+                last_order_side=None if target is None else str(target["side"]),
+                last_order_client_order_id=(
+                    None
+                    if target is None or target["client_order_id"] is None
+                    else str(target["client_order_id"])
+                ),
+                action=action,
             )
         )
     return tuple(rows)
@@ -671,7 +850,7 @@ def build_overview(
     if resolved_policy is None:
         # The caps are the Risk Engine's whatever the page knows about the
         # policy, so an unreadable policy name never understates a ceiling.
-        resolved_policy = allocation_policy_for("C_RESERVED_UNIVERSE")
+        resolved_policy = allocation_policy_for(FALLBACK_POLICY_ID)
     crypto = read_crypto_exposure(
         crypto_path if crypto_path is not None else crypto_database_path()
     )
@@ -685,6 +864,7 @@ def build_overview(
         targets=build_targets(snapshot, execution_universe=service.execution_universe),
         orders=build_orders(snapshot),
         safety=build_safety(snapshot),
+        policy=build_policy(resolved_policy, service),
     )
 
 
@@ -698,10 +878,18 @@ __all__ = [
     "STALE_AFTER",
     "UNAVAILABLE_DATABASE_UNREADABLE",
     "UNAVAILABLE_NOT_STARTED",
+    "FALLBACK_POLICY_ID",
+    "POLICY_SOURCE_FALLBACK",
+    "POLICY_SOURCE_RUNTIME",
+    "TARGET_READ_LIMIT",
+    "TARGET_SOURCE_FLAT",
+    "TARGET_SOURCE_NOT_RECORDED",
+    "TARGET_SOURCE_RECORDED",
     "EquityPaperOverview",
     "ExposurePanel",
     "OrderRow",
     "PaperSnapshot",
+    "PolicyPanel",
     "RegimePanel",
     "SafetyPanel",
     "ServicePanel",
@@ -709,6 +897,7 @@ __all__ = [
     "build_exposure",
     "build_orders",
     "build_overview",
+    "build_policy",
     "build_regime",
     "build_safety",
     "build_service",

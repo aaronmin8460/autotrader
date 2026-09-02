@@ -1,40 +1,45 @@
 "use client";
 
 /**
- * The dashboard. One page, and deliberately only one.
+ * Operations: account-wide operational truth.
  *
  * The composition answers the operator's questions in the order they are
- * asked: the header says whether anything is wrong, the metric row says what
- * the account is worth, the left column says what is held and what was sent,
- * and the right column says whether the machinery underneath is healthy and
- * how much risk is in use.
+ * asked: the header says whether anything is wrong, the summary cards say
+ * what the account is worth and how deployed it is against the deployed
+ * policy, the left column says what is held and what was sent across the
+ * whole account, and the right column says whether the machinery underneath
+ * is healthy and how much risk is in use.
  *
- * Several runtimes share one account, so the shared account-safety strip sits
- * directly above them: it answers "may anything trade?", which outranks any
- * service's answer to "am I running?". The runtime cards sit side by side on a
- * wide screen and stack below it.
- *
- * **Two sources, one page.** The operational API describes the account and the
- * trails written into its store; the service endpoint describes which units are
- * actually up. The second exists because the first cannot see the equity paper
- * runtime at all, and a health panel built only from the first reported the
- * masked legacy service as though it were the current equity book.
+ * **Four records, one page.** The operational API describes the broker
+ * account and the crypto store's trail; the paper API describes the deployed
+ * policy, the merged order list and which units are actually up; the chart
+ * process supplies price series and nothing else. None of them can act, and
+ * a chart failing leaves every account figure exactly as it was.
  *
  * There is no control on this page. No buy, no sell, no close, no start, no
- * stop, no editable limit - and no endpoint behind any of them, which is the
- * part that actually makes it safe.
+ * stop, no editable limit - and no endpoint behind any of them.
  */
 
+import { useCallback, useMemo, useState } from "react";
+
+import { AccountOrders } from "@/components/AccountOrders";
 import { AccountSafety } from "@/components/AccountSafety";
 import { Attention } from "@/components/Attention";
 import { Header } from "@/components/Header";
 import { Metrics } from "@/components/Metrics";
-import { Orders } from "@/components/Orders";
+import { Footer } from "@/components/Nav";
+import { Portfolio } from "@/components/Portfolio";
 import { Positions } from "@/components/Positions";
 import { Risk } from "@/components/Risk";
 import { Runtimes } from "@/components/Runtime";
+import { SymbolDetail } from "@/components/SymbolDetail";
 import { SystemHealth } from "@/components/SystemHealth";
 import { POLL_INTERVAL_MS, useOverview, useServiceUnits } from "@/lib/api";
+import { useChartBatch, type ChartRange } from "@/lib/charts";
+import { useAccountOrders } from "@/lib/orders";
+import { usePaperOverview } from "@/lib/paper";
+import { equityOf, targetVsActual } from "@/lib/portfolio";
+import { buildRiskView } from "@/lib/risk";
 
 function Loading() {
   return (
@@ -46,14 +51,12 @@ function Loading() {
 
 function Unreachable() {
   return (
-    <div className="rounded-card border border-line bg-surface px-5 py-8 text-center">
+    <div className="card px-5 py-8 text-center">
       <p className="text-[13px] text-ink-2">The dashboard API is not answering.</p>
       <p className="mx-auto mt-2 max-w-[52ch] text-[12px] leading-snug text-ink-3">
         Start it with{" "}
-        <code className="rounded-[3px] bg-sunken px-1 py-0.5 font-mono text-[11.5px] text-ink-2">
-          python -m autotrader.dashboard
-        </code>
-        . It binds 127.0.0.1:8000 and serves GET routes only.
+        <code className="rounded-[3px] bg-sunken px-1 py-0.5 font-mono text-[11.5px] text-ink-2">python -m autotrader.dashboard</code>. It
+        binds 127.0.0.1:8000 and serves GET routes only.
       </p>
     </div>
   );
@@ -62,12 +65,42 @@ function Unreachable() {
 export default function Page() {
   const { data, loading, connected, lastSuccessAt } = useOverview();
   const { services } = useServiceUnits();
+  const { data: paper } = usePaperOverview();
+  const { data: orders } = useAccountOrders();
+  const [sparkRange, setSparkRange] = useState<ChartRange>("1D");
+  const [selected, setSelected] = useState<string | null>(null);
+
+  const symbols = useMemo(() => (data?.positions?.rows ?? []).map((row) => row.symbol), [data]);
+  const { series: sparklines } = useChartBatch(symbols, sparkRange);
+
+  const policy = paper?.policy ?? null;
+  const equity = equityOf(data?.metrics ?? null);
+  const risk = useMemo(
+    () =>
+      buildRiskView(
+        data?.metrics ?? null,
+        data?.positions ?? null,
+        policy,
+        data?.risk?.limits.find((limit) => limit.key === "daily_loss") ?? null,
+      ),
+    [data, policy],
+  );
+  const targetRows = useMemo(
+    () => targetVsActual(paper?.targets ?? [], data?.positions ?? null, data?.metrics ?? null),
+    [paper, data],
+  );
+  const targetWeights = useMemo(() => {
+    const out: Record<string, number | null> = {};
+    for (const row of targetRows) out[row.symbol] = row.target_weight;
+    return out;
+  }, [targetRows]);
+  const close = useCallback(() => setSelected(null), []);
 
   return (
     <div className="min-h-full">
       <Header overview={data} connected={connected} lastSuccessAt={lastSuccessAt} />
 
-      <main className="mx-auto max-w-[1520px] px-5 py-5 sm:px-6">
+      <main className="mx-auto max-w-[1720px] px-5 py-5 sm:px-6">
         {loading && !data ? (
           <Loading />
         ) : !data ? (
@@ -76,29 +109,27 @@ export default function Page() {
           <div className="space-y-4">
             <Attention overview={data} />
 
-            <Metrics metrics={data.metrics} />
+            <Metrics metrics={data.metrics} risk={risk} />
 
-            <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-12">
-              <div className="space-y-4 lg:col-span-8">
-                <Positions panel={data.positions} generatedAt={data.generated_at} />
-                <Orders panel={data.orders} generatedAt={data.generated_at} />
-              </div>
-
-              <div className="lg:col-span-4">
-                <SystemHealth
-                  components={data.health}
-                  services={services}
-                  reconciliation={data.reconciliation}
+            <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-12">
+              <div className="space-y-4 xl:col-span-8">
+                <Positions
+                  panel={data.positions}
                   generatedAt={data.generated_at}
+                  equity={equity}
+                  sparklines={sparklines}
+                  sparkRange={sparkRange}
+                  onSparkRange={setSparkRange}
+                  targetWeights={targetWeights}
+                  onSelect={setSelected}
                 />
+                <AccountOrders panel={orders} generatedAt={orders?.generated_at ?? data.generated_at} />
+                <Portfolio positions={data.positions} metrics={data.metrics} policy={policy} />
               </div>
-            </div>
 
-            <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-12">
-              <div className="lg:col-span-4">
-                <Risk panel={data.risk} />
-              </div>
-              <div className="space-y-4 lg:col-span-8">
+              <div className="space-y-4 xl:col-span-4">
+                <SystemHealth components={data.health} services={services} reconciliation={data.reconciliation} generatedAt={data.generated_at} />
+                <Risk view={risk} />
                 <AccountSafety
                   panel={data.account_safety}
                   budget={data.api_budget}
@@ -106,22 +137,24 @@ export default function Page() {
                   lastFailureAt={data.last_failure_at}
                   generatedAt={data.generated_at}
                 />
-                <Runtimes
-                  panels={data.runtimes}
-                  services={services}
-                  generatedAt={data.generated_at}
-                />
+                <Runtimes panels={data.runtimes} services={services} generatedAt={data.generated_at} />
               </div>
             </div>
           </div>
         )}
 
-        <footer className="mt-6 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-line pt-4 text-[11px] text-ink-3">
-          <span>Read-only view. The dashboard API exposes GET routes only.</span>
-          <span>All times UTC.</span>
-          <span className="num">Refreshes every {POLL_INTERVAL_MS / 1000}s.</span>
-        </footer>
+        <Footer intervalSeconds={POLL_INTERVAL_MS / 1000} />
       </main>
+
+      <SymbolDetail
+        symbol={selected}
+        onClose={close}
+        position={data?.positions?.rows.find((row) => row.symbol === selected) ?? null}
+        equity={equity}
+        target={targetRows.find((row) => row.symbol === selected) ?? null}
+        orders={orders}
+        generatedAt={data?.generated_at ?? null}
+      />
     </div>
   );
 }

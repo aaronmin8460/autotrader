@@ -89,6 +89,7 @@ def test_each_label_names_exactly_one_unit() -> None:
         "Crypto Paper": "autotrader-crypto.service",
         "Equity Paper · EDA-1": "autotrader-equity-paper.service",
         "Equity Shadow": "autotrader-equity-shadow.service",
+        "A1-B U30 Shadow": "autotrader-equity-a1b-shadow.service",
         "Legacy Equity Runtime": "autotrader-equity.service",
     }
 
@@ -109,8 +110,43 @@ def test_only_the_legacy_unit_is_expected_to_be_off() -> None:
         "crypto": service_units.EXPECT_ACTIVE,
         "equity_paper": service_units.EXPECT_ACTIVE,
         "equity_shadow": service_units.EXPECT_ACTIVE,
+        "equity_a1b_shadow": service_units.EXPECT_ACTIVE,
         "equity_legacy": service_units.EXPECT_MASKED,
     }
+
+
+def test_the_two_observers_are_kinds_apart_from_the_two_traders() -> None:
+    """A running observer must never render as a running trader.
+
+    The service manager says `active` for both. The `kind` is what lets the
+    screen say OBSERVING in the observation colour for one and RUNNING in
+    green for the other - and it is declared on the registry, not inferred.
+    """
+    kinds = {spec.key: spec.kind for spec in service_units.SERVICE_UNITS}
+    assert kinds == {
+        "crypto": service_units.KIND_TRADING,
+        "equity_paper": service_units.KIND_TRADING,
+        "equity_shadow": service_units.KIND_OBSERVER,
+        "equity_a1b_shadow": service_units.KIND_OBSERVER,
+        "equity_legacy": service_units.KIND_LEGACY,
+    }
+    for spec in service_units.SERVICE_UNITS:
+        if spec.kind == service_units.KIND_OBSERVER:
+            assert "ZERO ORDERS" in spec.note, spec.key
+            assert "OBSERVATION ONLY" in spec.note, spec.key
+        row = service_units.classify(spec, active())
+        assert row.kind == spec.kind
+
+
+def test_the_a1b_shadow_row_says_it_cannot_order() -> None:
+    row = service_units.classify(spec_for("equity_a1b_shadow"), active())
+
+    assert row.status == "RUNNING"
+    assert row.kind == service_units.KIND_OBSERVER
+    assert row.note == "OBSERVATION ONLY · ZERO ORDERS"
+    assert row.unit == "autotrader-equity-a1b-shadow.service"
+    assert "26" in row.detail
+    assert "cancel or replace nothing" in row.detail
 
 
 # ==========================================================================
@@ -296,6 +332,7 @@ def test_every_unit_is_queried_by_its_own_name(monkeypatch: pytest.MonkeyPatch) 
         "autotrader-crypto.service",
         "autotrader-equity-paper.service",
         "autotrader-equity-shadow.service",
+        "autotrader-equity-a1b-shadow.service",
         "autotrader-equity.service",
     ]
     statuses = {row.key: row.status for row in panel.units}
@@ -303,6 +340,7 @@ def test_every_unit_is_queried_by_its_own_name(monkeypatch: pytest.MonkeyPatch) 
         "crypto": "RUNNING",
         "equity_paper": "RUNNING",
         "equity_shadow": "RUNNING",
+        "equity_a1b_shadow": "RUNNING",
         "equity_legacy": "MASKED",
     }
 
@@ -319,6 +357,7 @@ def test_the_panel_preserves_the_reading_order(monkeypatch: pytest.MonkeyPatch) 
         "crypto",
         "equity_paper",
         "equity_shadow",
+        "equity_a1b_shadow",
         "equity_legacy",
     ]
 

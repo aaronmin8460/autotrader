@@ -2,59 +2,32 @@
  * The four headline numbers.
  *
  * Four, and no more: equity, cash, the day's P&L, and how much of the account
- * is deployed. Each is one figure with one line of context under it - a caption
- * that says what the number is measured against, because a percentage with no
- * denominator on screen is a number an operator has to trust rather than read.
+ * is deployed. Each is one figure with a line of context under it - what the
+ * number is measured against - because a percentage with no denominator on
+ * screen is a number an operator has to trust rather than read.
  *
- * The tiles are deliberately plain. Only the P&L carries colour, because only
- * the P&L has a direction that means something.
+ * Exposure and cash carry the deployed policy's target and hard cap beside
+ * them, from the risk view. Not from a constant: when the policy cannot be
+ * read the context says so instead of naming a limit.
  */
 
 import { amount, money, percent, signTone, signedMoney, signedPercent } from "@/lib/format";
+import type { RiskView } from "@/lib/risk";
 import type { Amount, PrimaryMetrics } from "@/lib/types";
 
-import { Figure, Unavailable, cn, toneText } from "./ui";
+import { ExposureRail } from "./charts/ExposureRail";
+import { Figure, Metric, Status, Unavailable } from "./ui";
 
-function Tile({
-  label,
-  value,
-  caption,
-  captionTitle,
-  tone,
-}: {
-  label: string;
-  value: React.ReactNode;
-  caption: React.ReactNode;
-  captionTitle?: string;
-  tone?: "POSITIVE" | "NEGATIVE" | "NEUTRAL";
-}) {
-  return (
-    <div className="rounded-card border border-line bg-surface px-4 py-3.5">
-      <div className="eyebrow text-ink-3">{label}</div>
-      <div
-        className={cn(
-          "num mt-2 text-[26px] leading-none font-semibold tracking-[-0.02em]",
-          tone ? toneText(tone) : "text-ink",
-        )}
-      >
-        {value}
-      </div>
-      <div className="mt-2 truncate text-[11.5px] leading-none text-ink-3" title={captionTitle}>
-        {caption}
-      </div>
-    </div>
-  );
-}
-
-function cashCaption(cash: Amount, equity: Amount): string {
+function cashCaption(cash: Amount, equity: Amount, reserve: number | null): string {
   if (!cash.available || !equity.available || !equity.value) return "Settled paper cash";
-  return `${percent(cash.value! / equity.value, 1)} of equity`;
+  const share = percent(cash.value! / equity.value, 2);
+  return reserve === null ? `${share} of equity` : `${share} of equity · reserve target ${percent(reserve, 0)}`;
 }
 
-export function Metrics({ metrics }: { metrics: PrimaryMetrics | null }) {
+export function Metrics({ metrics, risk }: { metrics: PrimaryMetrics | null; risk: RiskView }) {
   if (!metrics) {
     return (
-      <div className="rounded-card border border-line bg-surface px-4 py-6">
+      <div className="card px-4 py-6">
         <Unavailable reason="DATABASE_UNREADABLE" />
       </div>
     );
@@ -62,45 +35,69 @@ export function Metrics({ metrics }: { metrics: PrimaryMetrics | null }) {
 
   const pnlTone = metrics.daily_pnl.available ? signTone(metrics.daily_pnl.value) : undefined;
   const baselineDate = metrics.daily_pnl_baseline_date;
+  const total = risk.rows.find((row) => row.key === "total") ?? null;
+  const cash = risk.rows.find((row) => row.key === "cash") ?? null;
 
   return (
     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-      <Tile
+      <Metric
         label="Portfolio equity"
         value={<Figure value={metrics.equity} render={money} />}
-        caption="Alpaca paper account"
+        context="Broker paper account · positions plus cash"
       />
-      <Tile
+      <Metric
         label="Cash"
         value={<Figure value={metrics.cash} render={money} />}
-        caption={cashCaption(metrics.cash, metrics.equity)}
+        context={cashCaption(metrics.cash, metrics.equity, cash?.target ?? null)}
+        title="Settled cash on the paper account. The reserve target is what the policy deliberately leaves undeployed."
       />
-      <Tile
+      <Metric
         label="Daily P&L"
         tone={pnlTone}
         value={<Figure value={metrics.daily_pnl} render={signedMoney} />}
-        caption={
+        context={
           metrics.daily_pnl.available
-            ? `${signedPercent(metrics.daily_pnl_fraction)} vs ${amount(
-                metrics.daily_pnl_baseline,
-              )} baseline`
+            ? `${signedPercent(metrics.daily_pnl_fraction)} vs ${amount(metrics.daily_pnl_baseline)} UTC-day baseline`
             : "Needs live equity and a stored UTC baseline"
         }
-        captionTitle={
+        title={
           baselineDate
             ? `Measured against the equity first observed on ${baselineDate} UTC.`
-            : undefined
+            : "Measured against the stored UTC-day baseline equity."
         }
       />
-      <Tile
+      <Metric
         label="Total exposure"
-        value={<Figure value={metrics.exposure} render={money} />}
-        caption={
-          metrics.exposure.available
-            ? `${percent(metrics.exposure_fraction)} of equity · 30% limit`
-            : "Needs a broker position read"
+        value={
+          metrics.exposure.available && metrics.exposure_fraction !== null ? (
+            <span className="num">{percent(metrics.exposure_fraction, 2)}</span>
+          ) : (
+            <Figure value={metrics.exposure} render={money} />
+          )
         }
-      />
+        title="Aggregate long market value against account equity, both books counted."
+        context={
+          total ? (
+            <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span className="num text-ink-2">{money(metrics.exposure.value)}</span>
+              {total.target !== null ? <span className="num">target {percent(total.target, 0)}</span> : null}
+              {total.cap !== null ? <span className="num">hard cap {percent(total.cap, 0)}</span> : null}
+              {cash?.current !== null && cash?.current !== undefined ? (
+                <span className="num">cash reserve {percent(cash.current, 2)}</span>
+              ) : null}
+              <Status tone={total.tone}>{total.status}</Status>
+            </span>
+          ) : (
+            "Policy target and cap unavailable"
+          )
+        }
+      >
+        {total?.rail ? (
+          <div className="mt-3">
+            <ExposureRail current={total.rail.current} target={total.rail.target} cap={total.rail.cap} tone={total.tone} compact />
+          </div>
+        ) : null}
+      </Metric>
     </div>
   );
 }

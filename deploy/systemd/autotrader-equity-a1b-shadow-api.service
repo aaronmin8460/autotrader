@@ -1,0 +1,83 @@
+# /etc/systemd/system/autotrader-equity-a1b-shadow-api.service
+# AutoTrader A1-B U30 SHADOW dashboard API - read-only, 127.0.0.1:8003.
+#
+# Install to /etc/systemd/system/autotrader-equity-a1b-shadow-api.service.
+#
+# A fourth API process rather than more routes on any existing one, and the
+# reason is identity rather than code. The A1-B observation record lives in
+# /var/lib/autotrader-equity-a1b-shadow, owned by `ata1bshadow` with no group
+# access, and none of the other three readers can open it - proven, not
+# assumed. Serving it from any of them would have widened their reach to a
+# record they have no business opening; this unit runs as the one identity that
+# can read it and holds nothing else.
+#
+# It runs from the dedicated dashboard tree and virtualenv under
+# /opt/autotrader-dashboard, NOT from the observer's own tree. The observer's
+# venv carries no web framework, and installing one into a venv a running
+# process depends on is the kind of change this deployment avoids on principle.
+# The dashboard venv is shared by no runtime and no observer.
+#
+# This unit reads NO activation file and NO credentials. It opens one SQLite
+# file read-only and serves it; it never contacts the broker, so it is given
+# nothing to lose. It is a reader of a record written by a process that cannot
+# trade, and there is nothing here for a gate to authorize.
+
+[Unit]
+Description=AutoTrader A1-B U30 Shadow API (read-only, 127.0.0.1)
+Documentation=file:/opt/autotrader-dashboard/app/docs/DEPLOYMENT.md
+After=network.target
+
+ConditionPathExists=/etc/autotrader/autotrader-a1b-shadow.env
+ConditionPathExists=/opt/autotrader-dashboard/venv/bin/python
+
+[Service]
+Type=simple
+User=ata1bshadow
+Group=ata1bshadow
+WorkingDirectory=/opt/autotrader-dashboard/app
+
+# One file, and no secrets in it: the path of the A1-B record.
+EnvironmentFile=/etc/autotrader/autotrader-a1b-shadow.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# No --host argument, deliberately: the entry point hardcodes 127.0.0.1, and a
+# host flag here would be a second way to get that wrong. The port is literal
+# because it is part of the frontend's rewrite table; see next.config.mjs.
+ExecStart=/opt/autotrader-dashboard/venv/bin/python -m autotrader.dashboard.a1b_shadow_api --port 8003
+
+# A viewer, not a trader. Nothing it does can be left half-finished, so unlike
+# the runtimes it restarts unconditionally.
+Restart=always
+RestartSec=5
+
+# The same state directory as the observer: a WAL reader still writes the -shm
+# index, and this is the one path the identity may write.
+StateDirectory=autotrader-equity-a1b-shadow
+StateDirectoryMode=0750
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity-a1b-shadow-api
+
+[Install]
+WantedBy=multi-user.target

@@ -11,7 +11,12 @@
  * for the browser to send back.
  */
 
-export type Tone = "NEUTRAL" | "POSITIVE" | "NEGATIVE" | "ATTENTION" | "MUTED";
+/**
+ * `SHADOW` is the one tone the backend never sends: it is the observation
+ * colour, assigned by the frontend to processes that record and cannot act,
+ * so a green row can only ever mean something that trades.
+ */
+export type Tone = "NEUTRAL" | "POSITIVE" | "NEGATIVE" | "ATTENTION" | "MUTED" | "SHADOW";
 
 export type SystemState = "HEALTHY" | "ATTENTION" | "PAUSED";
 

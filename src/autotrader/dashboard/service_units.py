@@ -91,6 +91,14 @@ STATUS_UNKNOWN = "UNKNOWN"
 EXPECT_ACTIVE = "ACTIVE"
 EXPECT_MASKED = "MASKED"
 
+#: What kind of process a unit is, which is not something a status word
+#: carries. A running observer and a running trader are both `RUNNING` to the
+#: service manager; to an operator one of them can place an order and the
+#: other structurally cannot, and the screen has to say which.
+KIND_TRADING = "TRADING"
+KIND_OBSERVER = "OBSERVER"
+KIND_LEGACY = "LEGACY"
+
 #: The properties asked for, in one call per unit. All four are needed: a
 #: masked unit reports `LoadState=masked` while `ActiveState` only says
 #: `inactive`, which is the exact confusion this module exists to remove.
@@ -127,10 +135,15 @@ class UnitSpec:
     note: str
     #: What the unit is, in one sentence, for the row's tooltip.
     description: str
+    #: Trading, observer, or legacy. Observers render as OBSERVING rather than
+    #: RUNNING on screen, in the observation colour, so a green row never
+    #: implies a process that can trade.
+    kind: str = KIND_TRADING
 
 
-#: The four units this host runs, in the order an operator should read them:
-#: the two books that trade, the observer that cannot, and the one that is off.
+#: The five units this host runs, in the order an operator should read them:
+#: the two books that trade, the two observers that cannot, and the one that
+#: is off.
 SERVICE_UNITS: tuple[UnitSpec, ...] = (
     UnitSpec(
         key="crypto",
@@ -165,6 +178,21 @@ SERVICE_UNITS: tuple[UnitSpec, ...] = (
             "The independent V3 and EDA-1 observer. It records what it would have "
             "done and can submit, cancel or replace nothing."
         ),
+        kind=KIND_OBSERVER,
+    ),
+    UnitSpec(
+        key="equity_a1b_shadow",
+        label="A1-B U30 Shadow",
+        unit="autotrader-equity-a1b-shadow.service",
+        expectation=EXPECT_ACTIVE,
+        note="OBSERVATION ONLY · ZERO ORDERS",
+        description=(
+            "The A1-B U30 archetype-allocation observer over the frozen 26-symbol "
+            "universe. It records hypothetical target weights per bar and can "
+            "submit, cancel or replace nothing: its observation table refuses any "
+            "order linkage by constraint."
+        ),
+        kind=KIND_OBSERVER,
     ),
     UnitSpec(
         key="equity_legacy",
@@ -177,6 +205,7 @@ SERVICE_UNITS: tuple[UnitSpec, ...] = (
             "and deliberately masked. Masked is its correct state: it is off on "
             "purpose, and current equity paper trading does not depend on it."
         ),
+        kind=KIND_LEGACY,
     ),
 )
 
@@ -200,6 +229,7 @@ class ServiceUnitRow:
     detail: str
     expected: bool
     healthy: bool
+    kind: str = KIND_TRADING
     load_state: str | None = None
     active_state: str | None = None
     sub_state: str | None = None
@@ -299,6 +329,7 @@ def classify(spec: UnitSpec, properties: dict[str, str] | None) -> ServiceUnitRo
         "label": spec.label,
         "unit": spec.unit,
         "note": spec.note,
+        "kind": spec.kind,
     }
 
     if properties is None:
@@ -461,6 +492,9 @@ def build_panel(
 __all__ = [
     "EXPECT_ACTIVE",
     "EXPECT_MASKED",
+    "KIND_LEGACY",
+    "KIND_OBSERVER",
+    "KIND_TRADING",
     "QUERY_TIMEOUT_SECONDS",
     "SERVICE_UNITS",
     "STATUS_FAILED",

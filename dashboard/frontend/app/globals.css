@@ -9,8 +9,15 @@
    so light mode is not a second design to maintain - it is the same design
    with one block of variables swapped.
 
-   Greens and reds are reserved for financial and safety semantics. Nothing
-   here is decorative colour.
+   Colour is semantic, and there are exactly five semantics:
+
+     green   healthy · positive P&L · safe
+     red     loss · error · a hard cap actually breached
+     amber   warning · degraded · near a limit
+     violet  observation · simulation · a shadow that cannot trade
+     gray    masked · inactive · metadata
+
+   Nothing here is decorative colour, and status is never colour alone.
    -------------------------------------------------------------------------- */
 
 @theme {
@@ -23,6 +30,7 @@
 
   --color-canvas: var(--app-canvas);
   --color-surface: var(--app-surface);
+  --color-surface-2: var(--app-surface-2);
   --color-sunken: var(--app-sunken);
   --color-line: var(--app-line);
   --color-line-strong: var(--app-line-strong);
@@ -33,43 +41,48 @@
   --color-neg: var(--app-neg);
   --color-warn: var(--app-warn);
   --color-accent: var(--app-accent);
+  --color-observe: var(--app-observe);
 
-  --radius-card: 8px;
+  --radius-card: 10px;
 }
 
 :root {
   color-scheme: dark;
 
-  --app-canvas: #0a0c0d;
-  --app-surface: #101315;
-  --app-sunken: #0d1011;
-  --app-line: #1e2427;
-  --app-line-strong: #2b3236;
-  --app-ink: #e7eaeb;
-  --app-ink-2: #98a1a6;
-  --app-ink-3: #6a7378;
-  --app-pos: #46b26a;
-  --app-neg: #e0574f;
-  --app-warn: #cf9a3a;
-  --app-accent: #6ea8d8;
+  --app-canvas: #08090b;
+  --app-surface: #0e1114;
+  --app-surface-2: #13181c;
+  --app-sunken: #0b0e10;
+  --app-line: #1a2025;
+  --app-line-strong: #28313a;
+  --app-ink: #e9ecee;
+  --app-ink-2: #9ba5ab;
+  --app-ink-3: #66717a;
+  --app-pos: #41b36a;
+  --app-neg: #e35a52;
+  --app-warn: #d7a23f;
+  --app-accent: #5ea6de;
+  --app-observe: #9d8df5;
 }
 
 @media (prefers-color-scheme: light) {
   :root {
     color-scheme: light;
 
-    --app-canvas: #f4f5f6;
+    --app-canvas: #f3f4f6;
     --app-surface: #ffffff;
-    --app-sunken: #fafbfb;
-    --app-line: #e2e5e7;
-    --app-line-strong: #cfd4d7;
-    --app-ink: #14181a;
-    --app-ink-2: #5d666b;
-    --app-ink-3: #8b9498;
-    --app-pos: #1a7f42;
-    --app-neg: #c23934;
-    --app-warn: #8a6212;
-    --app-accent: #2f6f9f;
+    --app-surface-2: #f8f9fa;
+    --app-sunken: #f5f6f7;
+    --app-line: #e3e6e9;
+    --app-line-strong: #cfd5da;
+    --app-ink: #14181b;
+    --app-ink-2: #5b6570;
+    --app-ink-3: #8a949c;
+    --app-pos: #1b7f45;
+    --app-neg: #c33a35;
+    --app-warn: #8c6414;
+    --app-accent: #2b6ea3;
+    --app-observe: #5f4fd1;
   }
 }
 
@@ -101,6 +114,23 @@ body {
   font-weight: 500;
 }
 
+/* The card: one hairline, a slightly lifted surface, no inner borders. */
+.card {
+  background-color: var(--color-surface);
+  border: 1px solid color-mix(in srgb, var(--color-line) 85%, transparent);
+  border-radius: var(--radius-card);
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--color-canvas) 60%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--color-canvas) 30%, transparent);
+}
+
+/* A definition term that carries a tooltip. Dotted, never underlined. */
+.hint {
+  text-decoration: underline dotted color-mix(in srgb, var(--color-ink-3) 70%, transparent);
+  text-underline-offset: 3px;
+  cursor: help;
+}
+
 /* Tables scroll inside their own card rather than moving the page. */
 .scroll-x {
   overflow-x: auto;
@@ -120,6 +150,21 @@ body {
   background-color: transparent;
 }
 
+/* Clickable rows: a focus ring that survives dark mode. */
+.row-link {
+  cursor: pointer;
+}
+
+.row-link:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+/* Drawer transitions, removed entirely under reduced motion. */
+.drawer-panel {
+  transition: transform 160ms ease-out;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -134,7 +179,7 @@ body {
 
    The only place a semantic colour is used as a background rather than as
    text. Mixed against the surface so the card still reads as a card, not as a
-   coloured banner - reserved for the two states that mean something is wrong.
+   coloured banner.
    -------------------------------------------------------------------------- */
 
 .tint-neg {
@@ -143,4 +188,12 @@ body {
 
 .tint-warn {
   background-color: color-mix(in srgb, var(--color-warn) 8%, var(--color-surface));
+}
+
+.tint-observe {
+  background-color: color-mix(in srgb, var(--color-observe) 7%, var(--color-surface));
+}
+
+.tint-pos {
+  background-color: color-mix(in srgb, var(--color-pos) 7%, var(--color-surface));
 }

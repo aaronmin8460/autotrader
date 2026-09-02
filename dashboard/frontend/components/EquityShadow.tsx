@@ -26,6 +26,7 @@ import {
   type ServicePanel,
   STATUS_REASON_LABELS,
   type SymbolRow,
+  shadowStatusLabel,
   shadowTone,
 } from "@/lib/shadow";
 
@@ -47,16 +48,16 @@ export function ShadowBanner() {
   return (
     <section
       aria-label="Equity Shadow scope"
-      className="rounded-card border border-warn/35 bg-[color-mix(in_srgb,var(--color-warn)_7%,var(--color-surface))] px-5 py-4"
+      className="card tint-observe px-5 py-4"
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <span className="text-[13px] leading-none font-semibold tracking-tight text-ink">
           Equity — Shadow observation only
         </span>
-        <Tag title="No order can be submitted, cancelled, or replaced by this process.">
+        <Tag tone="SHADOW" title="No order can be submitted, cancelled, or replaced by this process.">
           Zero order mutation
         </Tag>
-        <Tag title="V3 is the production engine. EDA-1 is a research champion under observation.">
+        <Tag tone="SHADOW" title="V3 is the production engine. EDA-1 is a research champion under observation.">
           V3 + EDA-1 side by side
         </Tag>
       </div>
@@ -94,10 +95,11 @@ export function ShadowService({
 
   return (
     <Card
+      tone="SHADOW"
       title="Shadow service"
       meta={
         <>
-          <Pill tone={tone}>{service.status}</Pill>
+          <Pill tone={tone} emphasis>{shadowStatusLabel(service.status)}</Pill>
           <Tag title={service.mode}>{service.mode}</Tag>
         </>
       }
@@ -146,17 +148,15 @@ export function ShadowService({
       <div
         className={cn(
           "mt-5 rounded-[6px] border px-4 py-3",
-          invariantOk
-            ? "border-line bg-sunken"
-            : "border-neg/45 bg-[color-mix(in_srgb,var(--color-neg)_8%,var(--color-surface))]",
+          invariantOk ? "border-observe/30 bg-sunken" : "border-neg/45 tint-neg",
         )}
       >
         <div className="flex items-center gap-2">
-          <Dot tone={invariantOk ? "POSITIVE" : "NEGATIVE"} />
+          <Dot tone={invariantOk ? "SHADOW" : "NEGATIVE"} />
           <span
             className={cn(
               "text-[11px] leading-none font-medium tracking-[0.06em] uppercase",
-              toneText(invariantOk ? "POSITIVE" : "NEGATIVE"),
+              toneText(invariantOk ? "SHADOW" : "NEGATIVE"),
             )}
           >
             {invariantOk ? "Zero-order invariant holds" : "Zero-order invariant violated"}
@@ -214,6 +214,7 @@ export function ShadowRegime({
   const on = regime.participate;
   return (
     <Card
+      tone="SHADOW"
       title="EDA-1 regime"
       meta={<Pill tone={on ? "POSITIVE" : "MUTED"}>{on ? "Participate" : "Defensive / V3"}</Pill>}
     >
@@ -317,6 +318,7 @@ export function ShadowSymbols({
 
   return (
     <Card
+      tone="SHADOW"
       title="V3 vs EDA-1 — latest bar"
       meta={<Tag title="Both engines evaluated the same bar.">{recorded.length} symbols</Tag>}
       bodyClassName="p-0"
@@ -435,9 +437,9 @@ export function ShadowHypothetical({ panel }: { panel: HypotheticalPanel | null 
 
   return (
     <Card
+      tone="SHADOW"
       title="Hypothetical portfolio"
-      meta={<Pill tone="ATTENTION">{panel.label}</Pill>}
-      className="border-warn/30"
+      meta={<Pill tone="SHADOW" emphasis>{panel.label}</Pill>}
     >
       <p className="mb-4 max-w-[92ch] text-[12px] leading-snug text-ink-2">
         An equal-weight book that followed each engine&apos;s recorded stance, compounded from a
@@ -482,10 +484,10 @@ export function ShadowComparison({ panel }: { panel: ComparisonPanel | null }) {
   }
 
   return (
-    <Card title="V3 vs EDA-1 — comparison">
+    <Card tone="SHADOW" title="V3 vs EDA-1 — comparison">
       {/* The sample warning is unconditional and first. A caveat below the
           numbers is a caveat read after the conclusion has been formed. */}
-      <div className="mb-4 rounded-[6px] border border-warn/35 bg-[color-mix(in_srgb,var(--color-warn)_6%,var(--color-surface))] px-4 py-3">
+      <div className="mb-4 rounded-[6px] border border-warn/35 tint-warn px-4 py-3">
         <div className="flex items-center gap-2">
           <Dot tone="ATTENTION" />
           <span className="text-[11px] leading-none font-medium tracking-[0.06em] text-warn uppercase">

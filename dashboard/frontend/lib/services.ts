@@ -1,5 +1,5 @@
 /**
- * Live service state, and the composition that keeps three equity services apart.
+ * Live service state, and the composition that keeps five services apart.
  *
  * The operations page reads its health panel from the operational API, which
  * derives every runtime row from what a runtime wrote into *that* store. For
@@ -14,8 +14,13 @@
  * with rows read from the service manager itself, one query per named unit.
  *
  * The endpoint lives behind `/api/equity-paper/` because that is the process
- * that serves it - the least privileged of the three readers - and it is
- * GET-only, no-store, and behind the same authentication as everything else.
+ * that serves it - the least privileged of the readers - and it is GET-only,
+ * no-store, and behind the same authentication as everything else.
+ *
+ * **Observers are not traders, and the status word must not say they are.**
+ * The service manager reports `active` for a process that can place an order
+ * and for one that structurally cannot. Each unit therefore carries a `kind`,
+ * and a running observer renders as OBSERVING in the observation colour.
  *
  * Deliberately free of React, so the composition below can be run directly by
  * the test suite. The poll that feeds it lives in `lib/api`.
@@ -39,6 +44,8 @@ export type ServiceStatus =
   | "NOT INSTALLED"
   | "UNKNOWN";
 
+export type ServiceKind = "TRADING" | "OBSERVER" | "LEGACY";
+
 export interface ServiceUnitRow {
   key: string;
   label: string;
@@ -52,6 +59,8 @@ export interface ServiceUnitRow {
   expected: boolean;
   /** Not an error condition. Masked-on-purpose is healthy; stopped is not. */
   healthy: boolean;
+  /** Optional on the wire for older API builds; the registry fills it in. */
+  kind?: ServiceKind;
   load_state: string | null;
   active_state: string | null;
   sub_state: string | null;
@@ -70,13 +79,14 @@ export interface ServiceUnitsPanel {
 export interface HealthRow extends HealthComponent {
   note?: string | null;
   unit?: string | null;
+  kind?: ServiceKind;
 }
 
 /**
  * The units, their labels, and their unit names - mirroring the backend registry.
  *
  * Duplicated deliberately. When the service endpoint cannot be reached the page
- * must still name the four services and say it does not know their state; the
+ * must still name the five services and say it does not know their state; the
  * alternative is falling back to the trail-derived rows, which is exactly the
  * misreading this module exists to end. An unreachable status source is
  * reported as unknown, never as stopped and never as running.
@@ -86,35 +96,49 @@ export const SERVICE_UNITS: ReadonlyArray<{
   label: string;
   unit: string;
   note: string;
+  kind: ServiceKind;
 }> = [
   {
     key: "crypto",
     label: "Crypto Paper",
     unit: "autotrader-crypto.service",
     note: "PAPER · NO REAL MONEY",
+    kind: "TRADING",
   },
   {
     key: "equity_paper",
     label: "Equity Paper · EDA-1",
     unit: "autotrader-equity-paper.service",
     note: "PAPER · NO REAL MONEY",
+    kind: "TRADING",
   },
   {
     key: "equity_shadow",
     label: "Equity Shadow",
     unit: "autotrader-equity-shadow.service",
     note: "OBSERVATION ONLY · ZERO ORDERS",
+    kind: "OBSERVER",
+  },
+  {
+    key: "equity_a1b_shadow",
+    label: "A1-B U30 Shadow",
+    unit: "autotrader-equity-a1b-shadow.service",
+    note: "OBSERVATION ONLY · ZERO ORDERS",
+    kind: "OBSERVER",
   },
   {
     key: "equity_legacy",
     label: "Legacy Equity Runtime",
     unit: "autotrader-equity.service",
     note: "INTENTIONALLY OFF",
+    kind: "LEGACY",
   },
 ];
 
 /** The unit whose masked state must never be read as current equity trading. */
 export const LEGACY_EQUITY_KEY = "equity_legacy";
+
+export const A1B_SHADOW_KEY = "equity_a1b_shadow";
 
 /**
  * Which unit each of the operational API's trail panels is actually about.
@@ -136,6 +160,30 @@ export function trailPanelLabel(panelKey: string, fallback: string): string {
   return SERVICE_UNITS.find((spec) => spec.key === unitKey)?.label ?? fallback;
 }
 
+export function kindOf(key: string, sent?: ServiceKind): ServiceKind {
+  return sent ?? SERVICE_UNITS.find((spec) => spec.key === key)?.kind ?? "TRADING";
+}
+
+/**
+ * The word and colour a unit's status should carry on screen.
+ *
+ * A running observer says OBSERVING in the observation colour: green would
+ * read as "trading", and that is precisely the claim it cannot make. A
+ * masked legacy unit stays neutral; every other mapping is the backend's own.
+ */
+export function displayStatus(row: {
+  key: string;
+  status: string;
+  tone: Tone;
+  kind?: ServiceKind;
+}): { status: string; tone: Tone } {
+  const kind = kindOf(row.key, row.kind);
+  if (kind === "OBSERVER" && row.status === "RUNNING") {
+    return { status: "OBSERVING", tone: "SHADOW" };
+  }
+  return { status: row.status, tone: row.tone };
+}
+
 /** Rows for when the status source itself could not be read. */
 export function unknownServiceRows(): HealthRow[] {
   return SERVICE_UNITS.map((spec) => ({
@@ -145,18 +193,21 @@ export function unknownServiceRows(): HealthRow[] {
     tone: "ATTENTION" as Tone,
     note: spec.note,
     unit: spec.unit,
+    kind: spec.kind,
     detail: `The service manager could not be asked about ${spec.unit}. This is a statement about the query, not about the service.`,
   }));
 }
 
 function toHealthRow(unit: ServiceUnitRow): HealthRow {
+  const shown = displayStatus(unit);
   return {
     key: `service_${unit.key}`,
     label: unit.label,
-    status: unit.status,
-    tone: unit.tone,
+    status: shown.status,
+    tone: shown.tone,
     note: unit.note,
     unit: unit.unit,
+    kind: kindOf(unit.key, unit.kind),
     detail: unit.detail,
   };
 }
