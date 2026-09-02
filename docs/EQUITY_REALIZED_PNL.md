@@ -123,6 +123,15 @@ crypto fill ends up in an equity ledger. Every execution is joined to its
 order, which does say; an execution whose order cannot be read is **skipped and
 reported**, never assumed to be equity.
 
+Because of that join, the order read reaches **thirty days further back** than
+the execution read: an order submitted before the window can still produce an
+execution inside it. It cannot happen with today's same-second market fills,
+which is precisely the reason to handle it — the ledger would otherwise be
+correct only because of a property of the current order type. A pass that still
+finds an execution it cannot explain re-reads the whole order record once and
+retries, at a cost of one extra request on an already-anomalous pass. An
+execution with no order at all remains unresolved and reported.
+
 **Dividends** are not trade P&L and have no path into these numbers.
 
 **Fees.** Where this broker charges equity regulatory fees, it charges them as
