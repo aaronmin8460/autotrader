@@ -199,6 +199,7 @@ class A1BMarkBars:
         now: datetime,
     ) -> dict[str, pd.DataFrame]:
         """15m bars over the completed sessions strictly before `before`."""
+        from autotrader.data.historical import RESOLUTION
         from autotrader.equity.data import fetch_bars_for_symbols
 
         require_utc(now, "now")
@@ -212,9 +213,13 @@ class A1BMarkBars:
                 f"No completed session window strictly before {before.isoformat()} "
                 "could be resolved for the mark fingerprints; nothing was computed."
             )
-        start, end = lookback_window(window, latest_bar_start=window[-1].close_utc)
+        # The newest completed bar of the window's final session starts one
+        # resolution before that session's close — the sibling convention.
+        start, end = lookback_window(window, latest_bar_start=window[-1].close_utc - RESOLUTION)
         self.api_calls += 1
-        frames = fetch_bars_for_symbols(self._resolve_client(), list(symbols), start, end)
+        frames = fetch_bars_for_symbols(
+            self._resolve_client(), list(symbols), start, end - RESOLUTION
+        )
         out: dict[str, pd.DataFrame] = {}
         for symbol, frame in frames.items():
             if frame.empty:
