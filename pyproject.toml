@@ -53,6 +53,9 @@ version = { attr = "autotrader.__version__" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"autotrader.equity" = ["a1b_policy.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
