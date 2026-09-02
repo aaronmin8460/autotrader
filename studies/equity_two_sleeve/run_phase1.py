@@ -71,7 +71,9 @@ def _corr(a: pd.Series, b: pd.Series) -> dict[str, float | int]:
     return {
         "n": int(len(joined)),
         "pearson": float(x.corr(y)),
-        "spearman": float(x.corr(y, method="spearman")),
+        # Spearman as Pearson-of-ranks: the venv carries no scipy by repo
+        # convention (the study stack is numpy/pandas-native).
+        "spearman": float(x.rank().corr(y.rank())),
     }
 
 
