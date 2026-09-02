@@ -873,6 +873,8 @@
    "ward_agreement": 0.8835720844396397
   }
  ],
+ "grid_reference_mark": "2026-08-11",
+ "grid_reference_note": "The research mark grid runs on the reference symbol's observed-session axis, which lacks one exchange session the broker calendar has; live marks therefore anchor to the research grid's final mark and count calendar sessions forward from it.",
  "incumbents": [
   "AAPL",
   "AMZN",

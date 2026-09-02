@@ -778,28 +778,35 @@ class EquityA1BShadowRuntime:
         )
         return resolved.participate
 
-    def _sessions_since_anchor(self, day: date) -> int:
-        sessions = self._calendar.sessions_between(self._policy.mark_anchor, day)
-        if not sessions or sessions[0].session_date != self._policy.mark_anchor:
+    def _reference_axis(self, day: date):
+        """Calendar sessions from the grid reference mark through `day`.
+
+        The research grid ran on the reference symbol's observed-session
+        axis, which lacks one exchange session the calendar has; anchoring
+        at the research grid's final mark makes the two grids identical at
+        the handover and unambiguous forward.
+        """
+        sessions = self._calendar.sessions_between(self._policy.grid_reference_mark, day)
+        if not sessions or sessions[0].session_date != self._policy.grid_reference_mark:
             raise EquityError(
-                f"The calendar's session axis does not begin at the mark anchor "
-                f"{self._policy.mark_anchor.isoformat()}; the mark grid cannot be "
-                "resolved."
+                f"The calendar's session axis does not begin at the grid reference "
+                f"mark {self._policy.grid_reference_mark.isoformat()}; the mark grid "
+                "cannot be resolved."
             )
-        index = len(sessions) - 1
         if sessions[-1].session_date != day:
             raise EquityError(
                 f"{day.isoformat()} is not on the calendar's session axis; the "
                 "mark grid cannot be resolved."
             )
-        return index
+        return sessions
 
     def _ensure_mark_state(
         self, session: MarketSession, moment: datetime
     ) -> tuple[int, date, tuple[dict[str, float], dict[str, float]]]:
         """Resolve (and compute at most once) the mark governing `session`."""
         day = session.session_date
-        index = self._sessions_since_anchor(day)
+        axis = self._reference_axis(day)
+        index = len(axis) - 1
         mark_index = governing_mark(self._policy, index)
         row = self._connection.execute(
             "SELECT mark_date, active_weights_json, reserved_weights_json"
@@ -813,8 +820,7 @@ class EquityA1BShadowRuntime:
                 (json.loads(row[1]), json.loads(row[2])),
             )
 
-        sessions = self._calendar.sessions_between(self._policy.mark_anchor, day)
-        mark_day = sessions[mark_index].session_date
+        mark_day = axis[mark_index].session_date
         fit = governing_fit(self._policy, mark_day)
         z_by_symbol: dict[str, dict[str, float]] = {}
         labels: dict[str, int] = {}

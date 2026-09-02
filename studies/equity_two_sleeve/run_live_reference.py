@@ -80,20 +80,22 @@ def main() -> None:
             break
     if next_session is None:
         raise SystemExit("No upcoming session could be resolved from the calendar.")
-    full_axis = calendar.sessions_between(policy.mark_anchor, next_session.session_date)
-    index = len(full_axis) - 1
+    ref_axis = calendar.sessions_between(policy.grid_reference_mark, next_session.session_date)
+    if ref_axis[0].session_date != policy.grid_reference_mark:
+        raise SystemExit("The calendar axis does not begin at the grid reference mark.")
+    index = len(ref_axis) - 1
     mark_index = governing_mark(policy, index)
-    mark_day = full_axis[mark_index].session_date
+    mark_day = ref_axis[mark_index].session_date
+    report["grid_reference_mark"] = policy.grid_reference_mark.isoformat()
     report["next_session"] = next_session.session_date.isoformat()
-    report["next_session_index"] = index
+    report["next_session_offset_from_reference"] = index
     report["governing_mark_index"] = mark_index
     report["governing_mark_date"] = mark_day.isoformat()
     _log(
-        f"next session {next_session.session_date} (index {index}) → "
-        f"governing mark index {mark_index} = {mark_day}"
+        f"next session {next_session.session_date} (offset {index} from "
+        f"{policy.grid_reference_mark}) → governing mark offset {mark_index} = {mark_day}"
     )
-    if mark_index < len(axis_dates) and axis_dates[mark_index] != mark_day:
-        raise SystemExit("Mark index does not resolve consistently on the calendar axis.")
+    _ = axis_dates  # research-axis audit recorded above; grid runs on the reference anchor
 
     # ------------------------------------------------------------------
     # The shipped mark computation on freshly fetched bars.

@@ -79,6 +79,13 @@ class A1BPolicy:
     surviving_features: tuple[str, ...]
     fits: tuple[A1BFit, ...]
     mark_anchor: date
+    #: The research grid's FINAL mark. The research session axis (the
+    #: reference symbol's observed sessions) lacks one exchange session the
+    #: broker calendar has, so a naive calendar count from the anchor lands
+    #: one session early late in the region. Live marks therefore anchor
+    #: here — a date both axes agree on by construction — and count calendar
+    #: sessions forward.
+    grid_reference_mark: date
     mark_every_sessions: int
     mult_clip: tuple[float, float]
     per_symbol_cap: float
@@ -115,6 +122,7 @@ def load_policy() -> A1BPolicy:
         surviving_features=tuple(data["surviving_features"]),
         fits=tuple(fits),
         mark_anchor=date.fromisoformat(data["mark_anchor"]),
+        grid_reference_mark=date.fromisoformat(data["grid_reference_mark"]),
         mark_every_sessions=int(data["mark_every_sessions"]),
         mult_clip=(float(data["mult_clip"][0]), float(data["mult_clip"][1])),
         per_symbol_cap=float(data["per_symbol_cap"]),
@@ -133,12 +141,13 @@ def governing_fit(policy: A1BPolicy, mark: date) -> A1BFit | None:
     return chosen
 
 
-def governing_mark(policy: A1BPolicy, sessions_since_anchor: int) -> int:
-    """Index (on the anchored session axis) of the mark governing the session
-    `sessions_since_anchor` sessions after the anchor (anchor itself = 0)."""
-    if sessions_since_anchor < 0:
-        raise A1BPolicyError("The governing session precedes the mark anchor.")
-    return (sessions_since_anchor // policy.mark_every_sessions) * policy.mark_every_sessions
+def governing_mark(policy: A1BPolicy, sessions_since_reference: int) -> int:
+    """Offset (on the reference-anchored session axis) of the governing mark
+    for the session `sessions_since_reference` sessions after the grid
+    reference mark (the reference itself = 0)."""
+    if sessions_since_reference < 0:
+        raise A1BPolicyError("The governing session precedes the grid reference mark.")
+    return (sessions_since_reference // policy.mark_every_sessions) * policy.mark_every_sessions
 
 
 # ----------------------------------------------------------------------
