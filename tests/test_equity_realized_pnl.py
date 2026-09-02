@@ -1179,9 +1179,26 @@ def test_the_status_panel_reports_the_tracking_horizon(ledger: sqlite3.Connectio
     panel = readmodel.build_status(ledger)
 
     assert panel.status == store.RECON_CLEAN
-    assert panel.tracking_label == "REALIZED SINCE EQUITY PAPER ACTIVATION"
+    assert panel.tracking_label == "REALIZED SINCE 2026-09-01 14:30 UTC · WHOLE CONFIRMED HISTORY"
     assert panel.execution_granularity == GRANULARITY_EXECUTION
     assert panel.basis_method == accounting_models.BASIS_WEIGHTED_AVERAGE
+
+
+def test_the_tracking_label_never_says_all_time_and_never_says_activation() -> None:
+    """The horizon is the first confirmed execution, which on this deployment
+    precedes the strategy's activation - a hand-run submission smoke came
+    first. Labelling it "since activation" would be wrong and flattering."""
+    complete = readmodel.tracking_label(
+        "2026-08-31T13:34:37.514772+00:00", readmodel.COMPLETENESS_WHOLE_HISTORY
+    )
+    partial = readmodel.tracking_label("2026-08-31T13:34:37.514772+00:00", "CUTOVER")
+
+    assert complete == "REALIZED SINCE 2026-08-31 13:34 UTC · WHOLE CONFIRMED HISTORY"
+    assert partial == "REALIZED SINCE 2026-08-31 13:34 UTC"
+    for label in (complete, partial):
+        assert "ALL TIME" not in label.upper()
+        assert "ACTIVATION" not in label.upper()
+    assert readmodel.tracking_label(None, None) == "REALIZED P&L NOT YET TRACKED"
 
 
 def test_an_unbootstrapped_ledger_reports_unknown_not_clean(
@@ -1481,7 +1498,10 @@ def test_the_events_route_filters_and_bounds(api_client) -> None:
 def test_the_status_route_carries_the_reconciliation_rows(api_client) -> None:
     payload = api_client.get("/api/equity-paper/realized-pnl/status").json()
 
-    assert payload["status"]["tracking_label"] == "REALIZED SINCE EQUITY PAPER ACTIVATION"
+    assert (
+        payload["status"]["tracking_label"]
+        == "REALIZED SINCE 2026-09-01 14:30 UTC · WHOLE CONFIRMED HISTORY"
+    )
     assert payload["reconciliation"][0]["symbol"] == "SPY"
     assert payload["reconciliation"][0]["quantity_matches"] is True
 

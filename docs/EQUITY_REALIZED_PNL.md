@@ -274,8 +274,14 @@ the broker's own figure over open equity positions. Realized is what confirmed
 equity sales released. **They are not required to sum**, and nothing on the
 page adds them.
 
-The horizon is always stated, from the ledger's own metadata. It never says
-"all time" unless the whole history was proven.
+The horizon is always stated, from the ledger's own metadata, as a timestamp —
+`REALIZED SINCE 2026-08-31 13:34 UTC · WHOLE CONFIRMED HISTORY`. It never says
+"all time", and it deliberately never says "since activation": on this
+deployment the first confirmed execution *precedes* EDA-1's activation, because
+a hand-run submission smoke came first, so "since activation" would be both
+wrong and flattering. The `· WHOLE CONFIRMED HISTORY` suffix appears only when
+the replay reached the first execution the account ever had; without it a
+reader is right to assume there is history the ledger does not have.
 
 When the status is not `CLEAN` it renders in the strip, in the target-vs-actual
 header, and in the symbol drawer — a reader scanning any of those must be able

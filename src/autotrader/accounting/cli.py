@@ -193,11 +193,14 @@ def events(
         typer.echo("No realized events.")
         return
     typer.echo(
-        f"{'TIME':<26}{'SYM':<7}{'QTY':>16}{'PRICE':>11}{'COST':>11}{'REALIZED':>12}  SOURCE"
+        f"{'TIME (UTC)':<21}{'SYM':<7}{'QTY':>16}{'PRICE':>11}{'COST':>11}{'REALIZED':>12}  SOURCE"
     )
     for row in rows:
+        # Seconds, not microseconds: the extra six digits push every other
+        # column out of alignment and say nothing an operator reads.
+        stamp = row.realized_at[:19].replace("T", " ")
         typer.echo(
-            f"{row.realized_at:<26}{row.symbol:<7}{row.quantity:>16}"
+            f"{stamp:<21}{row.symbol:<7}{row.quantity:>16}"
             f"{row.execution_price:>11.2f}{row.average_cost_before:>11.2f}"
             f"{row.net_realized_pnl:>+12.2f}  {row.provenance}"
         )

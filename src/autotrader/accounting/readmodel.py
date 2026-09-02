@@ -75,6 +75,34 @@ def utc_day(now: datetime) -> str:
     return now.astimezone(UTC).date().isoformat()
 
 
+#: `historical_completeness` meaning "there is nothing before the horizon" -
+#: the replay reached the first execution the account ever had.
+COMPLETENESS_WHOLE_HISTORY = "EXACT_REPLAY_FROM_ACCOUNT_OPEN"
+
+
+def tracking_label(tracking_started_at: str | None, completeness: str | None) -> str:
+    """What horizon the figures cover, in words a screen can show verbatim.
+
+    Always names the timestamp, and says "all time" never. The horizon here is
+    the account's **first confirmed execution**, which on this deployment is
+    earlier than the strategy's activation - a hand-run submission smoke came
+    first - so calling it "since activation" would be both wrong and
+    flattering. When the replay reached that first execution the label adds
+    that nothing precedes it; otherwise it is a bare "since", and a reader is
+    right to assume there is history the ledger does not have.
+    """
+    if not tracking_started_at:
+        return "REALIZED P&L NOT YET TRACKED"
+    try:
+        moment = datetime.fromisoformat(tracking_started_at).astimezone(UTC)
+        stamp = moment.strftime("%Y-%m-%d %H:%M UTC")
+    except ValueError:  # pragma: no cover - metadata is written by this package
+        stamp = tracking_started_at
+    if completeness == COMPLETENESS_WHOLE_HISTORY:
+        return f"REALIZED SINCE {stamp} · WHOLE CONFIRMED HISTORY"
+    return f"REALIZED SINCE {stamp}"
+
+
 # --------------------------------------------------------------------------
 # Rows
 # --------------------------------------------------------------------------
@@ -247,11 +275,7 @@ def build_status(connection: sqlite3.Connection) -> AccountingStatusPanel:
         store.RECON_UNKNOWN: TONE_ATTENTION,
     }.get(status, TONE_ATTENTION)
 
-    label = (
-        "REALIZED SINCE EQUITY PAPER ACTIVATION"
-        if metadata.historical_completeness == "EXACT_REPLAY_FROM_ACCOUNT_OPEN"
-        else f"REALIZED SINCE {metadata.tracking_started_at}"
-    )
+    label = tracking_label(metadata.tracking_started_at, metadata.historical_completeness)
 
     return AccountingStatusPanel(
         status=status,
@@ -436,6 +460,7 @@ def build_events(
 
 
 __all__ = [
+    "COMPLETENESS_WHOLE_HISTORY",
     "DISPLAY_QUANTUM",
     "AccountingStatusPanel",
     "RealizedEventRow",
@@ -445,5 +470,6 @@ __all__ = [
     "build_events",
     "build_status",
     "build_summary",
+    "tracking_label",
     "utc_day",
 ]
