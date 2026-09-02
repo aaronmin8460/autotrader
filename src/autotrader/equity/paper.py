@@ -391,9 +391,35 @@ CREATE_PAPER_TARGETS = """
 
 
 def create_paper_target_table(connection: sqlite3.Connection) -> None:
-    """Ensure the durable target record exists. Idempotent."""
+    """Ensure the durable target record exists, at the current shape. Idempotent.
+
+    A store from before the audit-key finding carries this table with
+    ``client_order_id TEXT NOT NULL`` - the shape the finding replaced, because
+    the id is minted by the execution boundary and cannot exist when the row is
+    first written. ``CREATE TABLE IF NOT EXISTS`` never upgrades an existing
+    table, and no order was placed between that fix shipping and the first
+    fractional cycle, so the very first live target write is what found it: an
+    IntegrityError before any broker call (the fail-closed direction, but also
+    a runtime that cannot record a target at all). A legacy-shaped table is
+    therefore rebuilt in place here - same columns, rows preserved - so the
+    on-demand creator owns the whole lifecycle of the table it creates.
+    """
     with state.transaction(connection):
-        connection.execute(CREATE_PAPER_TARGETS)
+        legacy = any(
+            row[1] == "client_order_id" and row[3]
+            for row in connection.execute("PRAGMA table_info(equity_paper_targets)")
+        )
+        if legacy:
+            connection.execute(
+                "ALTER TABLE equity_paper_targets RENAME TO equity_paper_targets_legacy"
+            )
+            connection.execute(CREATE_PAPER_TARGETS)
+            connection.execute(
+                "INSERT INTO equity_paper_targets SELECT * FROM equity_paper_targets_legacy"
+            )
+            connection.execute("DROP TABLE equity_paper_targets_legacy")
+        else:
+            connection.execute(CREATE_PAPER_TARGETS)
 
 
 class ExternalSafetySource(Protocol):

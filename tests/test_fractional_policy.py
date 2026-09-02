@@ -947,3 +947,115 @@ def test_a_fractional_full_cycle_targets_ninety_percent(
     for _, side, quantity in gateway.calls:
         assert side is OrderSide.BUY
         assert quantity == quantity.quantize(FRACTIONAL_SHARE_INCREMENT)
+
+
+# ==========================================================================
+# The legacy target-table shape - the first live finding of this migration
+# ==========================================================================
+
+
+def test_a_legacy_target_table_is_rebuilt_in_place_with_rows_preserved(
+    tmp_path: Path,
+) -> None:
+    """CRITICAL. Found live on the first fractional cycle, 2026-09-02 13:49Z.
+
+    A store from before the audit-key fix declares client_order_id NOT NULL,
+    and CREATE IF NOT EXISTS never upgrades it - so the NULL-first target
+    write, whose whole point is surviving a crash before an id exists, hit an
+    IntegrityError before any broker call. The creator now rebuilds the legacy
+    shape in place, keeping every audit row.
+    """
+    from autotrader.equity.paper import create_paper_target_table
+
+    database = tmp_path / "legacy.db"
+    initialize_database(database)
+    legacy_create = """
+        CREATE TABLE equity_paper_targets (
+            id                 INTEGER PRIMARY KEY,
+            client_order_id    TEXT NOT NULL UNIQUE CHECK (client_order_id <> ''),
+            engine             TEXT NOT NULL CHECK (engine <> ''),
+            environment        TEXT NOT NULL CHECK (environment = 'PAPER'),
+            sizing_policy      TEXT NOT NULL CHECK (sizing_policy <> ''),
+            sizing_config_hash TEXT NOT NULL CHECK (sizing_config_hash <> ''),
+            rollout_stage      TEXT NOT NULL CHECK (rollout_stage <> ''),
+            symbol             TEXT NOT NULL CHECK (symbol <> ''),
+            side               TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+            target_weight      TEXT NOT NULL,
+            target_notional    TEXT NOT NULL,
+            target_quantity    TEXT NOT NULL,
+            broker_quantity    TEXT NOT NULL,
+            requested_delta    TEXT NOT NULL,
+            approved_quantity  TEXT,
+            risk_reason_code   TEXT,
+            reference_price    TEXT NOT NULL,
+            account_equity     TEXT NOT NULL,
+            external_exposure  TEXT NOT NULL,
+            budget_fraction    TEXT NOT NULL,
+            bar_timestamp      TEXT NOT NULL,
+            decided_at         TEXT NOT NULL
+        )
+    """
+    audit_row = (
+        "autotrader-legacy-1",
+        "EDA1_RGP",
+        "PAPER",
+        "C_RESERVED_UNIVERSE",
+        "c47288c2",
+        "C",
+        "SPY",
+        "BUY",
+        "0.03",
+        "3000",
+        "3",
+        "0",
+        "3",
+        "3",
+        "APPROVED",
+        "765.80",
+        "99854.92",
+        "0.05",
+        "0.25",
+        "2026-08-31T17:00:00+00:00",
+        "2026-08-31T17:20:28+00:00",
+    )
+    with connect(database) as connection:
+        connection.execute(legacy_create)
+        connection.execute(
+            "INSERT INTO equity_paper_targets ("
+            " client_order_id, engine, environment, sizing_policy,"
+            " sizing_config_hash, rollout_stage, symbol, side, target_weight,"
+            " target_notional, target_quantity, broker_quantity, requested_delta,"
+            " approved_quantity, risk_reason_code, reference_price, account_equity,"
+            " external_exposure, budget_fraction, bar_timestamp, decided_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            audit_row,
+        )
+        connection.commit()
+
+        create_paper_target_table(connection)
+
+        notnull = {
+            row[1]: row[3] for row in connection.execute("PRAGMA table_info(equity_paper_targets)")
+        }
+        assert notnull["client_order_id"] == 0  # nullable, the current shape
+        kept = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT client_order_id, symbol, target_weight FROM equity_paper_targets"
+            )
+        ]
+        assert kept == [("autotrader-legacy-1", "SPY", "0.03")]
+        # The write that found the defect: a row with no key yet.
+        connection.execute(
+            "INSERT INTO equity_paper_targets ("
+            " client_order_id, engine, environment, sizing_policy,"
+            " sizing_config_hash, rollout_stage, symbol, side, target_weight,"
+            " target_notional, target_quantity, broker_quantity, requested_delta,"
+            " approved_quantity, risk_reason_code, reference_price, account_equity,"
+            " external_exposure, budget_fraction, bar_timestamp, decided_at"
+            ") VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            audit_row[1:],
+        )
+        # And a second modern store is untouched by the check. Idempotent.
+        create_paper_target_table(connection)
+        assert connection.execute("SELECT COUNT(*) FROM equity_paper_targets").fetchone()[0] == 2
