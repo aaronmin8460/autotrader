@@ -434,6 +434,7 @@ class EquityA1BShadowRuntime:
             )
             for symbol in self._policy.u30
         }
+        self._mark_cache: dict[date, tuple[int, date, tuple[dict, dict]]] = {}
         self._started = False
 
     # ------------------------------------------------------------------
@@ -803,8 +804,16 @@ class EquityA1BShadowRuntime:
     def _ensure_mark_state(
         self, session: MarketSession, moment: datetime
     ) -> tuple[int, date, tuple[dict[str, float], dict[str, float]]]:
-        """Resolve (and compute at most once) the mark governing `session`."""
+        """Resolve (and compute at most once) the mark governing `session`.
+
+        The resolved answer is cached in memory per session date: the mark
+        cannot change within a session, so later cycles of the same session
+        cost neither a calendar call nor a database read.
+        """
         day = session.session_date
+        cached = self._mark_cache.get(day)
+        if cached is not None:
+            return cached
         axis = self._reference_axis(day)
         index = len(axis) - 1
         mark_index = governing_mark(self._policy, index)
@@ -814,11 +823,13 @@ class EquityA1BShadowRuntime:
             (mark_index,),
         ).fetchone()
         if row is not None:
-            return (
+            resolved = (
                 mark_index,
                 date.fromisoformat(row[0]),
                 (json.loads(row[1]), json.loads(row[2])),
             )
+            self._mark_cache[day] = resolved
+            return resolved
 
         mark_day = axis[mark_index].session_date
         fit = governing_fit(self._policy, mark_day)
@@ -878,7 +889,9 @@ class EquityA1BShadowRuntime:
             fit_mark=fit.fit_mark.isoformat() if fit is not None else None,
             labeled_symbols=len(labels),
         )
-        return mark_index, mark_day, (active, reserved)
+        resolved = (mark_index, mark_day, (active, reserved))
+        self._mark_cache[day] = resolved
+        return resolved
 
     def _observe_symbol(
         self,
