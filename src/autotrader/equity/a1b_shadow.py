@@ -174,6 +174,86 @@ def create_a1b_tables(connection: sqlite3.Connection) -> None:
     connection.executescript(_A1B_TABLES)
 
 
+class A1BUniverseBars:
+    """The per-cycle `ShadowBarSource` for the 26-name observation universe.
+
+    The sibling's `ShadowEquityBars` goes through the trading data boundary,
+    whose closed ten-name whitelist this universe exceeds; the request here
+    is therefore built directly against the historical stock-bars client —
+    which has no order surface of any kind — with symbols validated against
+    the frozen policy manifest instead. Bars are UNADJUSTED, exactly like the
+    sibling's and the trading runtime's V3 windows, so the ten shared names'
+    decisions stay comparable bar-for-bar.
+    """
+
+    def __init__(
+        self,
+        calendar: MarketCalendar,
+        universe: tuple[str, ...],
+        client: object | None = None,
+    ) -> None:
+        self._calendar = calendar
+        self._universe = tuple(universe)
+        self._client = client
+        self.api_calls = 0
+
+    def _resolve_client(self) -> object:
+        if self._client is None:
+            from autotrader.equity.data import create_client
+
+            self._client = create_client()
+        return self._client
+
+    def recent_bars(
+        self,
+        symbols,
+        *,
+        now: datetime,
+        latest_bar_start: datetime,
+        lookback_bars: int,
+    ) -> dict[str, pd.DataFrame]:
+        """Fetch the bounded completed window for the whole universe at once."""
+        from autotrader.data.historical import RESOLUTION
+        from autotrader.equity.data import build_bars_request, to_canonical_frame
+        from autotrader.equity.session import sessions_needed
+        from autotrader.equity.shadow import filter_to_shadow_sessions
+
+        count = require_shadow_lookback_bars(lookback_bars)
+        latest = require_utc(latest_bar_start, "latest_bar_start")
+        require_utc(now, "now")
+        allowed = set(self._universe)
+        tickers = []
+        for symbol in symbols:
+            normalized = str(symbol).strip().upper()
+            if normalized not in allowed:
+                raise EquityError(
+                    f"{symbol!r} is not in the frozen U30 observation manifest; "
+                    "this bar source refuses symbols outside the policy artifact."
+                )
+            tickers.append(normalized)
+        sessions = recent_sessions(
+            self._calendar,
+            day=market_date(latest),
+            count=sessions_needed(count),
+        )
+        start, end = lookback_window(sessions, latest_bar_start=latest)
+        request = build_bars_request(tickers, start, end - RESOLUTION, None)
+        self.api_calls += 1
+        barset = self._resolve_client().get_stock_bars(request)
+        data = getattr(barset, "data", None)
+        returned = (
+            {str(key): list(value) for key, value in data.items()} if isinstance(data, dict) else {}
+        )
+        return {
+            ticker: filter_to_shadow_sessions(
+                to_canonical_frame(returned.get(ticker, []), ticker),
+                sessions,
+                lookback_bars=count,
+            )
+            for ticker in tickers
+        }
+
+
 class A1BMarkBars:
     """Session-history source for mark fingerprints: one batched request per
     mark over the frozen 45-name z cross-section. The same market-data
@@ -198,11 +278,33 @@ class A1BMarkBars:
         before: date,
         now: datetime,
     ) -> dict[str, pd.DataFrame]:
-        """15m bars over the completed sessions strictly before `before`."""
+        """15m bars over the completed sessions strictly before `before`.
+
+        This request is built directly rather than through the trading data
+        boundary's `fetch_bars_for_symbols`, whose closed ten-name whitelist
+        protects the trading system's risk arithmetic, API budget, and
+        reconciliation scope — none of which this observation-only read can
+        reach. Symbols are validated against the frozen policy cross-section
+        instead, and the request is **split-adjusted** (the research
+        fingerprint convention: raw bars turn a split into a phantom crash,
+        which would corrupt every beta/vol/drawdown fingerprint).
+        """
+        from alpaca.data.enums import Adjustment
+
         from autotrader.data.historical import RESOLUTION
-        from autotrader.equity.data import fetch_bars_for_symbols
+        from autotrader.equity.data import build_bars_request, to_canonical_frame
 
         require_utc(now, "now")
+        allowed = set(symbols)
+        tickers = []
+        for symbol in symbols:
+            normalized = symbol.strip().upper()
+            if normalized not in allowed:
+                raise EquityError(
+                    f"{symbol!r} is not in the frozen fingerprint cross-section; "
+                    "the mark fetch refuses symbols outside the policy artifact."
+                )
+            tickers.append(normalized)
         window = recent_sessions(
             self._calendar,
             day=before - timedelta(days=1),
@@ -216,17 +318,21 @@ class A1BMarkBars:
         # The newest completed bar of the window's final session starts one
         # resolution before that session's close — the sibling convention.
         start, end = lookback_window(window, latest_bar_start=window[-1].close_utc - RESOLUTION)
+        request = build_bars_request(tickers, start, end - RESOLUTION, Adjustment.SPLIT)
         self.api_calls += 1
-        frames = fetch_bars_for_symbols(
-            self._resolve_client(), list(symbols), start, end - RESOLUTION
+        barset = self._resolve_client().get_stock_bars(request)
+        data = getattr(barset, "data", None)
+        returned = (
+            {str(key): list(value) for key, value in data.items()} if isinstance(data, dict) else {}
         )
         out: dict[str, pd.DataFrame] = {}
-        for symbol, frame in frames.items():
+        for ticker in tickers:
+            frame = to_canonical_frame(returned.get(ticker, []), ticker)
             if frame.empty:
-                out[symbol] = frame
+                out[ticker] = frame
                 continue
             mask = session_bar_mask(window, list(frame["timestamp"]))
-            out[symbol] = frame.loc[mask].reset_index(drop=True)
+            out[ticker] = frame.loc[mask].reset_index(drop=True)
         return out
 
 
@@ -909,6 +1015,7 @@ __all__ = [
     "MARK_HISTORY_SESSIONS",
     "A1BCycleReport",
     "A1BMarkBars",
+    "A1BUniverseBars",
     "A1BShadowConfig",
     "A1BSymbolResult",
     "EquityA1BShadowRuntime",

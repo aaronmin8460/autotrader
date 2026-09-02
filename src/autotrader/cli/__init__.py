@@ -1790,10 +1790,12 @@ def equity_a1b_shadow(
 
     Exits 0 on a clean stop and 1 on a controlled refusal or fatal failure.
     """
+    from autotrader.equity.a1b_policy import load_policy as _load_a1b_policy
     from autotrader.equity.a1b_shadow import (
         EQUITY_A1B_SHADOW_LOCK_SCOPE,
         A1BMarkBars,
         A1BShadowConfig,
+        A1BUniverseBars,
         EquityA1BShadowRuntime,
     )
 
@@ -1838,7 +1840,7 @@ def equity_a1b_shadow(
             calendar = AlpacaMarketCalendar()
             runtime = EquityA1BShadowRuntime(
                 connection,
-                market_data=ShadowEquityBars(calendar),
+                market_data=A1BUniverseBars(calendar, _load_a1b_policy().u30),
                 regime_data=RegimeEquityBars(calendar),
                 mark_data=A1BMarkBars(calendar),
                 calendar=calendar,
