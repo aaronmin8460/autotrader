@@ -1726,6 +1726,178 @@ def equity_shadow(
         raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE)
 
 
+EQUITY_A1B_SHADOW_DATABASE_PATH = Path("data/autotrader-a1b-shadow.db")
+
+
+@app.command(name="equity-a1b-shadow")
+def equity_a1b_shadow(
+    once: bool = typer.Option(
+        False,
+        "--once",
+        help="Process the current cycle once and exit, without waiting.",
+    ),
+    safety_delay: float = typer.Option(
+        DEFAULT_SAFETY_DELAY.total_seconds(),
+        "--safety-delay",
+        help=(
+            "Seconds to wait after a 15-minute boundary before treating the bar "
+            "that just closed as fetchable."
+        ),
+    ),
+    lookback_bars: int = typer.Option(
+        DEFAULT_SHADOW_LOOKBACK_BARS,
+        "--lookback-bars",
+        help="Completed base bars fetched per cycle for the V3 context.",
+    ),
+    state_sessions: int = typer.Option(
+        DEFAULT_STATE_SESSIONS,
+        "--state-sessions",
+        help="Completed sessions behind the EDA-1 regime state.",
+    ),
+    database: Annotated[
+        Path,
+        typer.Option(
+            "--db",
+            help=(
+                "The A1-B shadow's own state database. Never the trading database "
+                "and never the sibling shadow's: a database that has ever held an "
+                "order intent is refused, and one whose mark states were computed "
+                "under a different frozen policy is refused."
+            ),
+        ),
+    ] = EQUITY_A1B_SHADOW_DATABASE_PATH,
+) -> None:
+    """Run the Equity A1-B U30 LIVE SHADOW: hypothetical allocations, zero orders.
+
+    Watches the frozen 26-name U30 universe on completed regular-session
+    15-minute bars, runs the V3 decision engine on each newest completed bar
+    (non-incumbent names under the proven reference alias), resolves the
+    EDA-1 participation state once per session, computes the frozen A1-B
+    archetype allocation at each 21-session mark, and records the
+    hypothetical target weight per symbol per bar — designation
+    SIMULATED_SHADOW, order linkage NULL by table constraint.
+
+    \b
+    What makes this a shadow rather than a runtime with its gates shut:
+      * there is no execution path to disable - the runtime's constructor has
+        no execution parameter and holds no gateway
+      * no environment gate and no confirmation token exist here, because
+        there is nothing they could authorize
+      * the shadow keeps its own database and refuses one that has ever held
+        an order intent, re-verified after every cycle
+      * the observation table itself refuses any designation other than
+        SIMULATED_SHADOW and any non-NULL order linkage, by CHECK constraint
+
+    Exits 0 on a clean stop and 1 on a controlled refusal or fatal failure.
+    """
+    from autotrader.equity.a1b_shadow import (
+        EQUITY_A1B_SHADOW_LOCK_SCOPE,
+        A1BMarkBars,
+        A1BShadowConfig,
+        EquityA1BShadowRuntime,
+    )
+
+    _configure_runtime_logging(verbose=False)
+
+    code_sha: str | None = None
+    try:
+        from autotrader.smoke.gitinfo import git_state
+
+        code_sha = git_state(Path(".")).sha
+    except Exception:  # noqa: BLE001 - provenance is recorded, never required
+        code_sha = None
+
+    try:
+        config = A1BShadowConfig(
+            safety_delay=timedelta(seconds=safety_delay),
+            lookback_bars=lookback_bars,
+            state_sessions=state_sessions,
+            code_sha=code_sha,
+        )
+    except (ScheduleError, EquityError) as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE) from None
+
+    try:
+        initialize_database(database)
+    except StateError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE) from None
+
+    lock = RuntimeLock(lock_path_for(database, scope=EQUITY_A1B_SHADOW_LOCK_SCOPE))
+    try:
+        lock.acquire()
+    except RuntimeLockError as error:
+        typer.secho(str(error), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE) from None
+
+    shutdown = ShutdownRequest()
+    shutdown.install()
+    try:
+        with connect(database) as connection:
+            calendar = AlpacaMarketCalendar()
+            runtime = EquityA1BShadowRuntime(
+                connection,
+                market_data=ShadowEquityBars(calendar),
+                regime_data=RegimeEquityBars(calendar),
+                mark_data=A1BMarkBars(calendar),
+                calendar=calendar,
+                config=config,
+                shutdown=shutdown,
+            )
+            try:
+                runtime.start()
+            except ShadowIntegrityError as error:
+                typer.secho(str(error), fg=typer.colors.RED, err=True)
+                raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE) from None
+            policy = runtime.policy
+            typer.echo("AUTO TRADER - EQUITY A1-B U30 LIVE SHADOW")
+            typer.echo("")
+            typer.echo(_field("Environment", "OBSERVATION ONLY"))
+            typer.echo(_field("Universe", f"{len(policy.u30)} symbols (frozen U30 manifest)"))
+            typer.echo(_field("Policy Hash", policy.policy_hash[:16]))
+            typer.echo(
+                _field(
+                    "Mark Grid",
+                    (
+                        f"every {policy.mark_every_sessions} sessions from "
+                        f"{policy.mark_anchor.isoformat()}"
+                    ),
+                )
+            )
+            typer.echo(_field("Session", "US regular hours, broker calendar"))
+            typer.echo(_field("Mode", "single cycle" if once else "daemon"))
+            typer.echo(_field("Database", str(database)))
+            typer.echo(_field("Lock", str(lock.path)))
+            typer.echo("")
+            typer.secho(
+                "ZERO ORDER MUTATION: this process holds no execution path. "
+                "Hypothetical allocations are",
+                bold=True,
+            )
+            typer.secho(
+                "recorded as SIMULATED_SHADOW; no order can be submitted, cancelled, or replaced.",
+                bold=True,
+            )
+            typer.echo("")
+            try:
+                if once:
+                    runtime.run_cycle()
+                else:
+                    runtime.run_forever()
+            finally:
+                runtime.stop()
+            state_value = runtime.state
+    finally:
+        shutdown.restore()
+        lock.release()
+
+    if state_value is RuntimeState.FAILED:
+        typer.echo("")
+        typer.secho("A1-B SHADOW STOPPED ON A FATAL ERROR", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EQUITY_SHADOW_REFUSED_EXIT_CODE)
+
+
 def _echo_equity_paper_banner(
     runtime: EquityPaperRuntime,
     *,
