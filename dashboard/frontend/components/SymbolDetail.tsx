@@ -4,25 +4,31 @@
  * The symbol detail drawer: what the account holds in one symbol, what the
  * paper runtime wants there, and a larger price chart.
  *
- * Every figure has one source and the drawer names it. Price, quantity,
- * market value, average entry and unrealized P&L are the broker's; weight is
- * the broker's market value over the broker's equity; stance and target are
- * the paper runtime's own recorded decision. The chart is provider bars from
- * the chart layer, with the broker's average entry drawn across it and the
- * book's real EQUITY PAPER fills marked on it - and nothing else.
+ * Every figure has one source and the drawer names it. Price, quantity, market
+ * value, average entry and unrealized P&L are the broker's; weight is the
+ * broker's market value over the broker's equity; stance and target are the
+ * paper runtime's own recorded decision. The chart is provider bars from the
+ * chart layer, with the broker's average entry drawn across it and the book's
+ * real EQUITY PAPER fills marked on it — and nothing else.
+ *
+ * `LONG`, `FLAT`, `BUY`, `SELL`, `HOLD` and the symbol are authoritative and
+ * are printed identically in both locales; in Korean a gloss appears beside a
+ * stance rather than in place of it.
  */
 
 import { useState } from "react";
 
 import { CHART_RANGES, useChartBatch, type ChartRange } from "@/lib/charts";
 import { fillsFor, fillsWithin } from "@/lib/fills";
-import { money, percent, quantity, signTone, signedMoney, signedPercent, stampUtc } from "@/lib/format";
+import { money, percent, signTone } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
+import { useFormat } from "@/lib/i18n/useFormat";
 import type { AccountOrdersPanel } from "@/lib/orders";
 import type { TargetVsActualRow } from "@/lib/portfolio";
 import type { PositionRow } from "@/lib/types";
 
 import { LineChart } from "./charts/LineChart";
-import { Drawer, Field, Pill, RangeSelector, Tag, cn, toneText } from "./ui";
+import { Drawer, Field, Pill, SegmentedTimeRange, Tag, cn, toneText } from "./ui";
 
 export function SymbolDetail({
   symbol,
@@ -41,6 +47,8 @@ export function SymbolDetail({
   orders: AccountOrdersPanel | null;
   generatedAt: string | null;
 }) {
+  const { t, gloss } = useI18n();
+  const format = useFormat();
   const [range, setRange] = useState<ChartRange>("1D");
   const symbols = symbol ? [symbol] : [];
   const { series } = useChartBatch(symbols, range);
@@ -48,7 +56,8 @@ export function SymbolDetail({
 
   if (!symbol) return null;
 
-  const weight = position && equity && position.market_value !== null ? position.market_value / equity : null;
+  const weight =
+    position && equity && position.market_value !== null ? position.market_value / equity : null;
   const fills = fillsWithin(fillsFor(orders, symbol), current?.first_at ?? null, current?.last_at ?? null);
   const pnlTone = signTone(position?.unrealized_pnl);
   const crypto = position?.asset_class === "CRYPTO";
@@ -61,44 +70,51 @@ export function SymbolDetail({
       meta={
         <>
           {position ? <Tag tone={crypto ? "ATTENTION" : undefined}>{position.asset_class}</Tag> : null}
-          <Tag title="Broker paper account. No real money.">Paper</Tag>
+          <Tag title={t("strategies.noRealMoneyHint")}>Paper</Tag>
         </>
       }
     >
       <div className="grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-3 lg:grid-cols-4">
-        <Field label="Current price" title="Implied by the broker's own market value and quantity.">
+        <Field label={t("drawer.currentPrice")} title={t("drawer.currentPriceHint")}>
           <span className="num">{money(position?.price)}</span>
         </Field>
-        <Field label="Quantity">
-          <span className="num">{quantity(position?.quantity)}</span>
+        <Field label={t("positions.col.quantity")}>
+          <span className="num">{format.quantity(position?.quantity)}</span>
         </Field>
-        <Field label="Market value">
+        <Field label={t("drawer.marketValue")}>
           <span className="num">{money(position?.market_value)}</span>
         </Field>
-        <Field label="Portfolio weight" title="Broker market value over broker equity, same read.">
+        <Field label={t("drawer.portfolioWeight")} title={t("drawer.portfolioWeightHint")}>
           <span className="num">{percent(weight, 2)}</span>
         </Field>
-        <Field label="Average entry" title="The broker's average entry price for the open position.">
+        <Field label={t("positions.col.avgEntry")} title={t("drawer.avgEntryHint")}>
           <span className="num">{money(position?.average_entry_price)}</span>
         </Field>
-        <Field label="Unrealized P&L">
+        <Field label={t("pnl.unrealized")}>
           {position?.unrealized_pnl === null || position?.unrealized_pnl === undefined ? (
             <span className="text-ink-3">—</span>
           ) : (
             <span className={cn("num", toneText(pnlTone))}>
-              {signedMoney(position.unrealized_pnl)}
-              <span className="ml-1.5 text-[11px] text-ink-3">{signedPercent(position.unrealized_pnl_fraction)}</span>
+              {format.signedMoney(position.unrealized_pnl)}
+              <span className="ms-1.5 text-meta text-ink-3">
+                {format.signedPercent(position.unrealized_pnl_fraction)}
+              </span>
             </span>
           )}
         </Field>
-        <Field label="Current stance" title="EDA-1's recorded stance on the latest completed bar.">
+        <Field label={t("drawer.currentStance")} title={t("drawer.currentStanceHint")}>
           {target?.stance ? (
-            <Pill tone={target.stance === "LONG" ? "POSITIVE" : "MUTED"}>{target.stance}</Pill>
+            <span className="inline-flex items-center gap-2">
+              <Pill tone={target.stance === "LONG" ? "POSITIVE" : "MUTED"}>{target.stance}</Pill>
+              {gloss(target.stance) ? (
+                <span className="text-meta text-ink-3">{gloss(target.stance)}</span>
+              ) : null}
+            </span>
           ) : (
-            <span className="text-ink-3">{crypto ? "Crypto book" : "N/A"}</span>
+            <span className="text-ink-3">{crypto ? t("drawer.cryptoBook") : "N/A"}</span>
           )}
         </Field>
-        <Field label="Target vs actual weight" title="Target: the paper runtime's newest recorded decision. Actual: broker weight now.">
+        <Field label={t("drawer.targetVsActualWeight")} title={t("drawer.targetVsActualWeightHint")}>
           <span className="num">
             {target && target.target_weight !== null ? percent(target.target_weight, 2) : "N/A"}
             <span className="text-ink-3"> / </span>
@@ -107,38 +123,50 @@ export function SymbolDetail({
         </Field>
       </div>
 
-      <div className="mt-5 flex items-center justify-between gap-3">
-        <h3 className="text-[12.5px] font-semibold text-ink">Price</h3>
-        <RangeSelector options={CHART_RANGES} value={range} onChange={setRange} label="Chart range" />
+      <div className="mt-6 flex items-center justify-between gap-3">
+        <h3 className="text-table font-semibold text-ink">{t("drawer.price")}</h3>
+        <SegmentedTimeRange
+          options={CHART_RANGES}
+          value={range}
+          onChange={setRange}
+          label={t("chart.range")}
+        />
       </div>
       <div className="mt-2">
         <LineChart
           series={current}
           entryPrice={position?.average_entry_price ?? null}
-          markers={fills.map((fill) => ({ at: fill.at, side: fill.side, price: fill.price, label: fill.label }))}
+          markers={fills.map((fill) => ({
+            at: fill.at,
+            side: fill.side,
+            price: fill.price,
+            label: fill.label,
+          }))}
         />
       </div>
 
       {target ? (
-        <dl className="mt-4 grid grid-cols-2 gap-x-5 gap-y-3 border-t border-line pt-4 sm:grid-cols-4">
-          <Field label="Action (latest bar)" title="The decided side on the latest bar, or HOLD when no order was decided.">
-            <span className="text-[12px] font-medium tracking-[0.06em] uppercase">{target.action}</span>
+        <dl className="mt-5 grid grid-cols-2 gap-x-5 gap-y-3 border-t border-subtle pt-4 sm:grid-cols-4">
+          <Field label={t("drawer.action")} title={t("drawer.actionHint")}>
+            <span className="text-table font-medium tracking-[0.06em] uppercase">{target.action}</span>
           </Field>
-          <Field label="Last decision">
-            <span className="num">{target.last_decision_at ? stampUtc(target.last_decision_at, generatedAt) : "—"}</span>
+          <Field label={t("drawer.lastDecision")}>
+            <span className="num">
+              {target.last_decision_at ? format.stamp(target.last_decision_at, generatedAt) : "—"}
+            </span>
           </Field>
-          <Field label="Target value">
+          <Field label={t("drawer.targetValue")}>
             <span className="num">{money(target.target_value)}</span>
           </Field>
-          <Field label="Delta vs target">
-            <span className={cn("num", toneText(signTone(target.delta_value)))}>{signedMoney(target.delta_value)}</span>
+          <Field label={t("drawer.deltaVsTarget")}>
+            <span className={cn("num", toneText(signTone(target.delta_value)))}>
+              {format.signedMoney(target.delta_value)}
+            </span>
           </Field>
         </dl>
       ) : null}
 
-      <p className="mt-4 text-[11px] leading-snug text-ink-3">
-        Read-only. Nothing on this panel can place, cancel or modify an order.
-      </p>
+      <p className="mt-5 text-meta leading-snug text-ink-3">{t("drawer.readOnly")}</p>
     </Drawer>
   );
 }

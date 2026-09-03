@@ -241,13 +241,28 @@ test("a trail panel is titled by the unit it is really about", () => {
 // Navigation
 // =========================================================================
 
-test("the navigation exposes exactly the three sections", () => {
-  const nav = source("components/Nav.tsx");
+test("the navigation keeps every deployed route and adds no per-strategy tab", () => {
+  // Dashboard V3 replaced the three-tab strip with a sidebar and ADDED four
+  // sections. The three deployed, bookmarked routes must still be present and
+  // unrenamed - a redesign is not a reason for a dead link.
+  const nav = source("components/shell/nav-model.ts");
   for (const href of ['href: "/"', 'href: "/equity-paper"', 'href: "/shadows"']) {
-    assert.ok(nav.includes(href), `Nav.tsx is missing ${href}`);
+    assert.ok(nav.includes(href), `nav-model.ts is missing ${href}`);
   }
-  assert.ok(!nav.includes('"/equity-shadow"'), "a per-strategy shadow tab crept back into the nav");
-  assert.ok(!nav.includes('"/a1b"'), "a per-strategy shadow tab crept back into the nav");
+  for (const href of ['href: "/portfolio"', 'href: "/strategies"', 'href: "/orders"', 'href: "/risk"', 'href: "/system"']) {
+    assert.ok(nav.includes(href), `nav-model.ts is missing ${href}`);
+  }
+  // A shadow strategy is a card inside Shadows, never a destination of its own.
+  assert.ok(!nav.includes('href: "/equity-shadow"'), "a per-strategy shadow tab crept back in");
+  assert.ok(!nav.includes('"/a1b"'), "a per-strategy shadow tab crept back in");
+});
+
+test("every navigation label is a translation key, never inline prose", () => {
+  const nav = source("components/shell/nav-model.ts");
+  for (const match of nav.matchAll(/labelKey: "([^"]+)"/g)) {
+    assert.ok(match[1]?.startsWith("nav."), `${match[1]} is not a nav key`);
+  }
+  assert.ok(!/label: "/.test(nav), "nav-model.ts carries an inline label");
 });
 
 test("the old shadow route still resolves, as a redirect into the workspace", () => {
@@ -258,10 +273,15 @@ test("the old shadow route still resolves, as a redirect into the workspace", ()
 });
 
 test("positions stay the broker-global account view", () => {
+  // The scope wording moved into the catalogues at V3; the guarantee did not.
+  // This table is the whole paper brokerage account, and a filter here would
+  // silently turn it into one strategy's book while keeping the total's label.
   const text = source("components/Positions.tsx");
-  assert.ok(text.includes("Broker account positions"));
-  assert.ok(text.includes("Alpaca paper account"));
-  assert.ok(!text.includes("filter("));
+  const messages = source("lib/i18n/en.ts");
+  assert.ok(text.includes('t("positions.brokerTitle")'));
+  assert.ok(messages.includes("Broker account positions"));
+  assert.ok(messages.includes("Alpaca paper account"));
+  assert.ok(!text.includes("filter("), "Positions.tsx filters the account's rows");
 });
 
 // =========================================================================

@@ -18,6 +18,7 @@ import { useMemo, useState, type KeyboardEvent, type MouseEvent } from "react";
 
 import { chartUnavailableLabel, type ChartSeries } from "@/lib/charts";
 import { money } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 
 import { cn } from "../ui";
 
@@ -70,6 +71,7 @@ export function LineChart({
   markers?: ChartMarker[];
   className?: string;
 }) {
+  const { t } = useI18n();
   const [cursor, setCursor] = useState<number | null>(null);
 
   const model = useMemo(() => {
@@ -102,15 +104,15 @@ export function LineChart({
 
   if (!series) {
     return (
-      <div className={cn("flex h-[220px] items-center justify-center text-[12px] text-ink-3", className)}>
-        Loading chart…
+      <div className={cn("flex h-[220px] items-center justify-center text-table text-ink-3", className)}>
+        {t("chart.loading")}
       </div>
     );
   }
   if (!model) {
     return (
-      <div className={cn("flex h-[220px] items-center justify-center text-[12px] text-ink-3", className)}>
-        N/A · {chartUnavailableLabel(series.unavailable_reason)}
+      <div className={cn("flex h-[220px] items-center justify-center text-table text-ink-3", className)}>
+        {t("chart.unavailable")} · {chartUnavailableLabel(series.unavailable_reason)}
       </div>
     );
   }
@@ -151,7 +153,7 @@ export function LineChart({
         className="block h-auto w-full select-none focus-visible:outline-2 focus-visible:outline-accent"
         role="img"
         tabIndex={0}
-        aria-label={`${series.symbol} ${series.range} close price chart. Use the arrow keys to move the cursor.`}
+        aria-label={t("chart.keyboardHint", { symbol: series.symbol, range: series.range })}
         onMouseMove={onMove}
         onMouseLeave={() => setCursor(null)}
         onKeyDown={onKey}
@@ -224,7 +226,7 @@ export function LineChart({
               fill="currentColor"
               className="num text-accent"
             >
-              avg entry {money(entryPrice)}
+              {t("chart.avgEntry")} {money(entryPrice)}
             </text>
           </g>
         ) : null}
@@ -243,7 +245,7 @@ export function LineChart({
           return (
             <g key={`${marker.at}-${index}`} className={buy ? "text-pos" : "text-neg"}>
               <title>{marker.label}</title>
-              <polygon points={points} fill="currentColor" stroke="var(--color-surface)" strokeWidth={1} />
+              <polygon points={points} fill="currentColor" stroke="var(--color-surface-1)" strokeWidth={1} />
             </g>
           );
         })}
@@ -269,7 +271,7 @@ export function LineChart({
           </g>
         ) : null}
       </svg>
-      <div className="mt-1 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-[11px] text-ink-3">
+      <div className="mt-1 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-meta text-ink-3">
         <span className="num">
           {activePoint ? (
             <>
@@ -280,15 +282,12 @@ export function LineChart({
           ) : null}
         </span>
         <span className="num">
-          {series.timeframe} bars · {series.points.length} points
-          {series.from_cache ? " · cached" : ""}
+          {t("chart.bars", { timeframe: series.timeframe, count: series.points.length })}
+          {series.from_cache ? ` · ${t("chart.cached")}` : ""}
         </span>
       </div>
       {markers.length ? (
-        <p className="mt-1 text-[11px] text-ink-3">
-          <span className="text-pos">▲</span> BUY / <span className="text-neg">▼</span> SELL are real
-          EQUITY PAPER fills in this range. No shadow or simulated action is drawn.
-        </p>
+        <p className="mt-1 text-meta leading-snug text-ink-3">{t("drawer.fillsLegend")}</p>
       ) : null}
     </div>
   );

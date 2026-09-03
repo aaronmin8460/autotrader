@@ -17,7 +17,9 @@
  * There is no control on this page, and no endpoint behind one.
  */
 
-import { percent, signedPercent, stampUtc } from "@/lib/format";
+import { percent, signedPercent } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
+import { useFormat } from "@/lib/i18n/useFormat";
 import {
   type ComparisonPanel,
   type EngineHypothetical,
@@ -45,23 +47,24 @@ import { Card, Dot, Empty, Field, Pill, Tag, Td, Th, cn, toneText } from "./ui";
  * label that is missing exactly when someone is worried.
  */
 export function ShadowBanner() {
+  const { t } = useI18n();
   return (
     <section
-      aria-label="Equity Shadow scope"
-      className="card tint-observe px-5 py-4"
+      aria-label={t("sd.scope")}
+      className="panel tint-observe px-5 py-4"
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <span className="text-[13px] leading-none font-semibold tracking-tight text-ink">
+        <span className="text-body leading-none font-semibold tracking-tight text-ink">
           Equity — Shadow observation only
         </span>
-        <Tag tone="SHADOW" title="No order can be submitted, cancelled, or replaced by this process.">
+        <Tag tone="SHADOW" title={t("sd.noMutation")}>
           Zero order mutation
         </Tag>
-        <Tag tone="SHADOW" title="V3 is the production engine. EDA-1 is a research champion under observation.">
+        <Tag tone="SHADOW" title={t("sd.enginesHint")}>
           V3 + EDA-1 side by side
         </Tag>
       </div>
-      <p className="mt-2 max-w-[92ch] text-[12px] leading-snug text-ink-2">
+      <p className="mt-2 max-w-[92ch] text-table leading-snug text-ink-2">
         These are decisions <strong className="font-semibold text-ink">recorded, not taken</strong>.
         The process behind this page has no execution path: no order has been placed, no position
         exists, and no figure here is broker account equity. Equity production remains disabled and
@@ -82,10 +85,12 @@ export function ShadowService({
   service: ServicePanel | null;
   generatedAt: string | null;
 }) {
+  const { t } = useI18n();
+  const format = useFormat();
   if (!service) {
     return (
-      <Card title="Shadow service">
-        <Empty headline="The shadow API is not answering." />
+      <Card title={t("sd.service")}>
+        <Empty headline={t("sd.apiDown")} />
       </Card>
     );
   }
@@ -96,7 +101,7 @@ export function ShadowService({
   return (
     <Card
       tone="SHADOW"
-      title="Shadow service"
+      title={t("sd.service")}
       meta={
         <>
           <Pill tone={tone} emphasis>{shadowStatusLabel(service.status)}</Pill>
@@ -104,42 +109,42 @@ export function ShadowService({
         </>
       }
     >
-      <p className="mb-4 text-[12px] leading-snug text-ink-2">
+      <p className="mb-4 text-table leading-snug text-ink-2">
         {STATUS_REASON_LABELS[service.status_reason] ?? service.status_reason}
       </p>
 
       <div className="grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-3 lg:grid-cols-4">
-        <Field label="Last successful cycle">
-          {service.last_cycle_at ? stampUtc(service.last_cycle_at, generatedAt) : "—"}
+        <Field label={t("sd.lastCycle")}>
+          {service.last_cycle_at ? format.stamp(service.last_cycle_at, generatedAt) : "—"}
         </Field>
         <Field
-          label="Next expected cycle"
-          title="15-minute bar boundaries during US regular sessions only."
+          label={t("sd.nextCycle")}
+          title={t("sd.nextCycleHint")}
         >
           {service.next_expected_cycle_at
-            ? stampUtc(service.next_expected_cycle_at, generatedAt)
+            ? format.stamp(service.next_expected_cycle_at, generatedAt)
             : service.within_regular_session
               ? "—"
               : "Next regular session"}
         </Field>
-        <Field label="Cycles recorded">
+        <Field label={t("sd.cyclesRecorded")}>
           <span className="num">{service.cycles_recorded}</span>
         </Field>
-        <Field label="Symbols last cycle">
+        <Field label={t("sd.symbolsLastCycle")}>
           <span className="num">
             {service.symbols_recorded_last_cycle}/{service.universe.length}
           </span>
         </Field>
-        <Field label="Universe">
+        <Field label={t("strategies.universe")}>
           <span className="num">{service.universe.length} symbols</span>
         </Field>
-        <Field label="Code SHA" title={service.code_sha ?? undefined}>
+        <Field label={t("sd.codeSha")} title={service.code_sha ?? undefined}>
           <span className="num">{service.code_sha ? service.code_sha.slice(0, 12) : "—"}</span>
         </Field>
-        <Field label="Observer started">
-          {service.started_at ? stampUtc(service.started_at, generatedAt) : "—"}
+        <Field label={t("sd.observerStarted")}>
+          {service.started_at ? format.stamp(service.started_at, generatedAt) : "—"}
         </Field>
-        <Field label="Session (broker calendar)">
+        <Field label={t("sd.session")}>
           {service.session_confirmed_open ? "Open — confirmed" : "No session confirmed today"}
         </Field>
       </div>
@@ -147,15 +152,15 @@ export function ShadowService({
       {/* The invariant, measured rather than asserted. */}
       <div
         className={cn(
-          "mt-5 rounded-[6px] border px-4 py-3",
-          invariantOk ? "border-observe/30 bg-sunken" : "border-neg/45 tint-neg",
+          "mt-5 rounded-sm border px-4 py-3",
+          invariantOk ? "border-observe/30 bg-surface-0" : "border-neg/45 tint-neg",
         )}
       >
         <div className="flex items-center gap-2">
           <Dot tone={invariantOk ? "SHADOW" : "NEGATIVE"} />
           <span
             className={cn(
-              "text-[11px] leading-none font-medium tracking-[0.06em] uppercase",
+              "text-meta leading-none font-medium tracking-[0.06em] uppercase",
               toneText(invariantOk ? "SHADOW" : "NEGATIVE"),
             )}
           >
@@ -163,25 +168,25 @@ export function ShadowService({
           </span>
         </div>
         <div className="mt-3 grid grid-cols-2 gap-x-5 gap-y-3 sm:grid-cols-4">
-          <Field label="Broker mutation">{service.broker_mutation}</Field>
-          <Field label="Orders submitted">
+          <Field label={t("sd.brokerMutation")}>{service.broker_mutation}</Field>
+          <Field label={t("sd.ordersSubmitted")}>
             <span className="num">{service.orders_submitted}</span>
           </Field>
-          <Field label="Order intents in DB">
+          <Field label={t("sd.intentsInDb")}>
             <span className="num">{service.order_intents_in_database}</span>
           </Field>
-          <Field label="Orders linked to a decision">
+          <Field label={t("sd.ordersLinked")}>
             <span className="num">{service.linked_orders_in_database}</span>
           </Field>
         </div>
-        <p className="mt-3 max-w-[92ch] text-[11.5px] leading-snug text-ink-3">
+        <p className="mt-3 max-w-[92ch] text-meta leading-snug text-ink-3">
           <span className="text-ink-2">
             Actionable candidates released: {service.released_candidates}.
           </span>{" "}
           {service.released_candidates_meaning}
         </p>
-        <p className="mt-2 max-w-[92ch] text-[11.5px] leading-snug text-ink-3">
-          <span className="text-ink-2">Startup safety / reconciliation:</span>{" "}
+        <p className="mt-2 max-w-[92ch] text-meta leading-snug text-ink-3">
+          <span className="text-ink-2">{t("sd.startupSafety")}</span>{" "}
           {service.startup_safety_note}
         </p>
       </div>
@@ -200,11 +205,13 @@ export function ShadowRegime({
   regime: RegimePanel | null;
   generatedAt: string | null;
 }) {
+  const { t } = useI18n();
+  const format = useFormat();
   if (!regime || regime.participate === null) {
     return (
-      <Card title="EDA-1 regime">
+      <Card title={t("sd.regime")}>
         <Empty
-          headline="No regime state recorded yet."
+          headline={t("sd.noRegime")}
           detail="The observer resolves one state per session, before the session's first decision."
         />
       </Card>
@@ -215,10 +222,10 @@ export function ShadowRegime({
   return (
     <Card
       tone="SHADOW"
-      title="EDA-1 regime"
+      title={t("sd.regime")}
       meta={<Pill tone={on ? "POSITIVE" : "MUTED"}>{on ? "Participate" : "Defensive / V3"}</Pill>}
     >
-      <p className="mb-4 max-w-[86ch] text-[12px] leading-snug text-ink-2">
+      <p className="mb-4 max-w-[86ch] text-table leading-snug text-ink-2">
         {on ? (
           <>
             Risk-on. EDA-1 targets a long position in every universe symbol while the router is in
@@ -233,47 +240,47 @@ export function ShadowRegime({
       </p>
 
       <div className="grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-3">
-        <Field label="Session" title="One state per session, resolved before any decision in it.">
+        <Field label={t("market.session")} title={t("sd.sessionHint")}>
           {regime.session_date ?? "—"}
         </Field>
-        <Field label="Reference">{regime.reference_symbol ?? "—"}</Field>
-        <Field label="Sessions observed">
+        <Field label={t("market.reference")}>{regime.reference_symbol ?? "—"}</Field>
+        <Field label={t("market.sessionsObserved")}>
           <span className="num">{regime.sessions_observed ?? "—"}</span>
         </Field>
         <Field
           label={`${regime.reference_symbol ?? "SPY"} completed-session close`}
-          title="The last completed session's close. The state governing a session never reads that session's own close."
+          title={t("sd.closeHint")}
         >
           <span className="num">{regime.info_close?.toFixed(2) ?? "—"}</span>
         </Field>
         <Field label={`SMA ${regime.sma_sessions ?? 200}`}>
           <span className="num">{regime.info_sma?.toFixed(2) ?? "—"}</span>
         </Field>
-        <Field label="Drawdown from trailing peak">
+        <Field label={t("sd.drawdownPeak")}>
           <span className={cn("num", toneText(signTone(regime.info_drawdown)))}>
             {signedPercent(regime.info_drawdown)}
           </span>
         </Field>
       </div>
 
-      <dl className="mt-5 space-y-1.5 border-t border-line pt-4 text-[11.5px] leading-snug text-ink-3">
+      <dl className="mt-5 space-y-1.5 border-t border-subtle pt-4 text-meta leading-snug text-ink-3">
         <div className="flex gap-2">
-          <dt className="shrink-0 text-ink-2">Rule</dt>
+          <dt className="shrink-0 text-ink-2">{t("sd.rule")}</dt>
           <dd>
             Participate if and only if close &gt; SMA{regime.sma_sessions ?? 200} and drawdown &gt;{" "}
             {percent(regime.calm_threshold, 0)}, both strict.
           </dd>
         </div>
         <div className="flex gap-2">
-          <dt className="shrink-0 text-ink-2">Causal lag</dt>
+          <dt className="shrink-0 text-ink-2">{t("sd.causalLag")}</dt>
           <dd>
             {regime.lag_sessions ?? 1} session. The information set ends at the previous completed
             session, so no state can read a close from the session it governs.
           </dd>
         </div>
         <div className="flex gap-2">
-          <dt className="shrink-0 text-ink-2">Computed</dt>
-          <dd>{stampUtc(regime.computed_at, generatedAt)}</dd>
+          <dt className="shrink-0 text-ink-2">{t("sd.computed")}</dt>
+          <dd>{format.stamp(regime.computed_at, generatedAt)}</dd>
         </div>
       </dl>
     </Card>
@@ -304,12 +311,14 @@ export function ShadowSymbols({
   symbols: SymbolRow[];
   generatedAt: string | null;
 }) {
+  const { t } = useI18n();
+  const format = useFormat();
   const recorded = symbols.filter((row) => row.bar_timestamp !== null);
   if (recorded.length === 0) {
     return (
-      <Card title="V3 vs EDA-1 — latest bar">
+      <Card title={t("sd.latestBar")}>
         <Empty
-          headline="No decisions recorded yet."
+          headline={t("sd.noDecisions")}
           detail="The observer records on completed 15-minute bars during US regular sessions."
         />
       </Card>
@@ -319,32 +328,32 @@ export function ShadowSymbols({
   return (
     <Card
       tone="SHADOW"
-      title="V3 vs EDA-1 — latest bar"
-      meta={<Tag title="Both engines evaluated the same bar.">{recorded.length} symbols</Tag>}
+      title={t("sd.latestBar")}
+      meta={<Tag title={t("sd.sameBar")}>{t("sd.symbolsCount", { count: recorded.length })}</Tag>}
       bodyClassName="p-0"
     >
       <div className="overflow-x-auto">
         <table className="w-full border-collapse">
-          <thead className="border-b border-line">
+          <thead className="border-b border-subtle">
             <tr>
-              <Th>Symbol</Th>
-              <Th>Bar (UTC)</Th>
-              <Th align="right">Reference</Th>
+              <Th>{t("orders.col.symbol")}</Th>
+              <Th>{t("sd.barUtc")}</Th>
+              <Th align="right">{t("market.reference")}</Th>
               <Th>V3</Th>
-              <Th align="right">V3 score</Th>
-              <Th align="right">V3 conf.</Th>
-              <Th>V3 regime</Th>
+              <Th align="right">{t("sd.v3Score")}</Th>
+              <Th align="right">{t("sd.v3Conf")}</Th>
+              <Th>{t("sd.v3Regime")}</Th>
               <Th>EDA-1</Th>
-              <Th>EDA-1 regime</Th>
-              <Th>Agree</Th>
+              <Th>{t("sd.eda1Regime")}</Th>
+              <Th>{t("sd.agree")}</Th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-line">
+          <tbody className="divide-y divide-subtle">
             {symbols.map((row) => (
               <tr key={row.symbol}>
                 <Td className="font-medium text-ink">{row.symbol}</Td>
                 <Td className="text-ink-3">
-                  {row.bar_timestamp ? stampUtc(row.bar_timestamp, generatedAt) : "—"}
+                  {row.bar_timestamp ? format.stamp(row.bar_timestamp, generatedAt) : "—"}
                 </Td>
                 <Td numeric>{row.reference_close?.toFixed(2) ?? "—"}</Td>
                 <Td>
@@ -371,7 +380,7 @@ export function ShadowSymbols({
           </tbody>
         </table>
       </div>
-      <p className="border-t border-line px-4 py-3 text-[11.5px] leading-snug text-ink-3">
+      <p className="border-t border-subtle px-4 py-3 text-meta leading-snug text-ink-3">
         EDA-1 has no score or confidence of its own — it is a participation router, not a second
         probability model, and the values it carries are V3&apos;s, copied. They are deliberately not
         repeated in an EDA-1 column, because a number in that column would read as a second opinion
@@ -386,36 +395,37 @@ export function ShadowSymbols({
 // --------------------------------------------------------------------------
 
 function EngineCard({ engine, label }: { engine: EngineHypothetical | null; label: string }) {
+  const { t } = useI18n();
   if (!engine) {
     return (
-      <div className="rounded-[6px] border border-line bg-sunken px-4 py-3">
+      <div className="rounded-sm border border-subtle bg-surface-0 px-4 py-3">
         <div className="eyebrow text-ink-3">{label}</div>
-        <p className="mt-2 text-[12px] text-ink-3">Not enough recorded bars.</p>
+        <p className="mt-2 text-table text-ink-3">{t("sd.notEnoughBars")}</p>
       </div>
     );
   }
   return (
-    <div className="rounded-[6px] border border-line bg-sunken px-4 py-3">
+    <div className="rounded-sm border border-subtle bg-surface-0 px-4 py-3">
       <div className="flex items-baseline justify-between gap-3">
         <span className="eyebrow text-ink-3">{label}</span>
-        <span className="text-[11px] text-ink-3">{engine.current_stance_summary}</span>
+        <span className="text-meta text-ink-3">{engine.current_stance_summary}</span>
       </div>
       <div className="mt-2 flex items-baseline gap-3">
         <span className="num text-[22px] leading-none font-semibold tracking-tight text-ink">
           {engine.portfolio_value?.toFixed(2) ?? "—"}
         </span>
-        <span className={cn("num text-[13px]", toneText(signTone(engine.cumulative_return)))}>
+        <span className={cn("num text-body", toneText(signTone(engine.cumulative_return)))}>
           {signedPercent(engine.cumulative_return)}
         </span>
       </div>
       <div className="mt-3 grid grid-cols-3 gap-x-4 gap-y-2">
-        <Field label="Max drawdown">
+        <Field label={t("sd.maxDrawdown")}>
           <span className="num">{signedPercent(engine.max_drawdown)}</span>
         </Field>
-        <Field label="Long exposure">
+        <Field label={t("sd.longExposure")}>
           <span className="num">{percent(engine.long_exposure_fraction, 0)}</span>
         </Field>
-        <Field label="Stance changes">
+        <Field label={t("sd.stanceChanges")}>
           <span className="num">{engine.stance_changes}</span>
         </Field>
       </div>
@@ -424,11 +434,13 @@ function EngineCard({ engine, label }: { engine: EngineHypothetical | null; labe
 }
 
 export function ShadowHypothetical({ panel }: { panel: HypotheticalPanel | null }) {
+  const { t } = useI18n();
+  const format = useFormat();
   if (!panel || panel.unavailable_reason) {
     return (
-      <Card title="Hypothetical portfolio">
+      <Card title={t("sd.hypothetical")}>
         <Empty
-          headline="Not enough recorded bars to compound a return."
+          headline={t("sd.notEnoughCompound")}
           detail="At least two observed bars are needed before a step return exists."
         />
       </Card>
@@ -438,10 +450,10 @@ export function ShadowHypothetical({ panel }: { panel: HypotheticalPanel | null 
   return (
     <Card
       tone="SHADOW"
-      title="Hypothetical portfolio"
+      title={t("sd.hypothetical")}
       meta={<Pill tone="SHADOW" emphasis>{panel.label}</Pill>}
     >
-      <p className="mb-4 max-w-[92ch] text-[12px] leading-snug text-ink-2">
+      <p className="mb-4 max-w-[92ch] text-table leading-snug text-ink-2">
         An equal-weight book that followed each engine&apos;s recorded stance, compounded from a
         normalized <span className="num">{panel.normalized_start.toFixed(0)}</span> over{" "}
         <span className="num">{panel.steps}</span> observed{" "}
@@ -452,19 +464,19 @@ export function ShadowHypothetical({ panel }: { panel: HypotheticalPanel | null 
       </p>
 
       <div className="grid gap-3 sm:grid-cols-2">
-        <EngineCard engine={panel.v3} label="V3 — production engine (shadow)" />
-        <EngineCard engine={panel.eda1} label="EDA-1 — research champion (shadow)" />
+        <EngineCard engine={panel.v3} label={t("sd.v3Engine")} />
+        <EngineCard engine={panel.eda1} label={t("sd.eda1Engine")} />
       </div>
 
-      <div className="mt-4 grid grid-cols-2 gap-x-5 gap-y-3 border-t border-line pt-4 sm:grid-cols-4">
-        <Field label="Equal-weight benchmark" title="Every universe symbol held throughout.">
+      <div className="mt-4 grid grid-cols-2 gap-x-5 gap-y-3 border-t border-subtle pt-4 sm:grid-cols-4">
+        <Field label={t("sd.benchmark")} title={t("sd.benchmarkHint")}>
           <span className={cn("num", toneText(signTone(panel.benchmark_return)))}>
             {signedPercent(panel.benchmark_return)}
           </span>
         </Field>
-        <Field label="Costs applied">{panel.costs_applied ? "Yes" : "None"}</Field>
-        <Field label="First bar">{panel.first_bar ? stampUtc(panel.first_bar) : "—"}</Field>
-        <Field label="Last bar">{panel.last_bar ? stampUtc(panel.last_bar) : "—"}</Field>
+        <Field label={t("sd.costsApplied")}>{panel.costs_applied ? t("sd.yes") : t("sd.costsNone")}</Field>
+        <Field label={t("sd.firstBar")}>{panel.first_bar ? format.stamp(panel.first_bar) : "—"}</Field>
+        <Field label={t("sd.lastBar")}>{panel.last_bar ? format.stamp(panel.last_bar) : "—"}</Field>
       </div>
     </Card>
   );
@@ -475,59 +487,60 @@ export function ShadowHypothetical({ panel }: { panel: HypotheticalPanel | null 
 // --------------------------------------------------------------------------
 
 export function ShadowComparison({ panel }: { panel: ComparisonPanel | null }) {
+  const { t } = useI18n();
   if (!panel || panel.unavailable_reason) {
     return (
-      <Card title="V3 vs EDA-1 — comparison">
-        <Empty headline="No comparisons recorded yet." />
+      <Card title={t("sd.comparison")}>
+        <Empty headline={t("sd.noComparisons")} />
       </Card>
     );
   }
 
   return (
-    <Card tone="SHADOW" title="V3 vs EDA-1 — comparison">
+    <Card tone="SHADOW" title={t("sd.comparison")}>
       {/* The sample warning is unconditional and first. A caveat below the
           numbers is a caveat read after the conclusion has been formed. */}
-      <div className="mb-4 rounded-[6px] border border-warn/35 tint-warn px-4 py-3">
+      <div className="mb-4 rounded-sm border border-warn/35 tint-warn px-4 py-3">
         <div className="flex items-center gap-2">
           <Dot tone="ATTENTION" />
-          <span className="text-[11px] leading-none font-medium tracking-[0.06em] text-warn uppercase">
+          <span className="text-meta leading-none font-medium tracking-[0.06em] text-warn uppercase">
             Sample size warning
           </span>
         </div>
-        <p className="mt-2 max-w-[92ch] text-[12px] leading-snug text-ink-2">{panel.sample_warning}</p>
+        <p className="mt-2 max-w-[92ch] text-table leading-snug text-ink-2">{panel.sample_warning}</p>
       </div>
 
       <div className="grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-3 lg:grid-cols-4">
-        <Field label="Bars compared">
+        <Field label={t("sd.barsCompared")}>
           <span className="num">{panel.bars_compared}</span>
         </Field>
-        <Field label="Decision agreement">
+        <Field label={t("sd.decisionAgreement")}>
           <span className="num">{percent(panel.agreement_fraction, 1)}</span>
         </Field>
-        <Field label="Disagreements">
+        <Field label={t("sd.disagreements")}>
           <span className="num">{panel.disagreement_count}</span>
         </Field>
-        <Field label="Stance disagreements" title="Bars where the two engines' target positions differ.">
+        <Field label={t("sd.stanceDisagreements")} title={t("sd.stanceDisagreementsHint")}>
           <span className="num">{panel.stance_disagreement_count}</span>
         </Field>
-        <Field label="Risk-on bars">
+        <Field label={t("sd.riskOnBars")}>
           <span className="num">{panel.participate_bars}</span>
         </Field>
-        <Field label="Risk-off bars">
+        <Field label={t("sd.riskOffBars")}>
           <span className="num">{panel.defensive_bars}</span>
         </Field>
-        <Field label="Risk-on sessions">
+        <Field label={t("sd.riskOnSessions")}>
           <span className="num">{panel.participate_sessions}</span>
         </Field>
-        <Field label="Regime transitions">
+        <Field label={t("sd.regimeTransitions")}>
           <span className="num">{panel.regime_transitions}</span>
         </Field>
       </div>
 
-      <div className="mt-5 border-t border-line pt-4">
-        <div className="eyebrow mb-2 text-ink-3">Capture ratios</div>
+      <div className="mt-5 border-t border-subtle pt-4">
+        <div className="eyebrow mb-2 text-ink-3">{t("sd.captureRatios")}</div>
         {panel.capture_unavailable_reason ? (
-          <p className="max-w-[92ch] text-[12px] leading-snug text-ink-3">
+          <p className="max-w-[92ch] text-table leading-snug text-ink-3">
             Withheld. {panel.steps} observed {panel.steps === 1 ? "step" : "steps"} is far below the
             threshold at which an up- or down-capture ratio means anything, and a ratio computed
             from a handful of points is noise wearing a statistic&apos;s name. No annualized figure —
@@ -535,17 +548,17 @@ export function ShadowComparison({ panel }: { panel: ComparisonPanel | null }) {
           </p>
         ) : (
           <div className="grid grid-cols-2 gap-x-5 gap-y-3 sm:grid-cols-4">
-            <Field label="EDA-1 up-capture">
+            <Field label={t("sd.upCapture")}>
               <span className="num">{panel.up_capture?.toFixed(3) ?? "—"}</span>
             </Field>
-            <Field label="EDA-1 down-capture">
+            <Field label={t("sd.downCapture")}>
               <span className="num">{panel.down_capture?.toFixed(3) ?? "—"}</span>
             </Field>
           </div>
         )}
       </div>
 
-      <p className="mt-4 border-t border-line pt-4 text-[11.5px] leading-snug text-ink-3">
+      <p className="mt-4 border-t border-subtle pt-4 text-meta leading-snug text-ink-3">
         No winner is declared here and none can be. The pre-registered evaluation judges EDA-1 on
         whether it reproduces its historical thesis across multiple regime states over months — not
         on a return column. V3 remains the production engine regardless of anything on this page,
