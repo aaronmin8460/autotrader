@@ -33,6 +33,8 @@ import type {
   PolicyPanel,
 } from "@/lib/paper";
 import type { TargetVsActualRow } from "@/lib/portfolio";
+import { statusTone } from "@/lib/pnl";
+import type { AccountingStatusPanel, SymbolRealized } from "@/lib/realized";
 
 import { Sparkline } from "./charts/Sparkline";
 import {
@@ -157,6 +159,8 @@ export function TargetVsActual({
   onSelect,
   generatedAt,
   brokerAvailable,
+  realized,
+  accountingStatus,
 }: {
   rows: TargetVsActualRow[];
   sparklines: Readonly<Record<string, ChartSeries>>;
@@ -165,6 +169,16 @@ export function TargetVsActual({
   onSelect: (symbol: string) => void;
   generatedAt: string | null;
   brokerAvailable: boolean;
+  /**
+   * Per-symbol realized totals from the accounting ledger, keyed by symbol.
+   *
+   * Optional because this table is also rendered on Portfolio, where the
+   * realized ledger is presented in its own panel rather than folded into a
+   * target-versus-actual row.
+   */
+  realized?: Readonly<Record<string, SymbolRealized>>;
+  /** Shown whenever it is not CLEAN, beside the figures it qualifies. */
+  accountingStatus?: AccountingStatusPanel | null;
 }) {
   const { t } = useI18n();
   const format = useFormat();
@@ -184,6 +198,15 @@ export function TargetVsActual({
         <>
           <Tag title={t("portfolio.targetVsActualHint")}>{t("portfolio.recordedVsBroker")}</Tag>
           {brokerAvailable ? null : <Pill tone="ATTENTION">{t("portfolio.brokerUnreadable")}</Pill>}
+          {accountingStatus && accountingStatus.status !== "CLEAN" ? (
+            <Pill
+              tone={statusTone(accountingStatus.status)}
+              emphasis
+              title={accountingStatus.message ?? undefined}
+            >
+              {t("pnl.accounting")} {accountingStatus.status}
+            </Pill>
+          ) : null}
           <SegmentedTimeRange
             options={["1D", "5D", "1M"] as const}
             value={sparkRange}
@@ -196,7 +219,7 @@ export function TargetVsActual({
     >
       <DataTable
         caption={t("portfolio.targetVsActual")}
-        minWidth="min-w-[1000px]"
+        minWidth={realized ? "min-w-[1240px]" : "min-w-[1000px]"}
         head={
           <>
             <Th>{t("orders.col.symbol")}</Th>
@@ -213,6 +236,16 @@ export function TargetVsActual({
               {t("positions.col.delta")}
             </Th>
             <Th title={t("drawer.actionHint")}>{t("drawer.action")}</Th>
+            {realized ? (
+              <>
+                <Th align="right" title={t("pnl.realizedTodayHint")}>
+                  {t("pnl.realizedToday")}
+                </Th>
+                <Th align="right" title={t("pnl.realizedSinceHint")}>
+                  {t("pnl.realizedSince")}
+                </Th>
+              </>
+            ) : null}
             <Th align="right">{t("drawer.lastDecision")}</Th>
             <Th align="right" title={t("positions.trendHint")}>
               {t("positions.col.trend", { range: sparkRange })}
@@ -222,6 +255,7 @@ export function TargetVsActual({
       >
         {rows.map((row) => {
           const spark = sparklines[row.symbol];
+          const realizedRow = realized?.[row.symbol];
           return (
             <Tr
               key={row.symbol}
@@ -261,6 +295,33 @@ export function TargetVsActual({
               <Td>
                 <Pill tone={ACTION_TONE[row.action] ?? "MUTED"}>{row.action}</Pill>
               </Td>
+              {realized ? (
+                <>
+                  <Td
+                    numeric
+                    className={cn(
+                      realizedRow ? toneText(signTone(realizedRow.realized_today)) : "text-ink-3",
+                    )}
+                  >
+                    {realizedRow ? format.signedMoney(realizedRow.realized_today) : "—"}
+                  </Td>
+                  <Td
+                    numeric
+                    className={cn(
+                      realizedRow
+                        ? toneText(signTone(realizedRow.realized_since_tracking))
+                        : "text-ink-3",
+                    )}
+                    title={
+                      realizedRow
+                        ? `${realizedRow.event_count} · exact ${realizedRow.realized_since_tracking_exact}`
+                        : undefined
+                    }
+                  >
+                    {realizedRow ? format.signedMoney(realizedRow.realized_since_tracking) : "—"}
+                  </Td>
+                </>
+              ) : null}
               <Td numeric className="text-ink-3">
                 {row.last_decision_at ? format.stamp(row.last_decision_at, generatedAt) : "—"}
               </Td>

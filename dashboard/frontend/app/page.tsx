@@ -42,6 +42,7 @@ import { AccountSummary } from "@/components/AccountSummary";
 import { Attention } from "@/components/Attention";
 import { MarketState } from "@/components/MarketState";
 import { Positions } from "@/components/Positions";
+import { RealizedStrip } from "@/components/RealizedPnl";
 import { Risk } from "@/components/Risk";
 import { ShadowSummary } from "@/components/Shadows";
 import { SymbolDetail } from "@/components/SymbolDetail";
@@ -52,6 +53,7 @@ import { useDashboard } from "@/lib/dashboard";
 import { useI18n } from "@/lib/i18n";
 import { useAccountOrders } from "@/lib/orders";
 import { equityOf, targetVsActual } from "@/lib/portfolio";
+import { useRealizedPnl } from "@/lib/realized";
 import { buildRiskView } from "@/lib/risk";
 
 /** How many rows the Overview's condensed tables show before deferring. */
@@ -122,6 +124,17 @@ export default function OverviewPage() {
     for (const row of targetRows) out[row.symbol] = row.target_weight;
     return out;
   }, [targetRows]);
+  const { data: realized } = useRealizedPnl();
+  // Equity-book unrealized only: the realized figure beside it is the equity
+  // ledger's, and pairing an account-wide unrealized with an equity-only
+  // realized would invite exactly the arithmetic the strip says not to do.
+  const unrealized = useMemo(() => {
+    const held = (data?.positions?.rows ?? []).filter(
+      (row) => row.asset_class === "EQUITY" && row.unrealized_pnl !== null,
+    );
+    if (held.length === 0) return null;
+    return held.reduce((total, row) => total + (row.unrealized_pnl ?? 0), 0);
+  }, [data]);
   const close = useCallback(() => setSelected(null), []);
 
   if (!loading && !data) return <Unreachable />;
@@ -133,6 +146,14 @@ export default function OverviewPage() {
       {data ? <Attention overview={data} /> : null}
 
       <AccountSummary metrics={data?.metrics ?? null} risk={risk} loading={loading} />
+
+      <RealizedStrip
+        panel={realized}
+        dailyPnl={data?.metrics?.daily_pnl ?? null}
+        dailyPnlFraction={data?.metrics?.daily_pnl_fraction ?? null}
+        unrealized={unrealized}
+        generatedAt={data?.generated_at ?? null}
+      />
 
       <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-12">
         <div className="xl:col-span-7">

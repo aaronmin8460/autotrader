@@ -9,10 +9,10 @@
  * and marks the policy's target and hard cap on it.
  *
  * The contribution chart is the broker's own **unrealized** P&L per position —
- * not a history, not realized, and labelled as such in both places. Beside it
- * the realized figure is reported as `Not tracked` with the reason, because
- * this build deploys no realized-P&L accounting and a reconstructed one would
- * be a number no runtime has ever computed.
+ * not a history, not realized, and labelled as such in both places. Realized
+ * P&L is a different measurement from a different source (the accounting
+ * ledger, built from broker-confirmed executions) and is presented in its own
+ * panel with its reconciliation status, never folded into this one.
  */
 
 import { useI18n } from "@/lib/i18n";
@@ -78,9 +78,12 @@ export function UnrealizedByPosition({ positions }: { positions: PositionsPanel 
           <EmptyState headline={t("empty.noUnrealized")} detail={t("empty.noUnrealizedDetail")} />
         )}
       </div>
-      {/* The distinction this dashboard must never blur. */}
-      <div className="border-t border-subtle">
-        <NotTracked headline={t("pnl.realized")} detail={t("pnl.realizedNotTracked")} />
+      {/* The distinction this dashboard must never blur: this panel is the
+          broker's mark on OPEN positions, and realized P&L is a different
+          measurement from a different source. It is shown in full under
+          Profit and loss rather than folded in here. */}
+      <div className="border-t border-subtle px-4 py-3">
+        <p className="text-meta leading-snug text-ink-3">{t("pnl.realizedNotTracked")}</p>
       </div>
     </Card>
   );

@@ -51,6 +51,7 @@ from autotrader.account.lock import (
     CompositeAccountLock,
     account_lock_path_for,
 )
+from autotrader.accounting.cli import accounting_app
 from autotrader.backtest import (
     DEFAULT_INITIAL_CASH,
     STRATEGY_NAME,
@@ -2067,6 +2068,12 @@ def equity_paper(
 #: growing with it, and so nothing under `research` is importable as part of
 #: the trading path. Every command in it is offline and read-only.
 app.add_typer(research_app, name="research")
+
+# The realized-P&L ledger for the equity paper book. A sub-application because
+# it is accounting and nothing else: it reads what the broker confirms happened
+# and writes it down, reaches no trading decision, and has no command that can
+# place, cancel or modify an order. Nothing in the trading path imports it.
+app.add_typer(accounting_app, name="equity-accounting")
 
 
 def main() -> None:

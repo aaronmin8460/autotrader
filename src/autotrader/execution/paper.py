@@ -113,12 +113,13 @@ from alpaca.trading.enums import (
     AssetClass,
     AssetStatus,
     PositionSide,
+    QueryOrderStatus,
     TimeInForce,
 )
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.models import Asset, Order, TradeAccount
 from alpaca.trading.models import Position as AlpacaPosition
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
 from autotrader.account import safety as account_safety
 from autotrader.account.budget import (
@@ -1362,6 +1363,371 @@ def find_broker_order_by_broker_id(
 
 
 # --------------------------------------------------------------------------
+# Execution activities (read-only)
+#
+# The account's *executions*, which is a finer record than its orders: one
+# order can fill in several pieces at several prices, and the order only ever
+# reports the aggregate. Nothing in the trading path consults this - it exists
+# for the accounting ledger, which needs the pieces.
+#
+# Read-only in the strongest available sense: a single GET against an endpoint
+# that has no write verb, behind the same environment gate as everything else
+# in this module, and no caller here can turn a returned activity back into an
+# order.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExecutionActivity:
+    """One execution the broker confirms, normalized and exact.
+
+    `activity_id` is the broker's own identifier for the execution. It is the
+    same token the endpoint accepts as a pagination cursor, which is what makes
+    it durable enough to be an accounting idempotency key rather than a
+    render-time artifact.
+
+    Quantity and price are `Decimal` parsed from the broker's own strings, so
+    no binary floating-point value ever enters the accounting ledger.
+    """
+
+    activity_id: str
+    broker_order_id: str
+    symbol: str
+    side: str
+    quantity: Decimal
+    price: Decimal
+    transaction_time: datetime
+    activity_subtype: str
+    order_status: str
+    cumulative_quantity: Decimal | None
+    leaves_quantity: Decimal | None
+
+
+#: The endpoint path, relative to the client's configured base. FILL covers
+#: both complete and partial executions; the row says which in `type`.
+EXECUTION_ACTIVITIES_PATH = "/account/activities/FILL"
+
+#: Rows per request. The endpoint pages with an opaque cursor.
+EXECUTION_ACTIVITIES_PAGE_SIZE = 100
+
+
+class ExecutionActivitiesUnavailableError(ExecutionError):
+    """The execution record could not be read. Nothing is known, nothing assumed."""
+
+
+def _activity_datetime(value: object, field: str) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ExecutionActivitiesUnavailableError(f"execution activity has no {field}")
+    normalized = text.replace("Z", "+00:00")
+    try:
+        moment = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise ExecutionActivitiesUnavailableError(
+            f"execution activity {field} is not a readable timestamp"
+        ) from None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _to_execution_activity(payload: object) -> ExecutionActivity:
+    if not isinstance(payload, dict):
+        raise ExecutionActivitiesUnavailableError(
+            "The broker returned an execution record in an unexpected shape."
+        )
+    side = str(payload.get("side", "")).strip().upper()
+    if side not in {"BUY", "SELL"}:
+        raise ExecutionActivitiesUnavailableError(
+            f"execution activity has an unreadable side {payload.get('side')!r}"
+        )
+    optional = {}
+    for name, key in (("cumulative_quantity", "cum_qty"), ("leaves_quantity", "leaves_qty")):
+        raw = payload.get(key)
+        optional[name] = None if raw is None else to_broker_decimal(raw, key)
+    return ExecutionActivity(
+        activity_id=str(payload.get("id", "")).strip(),
+        broker_order_id=str(payload.get("order_id", "")).strip(),
+        symbol=str(payload.get("symbol", "")).strip(),
+        side=side,
+        quantity=to_broker_decimal(payload.get("qty"), "execution quantity"),
+        price=to_broker_decimal(payload.get("price"), "execution price"),
+        transaction_time=_activity_datetime(payload.get("transaction_time"), "transaction_time"),
+        activity_subtype=str(payload.get("type", "")).strip(),
+        order_status=str(payload.get("order_status", "")).strip(),
+        **optional,
+    )
+
+
+def fetch_execution_activities(
+    client: object,
+    *,
+    after: datetime | None = None,
+    max_requests: int = 20,
+    page_size: int = EXECUTION_ACTIVITIES_PAGE_SIZE,
+) -> tuple[list[ExecutionActivity], int]:
+    """Read confirmed executions, newest first. Returns the rows and the call count.
+
+    `after` bounds the read; passing `None` asks for the whole record, which is
+    what a first bootstrap wants and what nothing else should.
+
+    `max_requests` is a local runaway guard, not a transcription of a provider
+    limit: this function is called by a periodic job that must never be able to
+    turn a paging bug into a request storm against an account that is
+    simultaneously trading. Exhausting it raises rather than returning a short
+    list, because a truncated execution record silently becomes a wrong cost
+    basis.
+
+    Every failure raises `ExecutionActivitiesUnavailableError`. "The read
+    failed" and "there were no executions" are different answers and a caller
+    that conflates them will report a confident wrong P&L.
+    """
+    getter = getattr(client, "get", None)
+    if not callable(getter):
+        raise ExecutionActivitiesUnavailableError(
+            "This broker client cannot perform a plain read; refusing to guess."
+        )
+
+    activities: list[ExecutionActivity] = []
+    seen: set[str] = set()
+    page_token: str | None = None
+    requests_made = 0
+
+    while True:
+        if requests_made >= max_requests:
+            raise ExecutionActivitiesUnavailableError(
+                f"The execution record did not end within {max_requests} requests. "
+                "Refusing to continue paging, and refusing to report a partial record."
+            )
+        params: dict[str, object] = {"page_size": int(page_size)}
+        if after is not None:
+            params["after"] = after.astimezone(UTC).isoformat()
+        if page_token is not None:
+            params["page_token"] = page_token
+        try:
+            payload = getter(EXECUTION_ACTIVITIES_PATH, params)
+        except APIError as error:
+            raise ExecutionActivitiesUnavailableError(
+                f"Could not read the execution record ({_api_error_text(error)}). "
+                "Nothing is known about it."
+            ) from None
+        except Exception as error:  # noqa: BLE001 - any failure here must fail closed
+            raise ExecutionActivitiesUnavailableError(
+                f"Could not read the execution record ({type(error).__name__}). "
+                "Nothing is known about it."
+            ) from None
+        requests_made += 1
+
+        if payload is None:
+            break
+        if not isinstance(payload, list):
+            raise ExecutionActivitiesUnavailableError(
+                "The broker returned the execution record in an unexpected shape."
+            )
+        if not payload:
+            break
+
+        fresh = 0
+        for row in payload:
+            activity = _to_execution_activity(row)
+            if not activity.activity_id or activity.activity_id in seen:
+                continue
+            seen.add(activity.activity_id)
+            activities.append(activity)
+            fresh += 1
+
+        page_token = str(payload[-1].get("id", "")).strip() or None
+        if fresh == 0 or page_token is None or len(payload) < page_size:
+            break
+
+    return activities, requests_made
+
+
+# --------------------------------------------------------------------------
+# Order records (read-only)
+#
+# The order behind an execution, for the two facts an execution activity does
+# not carry: which asset class it belongs to, and the client order id this
+# system minted for it. The first decides whether the accounting ledger is
+# allowed to touch the execution at all; the second is the only provable link
+# back to the runtime that placed it.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BrokerOrderRecord:
+    """One order as the broker currently describes it. Read-only, aggregate."""
+
+    broker_order_id: str
+    client_order_id: str
+    symbol: str
+    asset_class: str
+    side: str
+    status: str
+    submitted_at: datetime | None
+    filled_quantity: Decimal
+    filled_average_price: float | None
+
+
+class OrderHistoryUnavailableError(ExecutionError):
+    """The order record could not be read. Nothing is known, nothing assumed."""
+
+
+def _to_order_record(order: Order) -> BrokerOrderRecord:
+    asset_class = order.asset_class
+    asset_class_text = (
+        asset_class.value if isinstance(asset_class, Enum) else str(asset_class or "")
+    ).strip()
+    side = order.side.value.upper() if isinstance(order.side, Enum) else str(order.side).upper()
+    status = order.status.value if isinstance(order.status, Enum) else str(order.status)
+    filled = order.filled_qty if order.filled_qty is not None else 0
+    return BrokerOrderRecord(
+        broker_order_id=str(order.id),
+        client_order_id=str(order.client_order_id),
+        symbol=str(order.symbol),
+        asset_class=asset_class_text,
+        side=side,
+        status=str(status),
+        submitted_at=order.submitted_at,
+        filled_quantity=to_broker_decimal(filled, "filled quantity"),
+        filled_average_price=_optional_float(order.filled_avg_price),
+    )
+
+
+#: Orders per request, and the same local runaway guard as the activity read.
+ORDER_HISTORY_PAGE_SIZE = 500
+
+
+@dataclass(frozen=True)
+class PositionRecord:
+    """One open position, with its average entry price kept **exact**.
+
+    The difference from `PaperPosition` is `Decimal` rather than `float` on the
+    entry price, and the asset class carried alongside. Both matter to an
+    accounting ledger and to nothing else: a cost basis compared against a
+    float that was parsed from a string and printed back is comparing against a
+    value that has been through a lossy representation for no reason.
+    """
+
+    symbol: str
+    asset_class: str
+    quantity: Decimal
+    average_entry_price: Decimal
+    side: str
+
+
+def fetch_position_records(client: object) -> list[PositionRecord]:
+    """Read every open position exactly, long or short, without judgement.
+
+    Unlike `fetch_paper_positions` this does not refuse a short - it reports
+    one, with `side`. The trading path must refuse, because it cannot reason
+    about a short; a *reader* that refused would turn "the account is in a
+    state you should look at" into "the read failed", which is the less useful
+    of the two answers.
+    """
+    getter = getattr(client, "get_all_positions", None)
+    if not callable(getter):
+        raise UnsupportedBrokerStateError("This broker client cannot list positions.")
+    records: list[PositionRecord] = []
+    for position in getter():
+        symbol = str(getattr(position, "symbol", "")).strip()
+        if not symbol:
+            raise UnsupportedBrokerStateError("The broker returned a position with no symbol.")
+        asset_class = getattr(position, "asset_class", "")
+        asset_class_text = (
+            asset_class.value if isinstance(asset_class, Enum) else str(asset_class or "")
+        ).strip()
+        side = getattr(position, "side", "")
+        side_text = (side.value if isinstance(side, Enum) else str(side or "")).strip().upper()
+        records.append(
+            PositionRecord(
+                symbol=symbol,
+                asset_class=asset_class_text,
+                quantity=to_broker_decimal(
+                    getattr(position, "qty", None), f"{symbol} position quantity"
+                ),
+                average_entry_price=to_broker_decimal(
+                    getattr(position, "avg_entry_price", None), f"{symbol} average entry price"
+                ),
+                side=side_text,
+            )
+        )
+    return records
+
+
+def fetch_order_records(
+    client: object,
+    *,
+    after: datetime | None = None,
+    max_requests: int = 20,
+    page_size: int = ORDER_HISTORY_PAGE_SIZE,
+) -> tuple[list[BrokerOrderRecord], int]:
+    """Read the account's orders, oldest first. Returns the rows and the call count.
+
+    Every status, because a cancelled order that filled partially before it was
+    cancelled still produced executions, and an accounting ledger that only
+    looked at orders it expected to be filled would not know what asset class
+    those executions belonged to.
+
+    Fails closed exactly like `fetch_execution_activities`: a truncated order
+    record is refused rather than returned, because it would silently turn
+    "this execution's asset class is unknown" into "this execution is equity".
+    """
+    getter = getattr(client, "get_orders", None)
+    if not callable(getter):
+        raise OrderHistoryUnavailableError(
+            "This broker client cannot list orders; refusing to guess."
+        )
+
+    records: list[BrokerOrderRecord] = []
+    seen: set[str] = set()
+    cursor = after
+    requests_made = 0
+
+    while True:
+        if requests_made >= max_requests:
+            raise OrderHistoryUnavailableError(
+                f"The order record did not end within {max_requests} requests. "
+                "Refusing to report a partial record."
+            )
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            limit=int(page_size),
+            direction="asc",
+            after=cursor,
+        )
+        try:
+            batch = getter(request)
+        except APIError as error:
+            raise OrderHistoryUnavailableError(
+                f"Could not read the order record ({_api_error_text(error)})."
+            ) from None
+        except Exception as error:  # noqa: BLE001 - any failure here must fail closed
+            raise OrderHistoryUnavailableError(
+                f"Could not read the order record ({type(error).__name__})."
+            ) from None
+        requests_made += 1
+
+        if not batch:
+            break
+        fresh = 0
+        for order in batch:
+            if not isinstance(order, Order):
+                raise OrderHistoryUnavailableError(
+                    "The broker returned an order in an unexpected shape."
+                )
+            record = _to_order_record(order)
+            if record.broker_order_id in seen:
+                continue
+            seen.add(record.broker_order_id)
+            records.append(record)
+            fresh += 1
+        cursor = batch[-1].submitted_at or batch[-1].created_at
+        if fresh == 0 or cursor is None or len(batch) < page_size:
+            break
+
+    return records, requests_made
+
+
+# --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
 
@@ -1917,6 +2283,8 @@ __all__ = [
     "EVENT_REJECTED",
     "EVENT_SUBMITTED",
     "EVENT_UNKNOWN",
+    "EXECUTION_ACTIVITIES_PAGE_SIZE",
+    "EXECUTION_ACTIVITIES_PATH",
     "ORDER_TIME_IN_FORCE",
     "PAPER_TRADING_ENABLED_ENV",
     "PAPER_TRADING_ENABLED_VALUE",
@@ -1927,21 +2295,27 @@ __all__ = [
     "AccountNotTradableError",
     "AmbiguousSubmissionError",
     "AssetNotTradableError",
+    "BrokerOrderRecord",
     "BrokerOrderSnapshot",
     "BrokerRejectedOrderError",
     "ConfirmationRequiredError",
     "CryptoAssetSpec",
     "DuplicatePreflightUnavailableError",
+    "ExecutionActivitiesUnavailableError",
+    "ExecutionActivity",
     "ExecutionOutcome",
     "MinimumNotionalError",
     "MissingCredentialsError",
     "NonDurableIntentError",
     "NotPaperEnvironmentError",
+    "ORDER_HISTORY_PAGE_SIZE",
+    "OrderHistoryUnavailableError",
     "OrderLookupUnavailableError",
     "PaperAccountState",
     "PaperExecutionResult",
     "PaperPosition",
     "PaperTradingDisabledError",
+    "PositionRecord",
     "QuantityBelowMinimumError",
     "ReferencePriceUnavailableError",
     "SubmissionResult",
@@ -1955,8 +2329,11 @@ __all__ = [
     "effective_minimum_quantity",
     "execute_paper_order",
     "fetch_crypto_asset",
+    "fetch_execution_activities",
+    "fetch_order_records",
     "fetch_paper_account_state",
     "fetch_paper_positions",
+    "fetch_position_records",
     "fetch_reference_price",
     "find_broker_order_by_broker_id",
     "find_broker_order_by_client_id",

@@ -1,0 +1,40 @@
+# Five-minute realized-P&L accounting sync for the equity paper book.
+#
+# Install to /usr/lib/systemd/system/autotrader-equity-accounting.timer:
+#   systemctl enable --now autotrader-equity-accounting.timer
+#
+# CADENCE. Every five minutes. Realized P&L has no latency requirement - it
+# changes only when a sale fills, and a fill is minutes old by the time anyone
+# looks at it - so the cadence is set by how fresh an operator wants the number
+# rather than by anything the accounting needs. A missed run costs nothing: the
+# next pass re-reads a window that extends back before the last thing it
+# stored, so nothing is lost by being late.
+#
+# PHASE. Minutes 4, 9, 14, ... at :30, which keeps this pass out of three other
+# things happening on this host:
+#
+#   - the runtimes wake at :00/:15/:30/:45 plus five seconds and evaluate for
+#     about ninety seconds, then the equity paper runtime submits at about two
+#     minutes past the boundary. This phase is clear of both.
+#   - the crypto store reconciles at :07:30 and the equity paper store at
+#     :22:30. Neither minute is in this set.
+#   - both reconcile passes and both runtimes read the same broker account
+#     through the same provider allowance.
+#
+# NO OVERLAP. systemd will not start a second instance of a oneshot service
+# while one is running; a trigger arriving during a slow pass is dropped and
+# logged rather than queued, so a stalled provider cannot produce overlapping
+# readers of the same ledger.
+
+[Unit]
+Description=Five-minute AutoTrader realized-P&L accounting sync (equity paper)
+Documentation=file:/opt/autotrader/app/docs/DASHBOARD_V2.md
+
+[Timer]
+OnCalendar=*-*-* *:04/5:30
+RandomizedDelaySec=20
+Persistent=true
+Unit=autotrader-equity-accounting.service
+
+[Install]
+WantedBy=timers.target

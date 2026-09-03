@@ -25,9 +25,12 @@ import { useI18n } from "@/lib/i18n";
 import { useFormat } from "@/lib/i18n/useFormat";
 import type { AccountOrdersPanel } from "@/lib/orders";
 import type { TargetVsActualRow } from "@/lib/portfolio";
+import { statusTone } from "@/lib/pnl";
+import { useSymbolRealized } from "@/lib/realized";
 import type { PositionRow } from "@/lib/types";
 
 import { LineChart } from "./charts/LineChart";
+import { RealizedEvents } from "./RealizedPnl";
 import { Drawer, Field, Pill, SegmentedTimeRange, Tag, cn, toneText } from "./ui";
 
 export function SymbolDetail({
@@ -53,6 +56,7 @@ export function SymbolDetail({
   const symbols = symbol ? [symbol] : [];
   const { series } = useChartBatch(symbols, range);
   const current = symbol ? series[symbol] : undefined;
+  const { data: realized } = useSymbolRealized(symbol);
 
   if (!symbol) return null;
 
@@ -61,6 +65,8 @@ export function SymbolDetail({
   const fills = fillsWithin(fillsFor(orders, symbol), current?.first_at ?? null, current?.last_at ?? null);
   const pnlTone = signTone(position?.unrealized_pnl);
   const crypto = position?.asset_class === "CRYPTO";
+  const events = realized?.events ?? [];
+  const accounting = realized?.status ?? null;
 
   return (
     <Drawer
@@ -71,6 +77,15 @@ export function SymbolDetail({
         <>
           {position ? <Tag tone={crypto ? "ATTENTION" : undefined}>{position.asset_class}</Tag> : null}
           <Tag title={t("strategies.noRealMoneyHint")}>Paper</Tag>
+          {accounting ? (
+            <Pill
+              tone={statusTone(accounting.status)}
+              emphasis={accounting.status !== "CLEAN"}
+              title={accounting.message ?? accounting.tracking_label}
+            >
+              {t("pnl.accounting")} {accounting.status}
+            </Pill>
+          ) : null}
         </>
       }
     >
@@ -89,6 +104,34 @@ export function SymbolDetail({
         </Field>
         <Field label={t("positions.col.avgEntry")} title={t("drawer.avgEntryHint")}>
           <span className="num">{money(position?.average_entry_price)}</span>
+        </Field>
+        <Field label={t("pnl.accountingCost")} title={t("pnl.accountingCostHint")}>
+          {realized?.realized?.average_cost === null || realized?.realized?.average_cost === undefined ? (
+            <span className="text-ink-3">—</span>
+          ) : (
+            <span className="num">{money(realized.realized.average_cost)}</span>
+          )}
+        </Field>
+        <Field label={t("pnl.realizedToday")} title={t("pnl.symbolRealizedTodayHint")}>
+          {realized?.realized ? (
+            <span className={cn("num", toneText(signTone(realized.realized.realized_today)))}>
+              {format.signedMoney(realized.realized.realized_today)}
+            </span>
+          ) : (
+            <span className="text-ink-3">—</span>
+          )}
+        </Field>
+        <Field
+          label={t("pnl.realizedSince")}
+          title={accounting?.tracking_label ?? t("pnl.trackingHorizon")}
+        >
+          {realized?.realized ? (
+            <span className={cn("num", toneText(signTone(realized.realized.realized_since_tracking)))}>
+              {format.signedMoney(realized.realized.realized_since_tracking)}
+            </span>
+          ) : (
+            <span className="text-ink-3">—</span>
+          )}
         </Field>
         <Field label={t("pnl.unrealized")}>
           {position?.unrealized_pnl === null || position?.unrealized_pnl === undefined ? (
@@ -165,6 +208,18 @@ export function SymbolDetail({
           </Field>
         </dl>
       ) : null}
+
+      <div className="mt-6 border-t border-subtle pt-4">
+        <h3 className="text-table font-semibold text-ink">{t("pnl.col.realized")}</h3>
+        <div className="mt-2">
+          <RealizedEvents
+            events={events}
+            realized={realized?.realized ?? null}
+            status={accounting}
+            generatedAt={generatedAt}
+          />
+        </div>
+      </div>
 
       <p className="mt-5 text-meta leading-snug text-ink-3">{t("drawer.readOnly")}</p>
     </Drawer>

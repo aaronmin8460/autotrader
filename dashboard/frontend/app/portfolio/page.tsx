@@ -22,13 +22,16 @@ import { useCallback, useMemo, useState } from "react";
 import { TargetVsActual } from "@/components/EquityPaper";
 import { Allocation, EquityHistory, UnrealizedByPosition } from "@/components/Portfolio";
 import { Positions } from "@/components/Positions";
+import { RealizedStrip } from "@/components/RealizedPnl";
 import { SymbolDetail } from "@/components/SymbolDetail";
 import { PageHeader } from "@/components/shell/PageHeader";
 import { useChartBatch, type ChartRange } from "@/lib/charts";
 import { useDashboard } from "@/lib/dashboard";
 import { useI18n } from "@/lib/i18n";
 import { useAccountOrders } from "@/lib/orders";
+import { realizedBySymbol } from "@/lib/pnl";
 import { equityOf, targetVsActual } from "@/lib/portfolio";
+import { useRealizedPnl } from "@/lib/realized";
 
 export default function PortfolioPage() {
   const { t } = useI18n();
@@ -50,11 +53,31 @@ export default function PortfolioPage() {
     for (const row of rows) out[row.symbol] = row.target_weight;
     return out;
   }, [rows]);
+  const { data: realized } = useRealizedPnl();
+  // Equity-book unrealized only: the realized figure beside it is the equity
+  // ledger's, and pairing an account-wide unrealized with an equity-only
+  // realized would invite exactly the arithmetic the strip says not to do.
+  const unrealized = useMemo(() => {
+    const held = (data?.positions?.rows ?? []).filter(
+      (row) => row.asset_class === "EQUITY" && row.unrealized_pnl !== null,
+    );
+    if (held.length === 0) return null;
+    return held.reduce((total, row) => total + (row.unrealized_pnl ?? 0), 0);
+  }, [data]);
+  const realizedRows = useMemo(() => realizedBySymbol(realized), [realized]);
   const close = useCallback(() => setSelected(null), []);
 
   return (
     <div className="space-y-5">
       <PageHeader title={t("portfolio.title")} context={t("nav.detail.portfolio")} />
+
+      <RealizedStrip
+        panel={realized}
+        dailyPnl={data?.metrics?.daily_pnl ?? null}
+        dailyPnlFraction={data?.metrics?.daily_pnl_fraction ?? null}
+        unrealized={unrealized}
+        generatedAt={data?.generated_at ?? null}
+      />
 
       <Positions
         panel={data?.positions ?? null}
@@ -76,6 +99,8 @@ export default function PortfolioPage() {
         onSelect={setSelected}
         generatedAt={data?.generated_at ?? paper.data?.generated_at ?? null}
         brokerAvailable={data?.positions?.source === "BROKER"}
+        realized={realizedRows}
+        accountingStatus={realized?.status ?? null}
       />
 
       <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-2">
