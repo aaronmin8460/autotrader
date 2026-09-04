@@ -216,9 +216,14 @@ here touches that, reads its verdict, or can influence it.
 | verdict | meaning |
 |---|---|
 | `CLEAN` | every symbol's quantity matches and every average is inside tolerance |
-| `DEGRADED` | quantities match; at least one average cost differs beyond tolerance |
+| `BASIS_DIVERGENCE` | quantities match exactly and an average differs, but lot relief over the ledger's own fills accounts for all of it |
+| `DEGRADED` | quantities match; an average differs beyond tolerance and no lot-relief order over the recorded fills accounts for it |
 | `MISMATCH` | a quantity differs, or a symbol has stopped accounting |
 | `UNKNOWN` | the broker could not be read, or the ledger was never bootstrapped |
+
+Worst-first when several apply: `MISMATCH`, `UNKNOWN`, `DEGRADED`,
+`BASIS_DIVERGENCE`, `CLEAN`. One explained symbol never softens the verdict on
+an unexplained one.
 
 **Quantity is the hard test.** Two systems that disagree about how many shares
 exist have not made a rounding error; one has missed an execution.
@@ -226,6 +231,57 @@ exist have not made a rounding error; one has missed an execution.
 **Average cost is the soft test**, because the broker publishes
 `average_entry_price` rounded to six decimal places — exact equality is not
 available at any precision the broker can express. The tolerance is `1e-6`.
+
+### Beyond the tolerance, the difference is tested rather than assumed
+
+Two systems holding the same shares, bought at the same prices, can still carry
+different average costs, because *which shares did that sale consume?* has more
+than one defensible answer. This ledger relieves a sale at the running weighted
+average. This account's broker restates `avg_entry_price` after the close,
+relieving that day's sales against the inventory carried in from prior days —
+which moves its published figure away from the weighted average without either
+side being wrong about a single fill.
+
+That was observed directly on 2026-09-03: META, NVDA and TSLA all flipped from
+`CLEAN` to `DEGRADED` in one five-minute pass at 07:35 UTC, market closed, zero
+fills imported, the ledger's own average byte-identical either side of the
+transition. The broker restated; the ledger did not move.
+
+Reported as a bare `DEGRADED`, that is indistinguishable from a missing
+execution — the one thing this reconciliation exists to be able to tell apart.
+So a deviation beyond tolerance is now tested: **is the broker's implied cost
+basis reachable by relieving this ledger's own recorded purchase lots?** Two
+greedy lot books are advanced over the same fills in the same chronological
+order, one always taking the dearest lot on hand and one the cheapest. Every
+admissible method — weighted average, FIFO, LIFO, the broker's day-carry
+convention — lands between them.
+
+- inside the range → `BASIS_DIVERGENCE`, carrying the exact dollar figure and
+  the bounds it was judged on, stored on the reconciliation row
+- outside it → `DEGRADED`, exactly as before
+
+The question is deliberately never *which* method the broker used. That answer
+was inferred from a handful of restatements and could change without notice;
+this one is answered from the ledger's own evidence and stays correct if the
+broker changes convention tomorrow. Chronological, not sorted: a sale may only
+consume shares that had already been purchased when it happened.
+
+The envelope is widened by `broker_quantity x 5e-7` — half the broker's last
+published digit, per share — because the basis implied by a six-decimal average
+is uncertain by exactly that much. That is a tolerance on the question, not on
+the answer, and `AVERAGE_COST_TOLERANCE` itself is unchanged at `1e-6`.
+
+Every path that cannot gather evidence returns *not explained*: no fill history
+for the symbol, fills that do not fold back to the stored position, a flat
+position, an oversell. Missing evidence never becomes agreement.
+
+**On the difference being a timing difference and not a loss.** Under every
+cost-basis method, `cost_basis - cumulative_realized == sum of buy notional -
+sum of sale proceeds`, and the right-hand side is fixed by fills both sides
+agree on. So the basis difference and the realized difference are the same
+number with opposite sign: relieving a dearer lot releases more cost and books
+less profit. Nothing is lost or created — the two sides recognise the same P&L
+on different days, and the reconciliation message states the amount.
 
 Nothing here repairs anything.
 
