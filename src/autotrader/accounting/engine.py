@@ -53,6 +53,8 @@ symbol until a human has looked at it.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 
 from autotrader.accounting.models import (
@@ -208,6 +210,85 @@ def _apply_sell(state: CostBasisState, fill: ExecutionFill) -> AppliedFill:
     return AppliedFill(state=new_state, realized=realized)
 
 
+@dataclass(frozen=True)
+class ReliefEnvelope:
+    """The range of cost bases a fill stream can leave behind.
+
+    `low` is what survives if every sale is relieved against the dearest share
+    then available, `high` if against the cheapest. Both are reachable; so is
+    everything between them, and nothing outside them.
+    """
+
+    quantity: Decimal
+    low: Decimal
+    high: Decimal
+
+
+def relief_envelope(fills: Sequence[ExecutionFill]) -> ReliefEnvelope | None:
+    """The lowest and highest cost basis any lot-relief order can leave.
+
+    Two systems that hold the same shares, bought at the same prices, can still
+    carry different cost bases, because "which shares did that sale consume?"
+    has more than one defensible answer - weighted average, FIFO, LIFO, or the
+    day-carry convention this account's broker restates to overnight. What they
+    cannot do is disagree by more than the choice of answer allows.
+
+    This function measures that allowance. It relieves the same sales twice
+    over the same purchases: once always taking the dearest lot on hand, which
+    leaves the cheapest possible inventory, and once always taking the cheapest,
+    which leaves the dearest. Every admissible method lands between the two.
+
+    **Chronological, not sorted.** Each sale may only consume shares that had
+    already been purchased when it happened, so both books are advanced fill by
+    fill in the order given. A time-blind envelope would be wider, and would
+    accept a basis no real sequence of trades could have produced.
+
+    Returns `None` when the stream is not a usable inventory history - a sale
+    larger than the position, or nothing held at the end. Neither is a range to
+    reason about, and neither should be quietly reported as agreement.
+
+    Exact throughout: only additions, subtractions and multiplications of
+    Decimals. There is no division here and so no rounding, which is what lets
+    the caller compare the result to a broker figure and attribute every
+    remaining difference to the broker's own published precision.
+    """
+    dearest: list[list[Decimal]] = []
+    cheapest: list[list[Decimal]] = []
+    quantity = Decimal(0)
+    for fill in fills:
+        if fill.side == SIDE_BUY:
+            quantity += fill.quantity
+            dearest.append([fill.quantity, fill.price])
+            cheapest.append([fill.quantity, fill.price])
+            continue
+        if fill.quantity > quantity:
+            return None
+        quantity -= fill.quantity
+        _relieve(dearest, fill.quantity, take_dearest=True)
+        _relieve(cheapest, fill.quantity, take_dearest=False)
+    if quantity <= 0:
+        return None
+    return ReliefEnvelope(
+        quantity=quantity,
+        low=sum((lot[0] * lot[1] for lot in dearest), Decimal(0)),
+        high=sum((lot[0] * lot[1] for lot in cheapest), Decimal(0)),
+    )
+
+
+def _relieve(lots: list[list[Decimal]], quantity: Decimal, *, take_dearest: bool) -> None:
+    """Consume `quantity` from `lots`, always from the extreme price on hand."""
+    remaining = quantity
+    while remaining > 0 and lots:
+        index = (max if take_dearest else min)(
+            range(len(lots)), key=lambda position: lots[position][1]
+        )
+        taken = min(remaining, lots[index][0])
+        lots[index][0] -= taken
+        remaining -= taken
+        if lots[index][0] == 0:
+            lots.pop(index)
+
+
 def mark_mismatch(state: CostBasisState, *, at_execution_id: str | None = None) -> CostBasisState:
     """Stop accounting for a symbol, preserving the last state it was sure of.
 
@@ -256,8 +337,10 @@ def replay(
 __all__ = [
     "AVERAGE_QUANTUM",
     "BASIS_QUANTUM",
+    "ReliefEnvelope",
     "apply_fill",
     "average_cost",
     "mark_mismatch",
+    "relief_envelope",
     "replay",
 ]

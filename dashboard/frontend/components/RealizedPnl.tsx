@@ -41,6 +41,13 @@ function statusDetail(panel: RealizedPnlPanel | null): string {
   if (status.status === "CLEAN") {
     return `Ledger quantities match the broker on all ${status.symbols_checked} symbols.`;
   }
+  if (status.status === "BASIS_DIVERGENCE") {
+    return (
+      status.message
+        ? `${status.message}. Quantities match the broker exactly on all ${status.symbols_checked} symbols and every fill is accounted for; the two sides relieve sold lots differently, so the same P&L is recognised on different days.`
+        : "The ledger and the broker hold the same shares at the same prices and relieve sold lots differently."
+    );
+  }
   return status.message ?? "The ledger and the broker do not agree.";
 }
 

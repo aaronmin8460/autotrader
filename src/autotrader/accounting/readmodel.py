@@ -166,6 +166,7 @@ class AccountingStatusPanel:
     symbols_checked: int
     quantity_mismatches: int
     cost_deviations: int
+    basis_divergences: int
     last_reconciled_at: str | None
     last_sync_at: str | None
     last_sync_status: str | None
@@ -211,6 +212,15 @@ def _sum(connection: sqlite3.Connection, sql: str, params: tuple[object, ...]) -
     return total
 
 
+def _column(row: sqlite3.Row, name: str, default: object) -> object:
+    """One column of a row, or a default when this build knows a column the file does not."""
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
 def build_status(connection: sqlite3.Connection) -> AccountingStatusPanel:
     """Everything a viewer needs to decide whether to believe the numbers."""
     metadata = store.read_metadata(connection)
@@ -230,6 +240,7 @@ def build_status(connection: sqlite3.Connection) -> AccountingStatusPanel:
             symbols_checked=0,
             quantity_mismatches=0,
             cost_deviations=0,
+            basis_divergences=0,
             last_reconciled_at=None,
             last_sync_at=None if sync is None else str(sync["completed_at"]),
             last_sync_status=None if sync is None else str(sync["status"]),
@@ -245,7 +256,7 @@ def build_status(connection: sqlite3.Connection) -> AccountingStatusPanel:
     if run is None:
         status = store.RECON_UNKNOWN
         message = "The ledger has never been reconciled against the broker."
-        checked = mismatches = deviations = 0
+        checked = mismatches = deviations = divergences = 0
         reconciled_at = None
     else:
         status = str(run["status"])
@@ -253,6 +264,11 @@ def build_status(connection: sqlite3.Connection) -> AccountingStatusPanel:
         checked = int(run["symbols_checked"])
         mismatches = int(run["quantity_mismatches"])
         deviations = int(run["cost_deviations"])
+        # A read-only viewer can be running the new build against a ledger the
+        # writer has not migrated yet - the two are deployed as one tree but
+        # start seconds apart, and the migration happens on the write path.
+        # A column that is not there yet reads as zero, not as a 500.
+        divergences = int(_column(run, "basis_divergences", 0))
         reconciled_at = str(run["run_at"])
 
     if stopped_count:
@@ -270,6 +286,11 @@ def build_status(connection: sqlite3.Connection) -> AccountingStatusPanel:
 
     tone = {
         store.RECON_CLEAN: TONE_POSITIVE,
+        # Neutral, not positive and not attention. The ledger and the broker
+        # agree about every share and every price; they recognise a stated
+        # amount of P&L on different days. That is a fact to read, not a fault
+        # to chase - and not something to colour green either.
+        store.RECON_BASIS_DIVERGENCE: TONE_NEUTRAL,
         store.RECON_DEGRADED: TONE_ATTENTION,
         store.RECON_MISMATCH: TONE_NEGATIVE,
         store.RECON_UNKNOWN: TONE_ATTENTION,
@@ -289,6 +310,7 @@ def build_status(connection: sqlite3.Connection) -> AccountingStatusPanel:
         symbols_checked=checked,
         quantity_mismatches=mismatches,
         cost_deviations=deviations,
+        basis_divergences=divergences,
         last_reconciled_at=reconciled_at,
         last_sync_at=None if sync is None else str(sync["completed_at"]),
         last_sync_status=None if sync is None else str(sync["status"]),

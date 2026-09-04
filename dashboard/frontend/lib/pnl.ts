@@ -37,10 +37,16 @@ export function realizedForOrder(events: RealizedEventRow[], orderId: string | n
 }
 
 /** The tone for a status word. Never green unless the ledger reconciled clean. */
-export function statusTone(status: AccountingStatus | null | undefined): "POSITIVE" | "ATTENTION" | "NEGATIVE" | "MUTED" {
+export function statusTone(status: AccountingStatus | null | undefined): "POSITIVE" | "ATTENTION" | "NEGATIVE" | "NEUTRAL" | "MUTED" {
   switch (status) {
     case "CLEAN":
       return "POSITIVE";
+    // Neutral: an explained, quantified difference in when P&L is recognised.
+    // Not green - there is a real number on the screen that CLEAN would not
+    // have - and not amber, which is reserved for a difference nobody has
+    // accounted for.
+    case "BASIS_DIVERGENCE":
+      return "NEUTRAL";
     case "DEGRADED":
       return "ATTENTION";
     case "MISMATCH":

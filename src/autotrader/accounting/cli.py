@@ -120,7 +120,8 @@ def _report_pass(path: Path, result: service.PassResult) -> None:
     _line("Reconciliation", result.reconciliation.status)
     _line("Symbols checked", result.reconciliation.symbols_checked)
     _line("Quantity mismatches", result.reconciliation.quantity_mismatches)
-    _line("Cost deviations", result.reconciliation.cost_deviations)
+    _line("Unexplained deviations", result.reconciliation.cost_deviations)
+    _line("Basis divergences", result.reconciliation.basis_divergences)
     if result.reconciliation.message:
         _line("Note", result.reconciliation.message)
 

@@ -31,7 +31,14 @@ export const REALIZED_POLL_INTERVAL_MS = 30_000;
 export const REALIZED_SUMMARY_ENDPOINT = "/api/equity-paper/realized-pnl/summary";
 export const REALIZED_STATUS_ENDPOINT = "/api/equity-paper/realized-pnl/status";
 
-export type AccountingStatus = "CLEAN" | "DEGRADED" | "MISMATCH" | "UNKNOWN";
+/**
+ * `BASIS_DIVERGENCE` is not a fault. It means the ledger and the broker hold the
+ * same shares bought at the same prices, and relieve sold lots differently - so a
+ * stated amount of realized P&L is recognised on a different day by each. It is
+ * distinct from `DEGRADED`, which means a difference no lot-relief order over the
+ * recorded fills accounts for.
+ */
+export type AccountingStatus = "CLEAN" | "BASIS_DIVERGENCE" | "DEGRADED" | "MISMATCH" | "UNKNOWN";
 
 export interface AccountingStatusPanel {
   status: AccountingStatus;
@@ -45,6 +52,7 @@ export interface AccountingStatusPanel {
   symbols_checked: number;
   quantity_mismatches: number;
   cost_deviations: number;
+  basis_divergences: number;
   last_reconciled_at: string | null;
   last_sync_at: string | null;
   last_sync_status: string | null;

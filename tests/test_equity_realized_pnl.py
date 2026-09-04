@@ -411,10 +411,16 @@ def test_initialize_creates_the_schema_and_is_idempotent(tmp_path: Path) -> None
 
 
 def test_the_accounting_store_has_its_own_schema_version() -> None:
-    """It must not be the operational store's, or a bump there would migrate it."""
+    """It must not be the operational store's, or a bump there would migrate it.
+
+    The two counters move independently and always have: this one advances when
+    the ledger's own schema changes, and must never happen to equal the trading
+    lineage's, because a command that migrated on a shared number would migrate
+    a running trader's database out from under it.
+    """
     from autotrader import state
 
-    assert store.ACCOUNTING_SCHEMA_VERSION == 1
+    assert store.ACCOUNTING_SCHEMA_VERSION == 2
     assert store.ACCOUNTING_SCHEMA_VERSION != state.SCHEMA_VERSION
 
 
@@ -1225,6 +1231,679 @@ def test_every_reconciliation_leaves_an_audit_row(ledger: sqlite3.Connection) ->
     run = reconcile.latest(ledger)
     assert run is not None and run["status"] == store.RECON_CLEAN
     assert [row["symbol"] for row in reconcile.latest_symbols(ledger)] == ["SPY"]
+
+
+# --------------------------------------------------------------------------
+# Lot-relief envelope, and telling a method difference from a real fault
+# --------------------------------------------------------------------------
+
+
+def test_a_stream_with_no_sale_has_a_single_point_envelope() -> None:
+    """Nothing was relieved, so there is nothing to have relieved differently."""
+    envelope = engine.relief_envelope(
+        [fill("e1", SIDE_BUY, "10", "100"), fill("e2", SIDE_BUY, "10", "120")]
+    )
+
+    assert envelope is not None
+    assert envelope.quantity == Decimal("20")
+    assert envelope.low == envelope.high == Decimal("2200")
+
+
+def test_the_envelope_brackets_every_admissible_relief_order() -> None:
+    """Cheapest-first leaves the most basis, dearest-first the least."""
+    fills = [
+        fill("e1", SIDE_BUY, "10", "100"),
+        fill("e2", SIDE_BUY, "10", "120"),
+        fill("e3", SIDE_SELL, "5", "130", at=T0 + timedelta(hours=1)),
+    ]
+
+    envelope = engine.relief_envelope(fills)
+
+    assert envelope is not None
+    assert envelope.quantity == Decimal("15")
+    # Dearest relieved: 5 @ 120 gone, 2200 - 600.
+    assert envelope.low == Decimal("1600")
+    # Cheapest relieved: 5 @ 100 gone, 2200 - 500.
+    assert envelope.high == Decimal("1700")
+    # The ledger's own weighted average sits inside, as it must.
+    states, _ = engine.replay(fills)
+    assert envelope.low <= states["SPY"].total_cost_basis <= envelope.high
+
+
+def test_the_envelope_is_chronological_not_sorted() -> None:
+    """A sale cannot relieve a lot that had not been bought yet.
+
+    The cheap lot arrives *after* the sale here. A time-blind envelope would
+    offer it to that sale and report a wider range than any real sequence of
+    trades could produce - and would then accept a broker figure no accounting
+    method could have arrived at.
+    """
+    fills = [
+        fill("e1", SIDE_BUY, "10", "200"),
+        fill("e2", SIDE_SELL, "5", "210", at=T0 + timedelta(hours=1)),
+        fill("e3", SIDE_BUY, "10", "100", at=T0 + timedelta(hours=2)),
+    ]
+
+    envelope = engine.relief_envelope(fills)
+
+    assert envelope is not None
+    # Only the 200 lot existed at the sale, so both books relieve it: one answer.
+    assert envelope.low == envelope.high == Decimal("2000")
+
+
+def test_the_envelope_refuses_a_stream_that_is_not_an_inventory_history() -> None:
+    oversold = [fill("e1", SIDE_BUY, "1", "100"), fill("e2", SIDE_SELL, "2", "100")]
+    closed = [fill("e1", SIDE_BUY, "1", "100"), fill("e2", SIDE_SELL, "1", "100")]
+
+    assert engine.relief_envelope(oversold) is None
+    assert engine.relief_envelope(closed) is None
+    assert engine.relief_envelope([]) is None
+
+
+def test_a_deviation_lot_relief_accounts_for_is_a_basis_divergence(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Same shares, same prices, different answer to "which ones were sold?".
+
+    Two lots at 100 and 120, then a sale of 5. This ledger relieves at the
+    weighted average of 110, leaving 1650 over 15 shares. A first-in-first-out
+    counterparty relieves the 100 lot, leaving 1700 - an average of 113.333333.
+    The gap is 3.33 per share, five million times the reconciliation tolerance,
+    and not one fill is in dispute.
+    """
+    store.record_fill(ledger, fill("e1", SIDE_BUY, "10", "100"), now=T0)
+    store.record_fill(ledger, fill("e2", SIDE_BUY, "10", "120"), now=T0)
+    store.record_fill(ledger, fill("e3", SIDE_SELL, "5", "130", at=T0 + timedelta(hours=1)), now=T0)
+
+    result = reconcile.reconcile(ledger, {"SPY": Position("SPY", "15", "113.333333")}, now=T0)
+
+    assert result.status == store.RECON_BASIS_DIVERGENCE
+    assert result.basis_divergences == 1
+    assert result.cost_deviations == 0
+    assert result.quantity_mismatches == 0
+    row = result.symbols[0]
+    assert row.relief_basis_low == Decimal("1600")
+    assert row.relief_basis_high == Decimal("1700")
+    assert row.broker_implied_basis is not None
+    assert row.relief_basis_low <= row.broker_implied_basis <= row.relief_basis_high
+
+
+def test_a_deviation_no_relief_order_accounts_for_stays_degraded(
+    ledger: sqlite3.Connection,
+) -> None:
+    """Outside the envelope there is no method that explains it, so nothing does.
+
+    Same two lots and the same sale, but the counterparty claims an average of
+    150 - dearer than either lot ever cost. No order of relief over these
+    purchases produces that, so the difference is not about relief.
+    """
+    store.record_fill(ledger, fill("e1", SIDE_BUY, "10", "100"), now=T0)
+    store.record_fill(ledger, fill("e2", SIDE_BUY, "10", "120"), now=T0)
+    store.record_fill(ledger, fill("e3", SIDE_SELL, "5", "130", at=T0 + timedelta(hours=1)), now=T0)
+
+    result = reconcile.reconcile(ledger, {"SPY": Position("SPY", "15", "150")}, now=T0)
+
+    assert result.status == store.RECON_DEGRADED
+    assert result.cost_deviations == 1
+    assert result.basis_divergences == 0
+
+
+def test_a_missing_fill_is_not_laundered_into_a_basis_divergence(
+    ledger: sqlite3.Connection,
+) -> None:
+    """The case this whole distinction exists to keep separate.
+
+    The ledger missed a purchase, so it disagrees with the broker about the
+    quantity. Quantity is the hard test and runs first: no envelope is
+    consulted and the verdict is MISMATCH, exactly as before.
+    """
+    store.record_fill(ledger, fill("e1", SIDE_BUY, "10", "100"), now=T0)
+
+    result = reconcile.reconcile(ledger, {"SPY": Position("SPY", "20", "110")}, now=T0)
+
+    assert result.status == store.RECON_MISMATCH
+    assert result.symbols[0].broker_implied_basis is None
+
+
+def test_a_ledger_whose_fills_do_not_fold_to_its_position_explains_nothing() -> None:
+    """An envelope computed from fills that contradict the stored state is not evidence."""
+    verdict = reconcile.explain_deviation(
+        CostBasisState(
+            symbol="SPY",
+            quantity=Decimal("99"),
+            total_cost_basis=Decimal("9900"),
+            status=STATUS_TRACKING,
+        ),
+        Decimal("100"),
+        Decimal("99"),
+        [fill("e1", SIDE_BUY, "10", "100")],
+    )
+
+    assert verdict.explained is False
+    assert verdict.broker_implied_basis is None
+
+
+def test_a_deviation_with_no_fill_history_is_never_explained() -> None:
+    """Absence of evidence is reported as absence of evidence."""
+    state = CostBasisState(
+        symbol="SPY",
+        quantity=Decimal("10"),
+        total_cost_basis=Decimal("1000"),
+        status=STATUS_TRACKING,
+    )
+
+    assert not reconcile.explain_deviation(state, Decimal("110"), Decimal("10"), None).explained
+    assert not reconcile.explain_deviation(state, Decimal("110"), Decimal("10"), []).explained
+
+
+def test_the_broker_precision_slack_is_per_share_not_per_position() -> None:
+    """A published six-decimal average is uncertain by half a unit on every share."""
+    fills = [fill("e1", SIDE_BUY, "1000", "100")]
+    state = CostBasisState(
+        symbol="SPY",
+        quantity=Decimal("1000"),
+        total_cost_basis=Decimal("100000"),
+        status=STATUS_TRACKING,
+    )
+
+    # 1000 shares x 5e-7 = 5e-4 of basis, and no more.
+    assert reconcile.explain_deviation(
+        state, Decimal("100.0000004"), Decimal("1000"), fills
+    ).explained
+    assert not reconcile.explain_deviation(
+        state, Decimal("100.0000006"), Decimal("1000"), fills
+    ).explained
+
+
+def test_a_basis_divergence_ranks_below_a_degraded_symbol(ledger: sqlite3.Connection) -> None:
+    """One explained symbol must never soften the verdict on an unexplained one."""
+    store.record_fill(ledger, fill("e1", SIDE_BUY, "10", "100"), now=T0)
+    store.record_fill(ledger, fill("e2", SIDE_BUY, "10", "120"), now=T0)
+    store.record_fill(ledger, fill("e3", SIDE_SELL, "5", "130", at=T0 + timedelta(hours=1)), now=T0)
+    store.record_fill(ledger, fill("q1", SIDE_BUY, "5", "700", symbol="QQQ"), now=T0)
+
+    result = reconcile.reconcile(
+        ledger,
+        {
+            "SPY": Position("SPY", "15", "113.333333"),
+            "QQQ": Position("QQQ", "5", "800"),
+        },
+        now=T0,
+    )
+
+    assert result.status == store.RECON_DEGRADED
+    assert result.basis_divergences == 1
+    assert result.cost_deviations == 1
+
+
+def test_a_basis_divergence_is_never_reported_as_clean(ledger: sqlite3.Connection) -> None:
+    """It is a real, quantified difference. It does not get to be green."""
+    store.record_fill(ledger, fill("e1", SIDE_BUY, "10", "100"), now=T0)
+    store.record_fill(ledger, fill("e2", SIDE_BUY, "10", "120"), now=T0)
+    store.record_fill(ledger, fill("e3", SIDE_SELL, "5", "130", at=T0 + timedelta(hours=1)), now=T0)
+
+    result = reconcile.reconcile(ledger, {"SPY": Position("SPY", "15", "113.333333")}, now=T0)
+
+    assert result.status != store.RECON_CLEAN
+    assert result.message is not None
+    assert "no fill is in dispute" in result.message
+    assert readmodel.build_status(ledger).tone != readmodel.TONE_POSITIVE
+
+
+def test_the_reconciliation_tolerance_is_not_widened_by_the_divergence_test() -> None:
+    """The threshold for agreement is the broker's precision, and stays there."""
+    tolerance, half_ulp = reconcile.AVERAGE_COST_TOLERANCE, reconcile.BROKER_PRICE_HALF_ULP
+
+    assert tolerance == Decimal("1e-6")
+    assert half_ulp == Decimal("5e-7")
+
+
+def test_a_divergence_still_reconciles_nothing_and_repairs_nothing(
+    ledger: sqlite3.Connection,
+) -> None:
+    store.record_fill(ledger, fill("e1", SIDE_BUY, "10", "100"), now=T0)
+    store.record_fill(ledger, fill("e2", SIDE_BUY, "10", "120"), now=T0)
+    store.record_fill(ledger, fill("e3", SIDE_SELL, "5", "130", at=T0 + timedelta(hours=1)), now=T0)
+    before = store.read_cost_basis(ledger, "SPY")
+
+    reconcile.reconcile(ledger, {"SPY": Position("SPY", "15", "113.333333")}, now=T0)
+
+    assert store.read_cost_basis(ledger, "SPY") == before
+
+
+def test_the_envelope_row_survives_the_round_trip_to_the_database(
+    ledger: sqlite3.Connection,
+) -> None:
+    store.record_fill(ledger, fill("e1", SIDE_BUY, "10", "100"), now=T0)
+    store.record_fill(ledger, fill("e2", SIDE_BUY, "10", "120"), now=T0)
+    store.record_fill(ledger, fill("e3", SIDE_SELL, "5", "130", at=T0 + timedelta(hours=1)), now=T0)
+
+    reconcile.reconcile(ledger, {"SPY": Position("SPY", "15", "113.333333")}, now=T0)
+
+    row = reconcile.latest_symbols(ledger)[0]
+    assert row["status"] == store.RECON_BASIS_DIVERGENCE
+    assert Decimal(row["relief_basis_low"]) == Decimal("1600")
+    assert Decimal(row["relief_basis_high"]) == Decimal("1700")
+    assert Decimal(row["broker_implied_basis"]) == Decimal("113.333333") * Decimal("15")
+
+
+# --------------------------------------------------------------------------
+# The production divergence, as a regression
+# --------------------------------------------------------------------------
+
+#: The three symbols whose reconciliation went DEGRADED overnight on
+#: 2026-09-03 while the ledger stood still, replayed from the broker-confirmed
+#: fills the ledger actually holds. `broker` is the average the broker published
+#: after it restated that day's sales against the inventory carried in from
+#: prior days, rather than against the running weighted average.
+PRODUCTION_DIVERGENCE: dict[str, tuple[list[tuple[str, str, str]], str, str]] = {
+    "META": (
+        [
+            ("BUY", "4", "572"),
+            ("BUY", "1", "592.89"),
+            ("BUY", "5", "592.87"),
+            ("BUY", "5", "592.87"),
+            ("BUY", "0.252214314", "592.87"),
+            ("SELL", "0.238755444", "596.868"),
+            ("BUY", "0.174703844", "593.152"),
+            ("SELL", "0.358587941", "617.18"),
+            ("BUY", "0.17119867", "608.838"),
+        ],
+        "15.000773443",
+        "587.947417",
+    ),
+    "NVDA": (
+        [
+            ("BUY", "11", "219.64"),
+            ("BUY", "23", "219.93"),
+            ("BUY", "2", "219.9"),
+            ("BUY", "3", "219.9"),
+            ("BUY", "1", "219.92"),
+            ("BUY", "0.796669247", "219.92"),
+            ("SELL", "0.446966744", "223.074"),
+            ("SELL", "0.620603768", "226.696"),
+            ("BUY", "0.432561532", "224.138"),
+        ],
+        "40.161660267",
+        "219.89942",
+    ),
+    "TSLA": (
+        [
+            ("BUY", "6", "367.97"),
+            ("BUY", "8", "352.43"),
+            ("BUY", "4", "352.42"),
+            ("BUY", "7", "352.42"),
+            ("BUY", "0.544012431", "352.42"),
+            ("SELL", "0.25432343", "355.728"),
+            ("BUY", "0.292429382", "352.248"),
+            ("SELL", "1", "375.25"),
+            ("SELL", "0.121292898", "375.25"),
+            ("SELL", "0.311789164", "378.216"),
+        ],
+        "24.149036321",
+        "355.91365",
+    ),
+}
+
+
+def _record_production_fills(connection: sqlite3.Connection, symbol: str) -> None:
+    rows, _, _ = PRODUCTION_DIVERGENCE[symbol]
+    for index, (side, quantity, price) in enumerate(rows):
+        store.record_fill(
+            connection,
+            fill(
+                f"{symbol}-{index}",
+                side,
+                quantity,
+                price,
+                symbol=symbol,
+                at=T0 + timedelta(minutes=index),
+            ),
+            now=T0,
+        )
+
+
+@pytest.mark.parametrize("symbol", sorted(PRODUCTION_DIVERGENCE))
+def test_the_production_divergence_reconciles_as_a_method_difference(
+    ledger: sqlite3.Connection, symbol: str
+) -> None:
+    """Fractional quantities to the billionth of a share, and it still holds."""
+    _, quantity, broker_average = PRODUCTION_DIVERGENCE[symbol]
+    _record_production_fills(ledger, symbol)
+
+    result = reconcile.reconcile(
+        ledger, {symbol: Position(symbol, quantity, broker_average)}, now=T0
+    )
+
+    assert result.status == store.RECON_BASIS_DIVERGENCE, result.message
+    assert result.quantity_mismatches == 0
+    row = result.symbols[0]
+    assert row.local_quantity == Decimal(quantity)
+    assert abs(row.average_cost_delta or Decimal(0)) > reconcile.AVERAGE_COST_TOLERANCE
+
+
+@pytest.mark.parametrize("symbol", sorted(PRODUCTION_DIVERGENCE))
+def test_one_missing_purchase_in_the_production_stream_is_still_caught(
+    ledger: sqlite3.Connection, symbol: str
+) -> None:
+    """The same three symbols, with the ledger short one purchase.
+
+    This is the failure the DEGRADED verdict was supposed to be about, and it
+    must survive a change that stops crying wolf about the other one.
+    """
+    rows, quantity, broker_average = PRODUCTION_DIVERGENCE[symbol]
+    for index, (side, size, price) in enumerate(rows):
+        if index == 1:  # drop one real purchase
+            continue
+        store.record_fill(
+            connection=ledger,
+            fill=fill(
+                f"{symbol}-{index}",
+                side,
+                size,
+                price,
+                symbol=symbol,
+                at=T0 + timedelta(minutes=index),
+            ),
+            now=T0,
+        )
+
+    result = reconcile.reconcile(
+        ledger, {symbol: Position(symbol, quantity, broker_average)}, now=T0
+    )
+
+    assert result.status == store.RECON_MISMATCH
+    assert result.quantity_mismatches == 1
+
+
+# --------------------------------------------------------------------------
+# Cutover semantics
+# --------------------------------------------------------------------------
+
+
+def test_a_cutover_seed_is_the_state_a_replay_starts_from() -> None:
+    """The ledger in service did not take this path; the engine still supports it."""
+    seed = CostBasisState(
+        symbol="SPY",
+        quantity=Decimal("100"),
+        total_cost_basis=Decimal("50000"),
+        status=STATUS_TRACKING,
+    )
+
+    states, events = engine.replay([], initial={"SPY": seed})
+
+    assert states["SPY"] == seed
+    assert engine.average_cost(states["SPY"]) == Decimal("500.0000000000")
+    assert events == []
+
+
+def test_a_post_cutover_buy_blends_into_the_seeded_average() -> None:
+    seed = CostBasisState(
+        symbol="SPY",
+        quantity=Decimal("100"),
+        total_cost_basis=Decimal("50000"),
+        status=STATUS_TRACKING,
+    )
+
+    states, events = engine.replay([fill("e1", SIDE_BUY, "100", "600")], initial={"SPY": seed})
+
+    assert states["SPY"].quantity == Decimal("200")
+    assert states["SPY"].total_cost_basis == Decimal("110000")
+    assert engine.average_cost(states["SPY"]) == Decimal("550.0000000000")
+    assert events == []
+
+
+def test_a_post_cutover_sell_realizes_against_the_seed_not_against_zero() -> None:
+    """A sale after a cutover must not book the whole proceeds as profit."""
+    seed = CostBasisState(
+        symbol="SPY",
+        quantity=Decimal("100"),
+        total_cost_basis=Decimal("50000"),
+        status=STATUS_TRACKING,
+    )
+
+    states, events = engine.replay([fill("e1", SIDE_SELL, "10", "520")], initial={"SPY": seed})
+
+    assert len(events) == 1
+    assert events[0].average_cost_before == Decimal("500.0000000000")
+    assert events[0].released_cost_basis == Decimal("5000.0000000000")
+    assert events[0].net_realized_pnl == Decimal("200.0000000000")
+    assert states["SPY"].quantity == Decimal("90")
+    assert engine.average_cost(states["SPY"]) == Decimal("500.0000000000")
+
+
+def test_fills_at_the_same_price_leave_one_price_in_the_envelope() -> None:
+    """Same-price partial fills are one economic lot however they are split."""
+    fills = [
+        fill("e1", SIDE_BUY, "14", "497.9"),
+        fill("e2", SIDE_BUY, "0.045202135", "497.9"),
+        fill("e3", SIDE_SELL, "0.196647064", "511.968", at=T0 + timedelta(hours=1)),
+    ]
+
+    envelope = engine.relief_envelope(fills)
+    states, _ = engine.replay(fills)
+
+    assert envelope is not None
+    assert envelope.low == envelope.high
+    assert envelope.low == states["SPY"].total_cost_basis
+
+
+# --------------------------------------------------------------------------
+# Migrating a schema-1 ledger
+# --------------------------------------------------------------------------
+
+
+_SCHEMA_1_RECON_TABLES = (
+    """
+    CREATE TABLE accounting_reconciliation_runs (
+        id                  INTEGER PRIMARY KEY,
+        run_at              TEXT NOT NULL,
+        status              TEXT NOT NULL CHECK (
+            status IN ('CLEAN', 'DEGRADED', 'MISMATCH', 'UNKNOWN')
+        ),
+        symbols_checked     INTEGER NOT NULL CHECK (symbols_checked >= 0),
+        quantity_mismatches INTEGER NOT NULL CHECK (quantity_mismatches >= 0),
+        cost_deviations     INTEGER NOT NULL CHECK (cost_deviations >= 0),
+        message             TEXT,
+        created_at          TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE accounting_reconciliation_symbols (
+        id                    INTEGER PRIMARY KEY,
+        run_id                INTEGER NOT NULL
+                              REFERENCES accounting_reconciliation_runs (id),
+        symbol                TEXT NOT NULL CHECK (symbol <> ''),
+        local_quantity        TEXT NOT NULL,
+        broker_quantity       TEXT NOT NULL,
+        quantity_matches      INTEGER NOT NULL CHECK (quantity_matches IN (0, 1)),
+        local_average_cost    TEXT,
+        broker_average_entry  TEXT,
+        average_cost_delta    TEXT,
+        status                TEXT NOT NULL CHECK (
+            status IN ('CLEAN', 'DEGRADED', 'MISMATCH', 'UNKNOWN')
+        ),
+        created_at            TEXT NOT NULL,
+        UNIQUE (run_id, symbol)
+    )
+    """,
+)
+
+
+def _schema_1_ledger(path: Path) -> None:
+    """Build a ledger exactly as the schema-1 build would have left it."""
+    with store.connect(path) as connection:
+        store.initialize(connection)
+        store.record_fill(connection, fill("e1", SIDE_BUY, "10", "100"), now=T0)
+        store.record_fill(
+            connection, fill("e2", SIDE_SELL, "4", "110", at=T0 + timedelta(hours=1)), now=T0
+        )
+        store.write_metadata(
+            connection,
+            tracking_started_at=T0,
+            bootstrap_method="EXACT_REPLAY",
+            historical_completeness="EXACT_REPLAY_FROM_ACCOUNT_OPEN",
+            broker_account_fingerprint="fingerprint",
+            asset_class_scope="US_EQUITY",
+            now=T0,
+        )
+        reconcile.reconcile(connection, {"SPY": Position("SPY", "6", "100")}, now=T0)
+        reconcile.reconcile(connection, {"SPY": Position("SPY", "6", "100.5")}, now=T0)
+        with store.transaction(connection):
+            connection.execute("DROP INDEX idx_recon_symbols_run")
+            connection.execute("DROP TABLE accounting_reconciliation_symbols")
+            connection.execute("DROP TABLE accounting_reconciliation_runs")
+            for statement in _SCHEMA_1_RECON_TABLES:
+                connection.execute(statement)
+            connection.execute(
+                "CREATE INDEX idx_recon_symbols_run ON accounting_reconciliation_symbols (run_id)"
+            )
+            connection.execute(
+                "INSERT INTO accounting_reconciliation_runs "
+                "(id, run_at, status, symbols_checked, quantity_mismatches, "
+                " cost_deviations, message, created_at) "
+                "VALUES (1, ?, 'CLEAN', 1, 0, 0, NULL, ?), "
+                "       (2, ?, 'DEGRADED', 1, 0, 1, 'one symbol', ?)",
+                (T0.isoformat(), T0.isoformat(), T0.isoformat(), T0.isoformat()),
+            )
+            connection.execute(
+                "INSERT INTO accounting_reconciliation_symbols "
+                "(id, run_id, symbol, local_quantity, broker_quantity, quantity_matches, "
+                " local_average_cost, broker_average_entry, average_cost_delta, status, "
+                " created_at) "
+                "VALUES (1, 1, 'SPY', '6', '6', 1, '100', '100', '0', 'CLEAN', ?), "
+                "       (2, 2, 'SPY', '6', '6', 1, '100', '100.5', '-0.5', 'DEGRADED', ?)",
+                (T0.isoformat(), T0.isoformat()),
+            )
+            connection.execute("UPDATE accounting_metadata SET accounting_schema_version = 1")
+
+
+def test_a_schema_1_ledger_is_migrated_rather_than_refused(tmp_path: Path) -> None:
+    path = tmp_path / "v1.db"
+    _schema_1_ledger(path)
+
+    with store.connect(path) as connection:
+        assert store.initialize(connection) == 2
+        row = connection.execute(
+            "SELECT accounting_schema_version FROM accounting_metadata WHERE id = 1"
+        ).fetchone()
+        assert int(row["accounting_schema_version"]) == 2
+
+
+def test_the_migration_carries_every_historical_verdict_across(tmp_path: Path) -> None:
+    """Including the DEGRADED rows that led to the migration being written."""
+    path = tmp_path / "v1.db"
+    _schema_1_ledger(path)
+
+    with store.connect(path) as connection:
+        store.initialize(connection)
+        runs = list(
+            connection.execute(
+                "SELECT id, status, cost_deviations, basis_divergences, message "
+                "FROM accounting_reconciliation_runs ORDER BY id"
+            )
+        )
+        symbols = list(
+            connection.execute(
+                "SELECT id, run_id, symbol, status, broker_implied_basis "
+                "FROM accounting_reconciliation_symbols ORDER BY id"
+            )
+        )
+
+    assert [(int(r["id"]), str(r["status"])) for r in runs] == [(1, "CLEAN"), (2, "DEGRADED")]
+    assert [int(r["basis_divergences"]) for r in runs] == [0, 0]
+    assert str(runs[1]["message"]) == "one symbol"
+    assert [(int(r["id"]), int(r["run_id"]), str(r["status"])) for r in symbols] == [
+        (1, 1, "CLEAN"),
+        (2, 2, "DEGRADED"),
+    ]
+    # Never computed for those rows, so recorded as never computed.
+    assert all(r["broker_implied_basis"] is None for r in symbols)
+
+
+def test_the_migration_does_not_touch_fills_realized_events_or_cost_basis(
+    tmp_path: Path,
+) -> None:
+    """The immutable half of the ledger is not named by any migration statement."""
+    path = tmp_path / "v1.db"
+    _schema_1_ledger(path)
+
+    def snapshot(connection: sqlite3.Connection) -> tuple[list, list, list]:
+        return (
+            [tuple(r) for r in connection.execute("SELECT * FROM accounting_fills ORDER BY 1")],
+            [tuple(r) for r in connection.execute("SELECT * FROM realized_pnl_events ORDER BY 1")],
+            [tuple(r) for r in connection.execute("SELECT * FROM position_cost_basis ORDER BY 1")],
+        )
+
+    with store.connect(path) as connection:
+        before = snapshot(connection)
+    with store.connect(path) as connection:
+        store.initialize(connection)
+        after = snapshot(connection)
+
+    assert after == before
+    for statement in store._MIGRATE_1_TO_2:
+        for table in ("accounting_fills", "realized_pnl_events", "position_cost_basis"):
+            assert table not in statement
+
+
+def test_a_migrated_ledger_can_record_the_new_verdict(tmp_path: Path) -> None:
+    path = tmp_path / "v1.db"
+    _schema_1_ledger(path)
+
+    with store.connect(path) as connection:
+        store.initialize(connection)
+        store.record_fill(
+            connection,
+            fill("e3", SIDE_BUY, "10", "130", at=T0 + timedelta(hours=2)),
+            now=T0,
+        )
+        # 6 @ 100 plus 10 @ 130: the sale of 4 could have relieved either lot.
+        result = reconcile.reconcile(connection, {"SPY": Position("SPY", "16", "120")}, now=T0)
+
+    assert result.status in {store.RECON_BASIS_DIVERGENCE, store.RECON_DEGRADED}
+    assert result.quantity_mismatches == 0
+
+
+def test_a_reader_on_the_new_build_survives_a_ledger_not_yet_migrated(tmp_path: Path) -> None:
+    """The API process and the sync unit ship as one tree and start seconds apart.
+
+    In between, a read-only viewer running the new code opens a file the writer
+    has not migrated. A column that is not there yet must read as absent, not as
+    a stack trace on the page.
+    """
+    from autotrader.dashboard import realized_pnl as dashboard_realized
+
+    path = tmp_path / "v1.db"
+    _schema_1_ledger(path)
+
+    with store.connect_read_only(path) as connection:
+        panel = readmodel.build_status(connection)
+    rows = dashboard_realized.build_reconciliation(path=path)
+
+    assert panel.basis_divergences == 0
+    assert panel.status == store.RECON_DEGRADED
+    assert [row.symbol for row in rows] == ["SPY"]
+    assert rows[0].broker_implied_basis is None
+    assert rows[0].relief_basis_low is None
+
+
+def test_the_migration_is_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "v1.db"
+    _schema_1_ledger(path)
+
+    with store.connect(path) as connection:
+        assert store.initialize(connection) == 2
+        assert store.initialize(connection) == 2
+    with store.connect(path) as connection:
+        assert store.initialize(connection) == 2
+        leftovers = {
+            str(row["name"])
+            for row in connection.execute(
+                r"SELECT name FROM sqlite_master WHERE name LIKE '\_recon%' ESCAPE '\'"
+            )
+        }
+    assert leftovers == set()
 
 
 # --------------------------------------------------------------------------

@@ -87,6 +87,13 @@ class ReconciliationRow:
     broker_average_entry: str | None
     average_cost_delta: str | None
     status: str
+    #: Present only on a row whose deviation had to be judged. The broker's
+    #: implied cost basis, and the range this ledger's own purchase lots can be
+    #: relieved down to - so a reader can see *why* a divergence was called
+    #: explained rather than being asked to take the word for it.
+    broker_implied_basis: str | None = None
+    relief_basis_low: str | None = None
+    relief_basis_high: str | None = None
 
 
 def _unreadable_panel(moment: datetime) -> RealizedPnlPanel:
@@ -153,6 +160,15 @@ def build_status(*, path: Path | None = None) -> readmodel.AccountingStatusPanel
         return None
 
 
+def _optional(row: sqlite3.Row, name: str) -> str | None:
+    """A column this build knows about, or `None` when the file predates it."""
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return None
+    return None if value is None else str(value)
+
+
 def build_reconciliation(*, path: Path | None = None) -> list[ReconciliationRow]:
     """The most recent per-symbol comparison, ledger against broker."""
     try:
@@ -170,6 +186,9 @@ def build_reconciliation(*, path: Path | None = None) -> list[ReconciliationRow]
             broker_average_entry=row["broker_average_entry"],
             average_cost_delta=row["average_cost_delta"],
             status=str(row["status"]),
+            broker_implied_basis=_optional(row, "broker_implied_basis"),
+            relief_basis_low=_optional(row, "relief_basis_low"),
+            relief_basis_high=_optional(row, "relief_basis_high"),
         )
         for row in rows
     ]

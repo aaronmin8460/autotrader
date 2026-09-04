@@ -81,7 +81,11 @@ from autotrader.accounting.models import (
 
 #: The accounting store's own schema version, independent of the operational
 #: store's. It starts at 1 and has nothing to do with `state.SCHEMA_VERSION`.
-ACCOUNTING_SCHEMA_VERSION = 1
+#:
+#: 2 - reconciliation can report `BASIS_DIVERGENCE`, and records the lot-relief
+#:     envelope it decided that on. Reconciliation rows only; no fill, realized
+#:     event or cost basis is touched by the migration.
+ACCOUNTING_SCHEMA_VERSION = 2
 
 BUSY_TIMEOUT_MS = 5000
 
@@ -92,10 +96,23 @@ FILL_SOURCES: tuple[str, ...] = (SOURCE_BROKER_ACTIVITY, SOURCE_BOOTSTRAP_REPLAY
 
 #: Reconciliation verdicts, worst-first when several apply.
 RECON_CLEAN = "CLEAN"
+
+#: The ledger and the broker hold the same shares at the same prices, and
+#: differ only in which of those shares they consider sold. Not `CLEAN` - a
+#: real, quantified difference in when P&L is recognised is on the screen - and
+#: not `DEGRADED`, which means the difference has *not* been accounted for.
+RECON_BASIS_DIVERGENCE = "BASIS_DIVERGENCE"
+
 RECON_DEGRADED = "DEGRADED"
 RECON_MISMATCH = "MISMATCH"
 RECON_UNKNOWN = "UNKNOWN"
-RECON_STATUSES: tuple[str, ...] = (RECON_CLEAN, RECON_DEGRADED, RECON_MISMATCH, RECON_UNKNOWN)
+RECON_STATUSES: tuple[str, ...] = (
+    RECON_CLEAN,
+    RECON_BASIS_DIVERGENCE,
+    RECON_DEGRADED,
+    RECON_MISMATCH,
+    RECON_UNKNOWN,
+)
 
 
 class AccountingStoreError(AccountingError):
@@ -279,11 +296,13 @@ _CREATE_RECON_RUNS = """
         id                  INTEGER PRIMARY KEY,
         run_at              TEXT NOT NULL,
         status              TEXT NOT NULL CHECK (
-            status IN ('CLEAN', 'DEGRADED', 'MISMATCH', 'UNKNOWN')
+            status IN ('CLEAN', 'BASIS_DIVERGENCE', 'DEGRADED', 'MISMATCH', 'UNKNOWN')
         ),
         symbols_checked     INTEGER NOT NULL CHECK (symbols_checked >= 0),
         quantity_mismatches INTEGER NOT NULL CHECK (quantity_mismatches >= 0),
         cost_deviations     INTEGER NOT NULL CHECK (cost_deviations >= 0),
+        basis_divergences   INTEGER NOT NULL DEFAULT 0
+                            CHECK (basis_divergences >= 0),
         message             TEXT,
         created_at          TEXT NOT NULL
     )
@@ -302,8 +321,11 @@ _CREATE_RECON_SYMBOLS = """
         broker_average_entry  TEXT,
         average_cost_delta    TEXT,
         status                TEXT NOT NULL CHECK (
-            status IN ('CLEAN', 'DEGRADED', 'MISMATCH', 'UNKNOWN')
+            status IN ('CLEAN', 'BASIS_DIVERGENCE', 'DEGRADED', 'MISMATCH', 'UNKNOWN')
         ),
+        broker_implied_basis  TEXT,
+        relief_basis_low      TEXT,
+        relief_basis_high     TEXT,
         created_at            TEXT NOT NULL,
         UNIQUE (run_id, symbol)
     )
@@ -449,17 +471,75 @@ def initialize(connection: sqlite3.Connection) -> int:
             f"The accounting store is at schema {version}; this build understands "
             f"{ACCOUNTING_SCHEMA_VERSION}. Refusing to open it."
         )
-    if version < ACCOUNTING_SCHEMA_VERSION:  # pragma: no cover - no older version exists
-        raise UnsupportedAccountingSchemaError(
-            f"The accounting store is at schema {version} and no migration to "
-            f"{ACCOUNTING_SCHEMA_VERSION} is defined."
-        )
+    if version < ACCOUNTING_SCHEMA_VERSION:
+        version = _migrate(connection, version)
     missing = set(_TABLE_NAMES) - existing
     if missing:
         raise UnsupportedAccountingSchemaError(
             f"The accounting store is missing tables: {sorted(missing)}."
         )
     return version
+
+
+_MIGRATE_1_TO_2: tuple[str, ...] = (
+    "ALTER TABLE accounting_reconciliation_runs RENAME TO _recon_runs_v1",
+    "ALTER TABLE accounting_reconciliation_symbols RENAME TO _recon_symbols_v1",
+    "DROP INDEX IF EXISTS idx_recon_symbols_run",
+    _CREATE_RECON_RUNS,
+    _CREATE_RECON_SYMBOLS,
+    """
+    INSERT INTO accounting_reconciliation_runs (
+        id, run_at, status, symbols_checked, quantity_mismatches,
+        cost_deviations, basis_divergences, message, created_at
+    )
+    SELECT id, run_at, status, symbols_checked, quantity_mismatches,
+           cost_deviations, 0, message, created_at
+    FROM _recon_runs_v1 ORDER BY id
+    """,
+    """
+    INSERT INTO accounting_reconciliation_symbols (
+        id, run_id, symbol, local_quantity, broker_quantity, quantity_matches,
+        local_average_cost, broker_average_entry, average_cost_delta, status,
+        broker_implied_basis, relief_basis_low, relief_basis_high, created_at
+    )
+    SELECT id, run_id, symbol, local_quantity, broker_quantity, quantity_matches,
+           local_average_cost, broker_average_entry, average_cost_delta, status,
+           NULL, NULL, NULL, created_at
+    FROM _recon_symbols_v1 ORDER BY id
+    """,
+    "DROP TABLE _recon_symbols_v1",
+    "DROP TABLE _recon_runs_v1",
+    "CREATE INDEX idx_recon_symbols_run ON accounting_reconciliation_symbols (run_id)",
+    "UPDATE accounting_metadata SET accounting_schema_version = 2 WHERE id = 1",
+)
+
+
+def _migrate(connection: sqlite3.Connection, version: int) -> int:
+    """Bring an older accounting store up to the current schema, in one transaction.
+
+    **Only reconciliation rows are rewritten.** `accounting_fills`,
+    `realized_pnl_events` and `position_cost_basis` are not named by any
+    statement below, so the immutable accounting history cannot be disturbed by
+    running this - which is the property that makes migrating in place, under a
+    live timer, an acceptable thing to do at all.
+
+    The two reconciliation tables are rebuilt rather than altered because what
+    changed is a `CHECK` constraint on their status column, and SQLite cannot
+    alter one. Every historical row is carried across with its own `id`, so the
+    record of what the ledger reported, and when, survives intact - including
+    the 210 `DEGRADED` verdicts that led to this migration being written. The
+    new columns are `NULL` on those rows, which is the honest value: the
+    envelope they would have been judged against was never computed.
+    """
+    if version != 1:  # pragma: no cover - 1 is the only older version there is
+        raise UnsupportedAccountingSchemaError(
+            f"The accounting store is at schema {version} and no migration to "
+            f"{ACCOUNTING_SCHEMA_VERSION} is defined."
+        )
+    with transaction(connection):
+        for statement in _MIGRATE_1_TO_2:
+            connection.execute(statement)
+    return ACCOUNTING_SCHEMA_VERSION
 
 
 # --------------------------------------------------------------------------
@@ -599,6 +679,34 @@ def read_all_cost_basis(connection: sqlite3.Connection) -> dict[str, CostBasisSt
         )
         for row in connection.execute("SELECT * FROM position_cost_basis ORDER BY symbol")
     }
+
+
+def read_fills_by_symbol(connection: sqlite3.Connection) -> dict[str, tuple[ExecutionFill, ...]]:
+    """Every stored fill, per symbol, in the order it was applied.
+
+    The same total order the synchronizer imposes - `executed_at` then the row's
+    own id - so a caller that folds these gets the ledger's own history back,
+    not a plausible reordering of it.
+    """
+    fills: dict[str, list[ExecutionFill]] = {}
+    for row in connection.execute(
+        "SELECT * FROM accounting_fills ORDER BY executed_at, accounting_event_id"
+    ):
+        fill = ExecutionFill(
+            execution_id=str(row["idempotency_key"]),
+            order_id=str(row["broker_order_id"]),
+            symbol=str(row["symbol"]),
+            asset_class=str(row["asset_class"]),
+            side=str(row["side"]),
+            quantity=text_decimal(row["quantity"]),
+            price=text_decimal(row["execution_price"]),
+            executed_at=datetime.fromisoformat(str(row["executed_at"])),
+            granularity=str(row["execution_granularity"]),
+            provenance=str(row["provenance"]),
+            fees=text_decimal(row["fees"]),
+        )
+        fills.setdefault(fill.symbol, []).append(fill)
+    return {symbol: tuple(rows) for symbol, rows in fills.items()}
 
 
 def _write_cost_basis(
@@ -837,6 +945,7 @@ __all__ = [
     "ACCOUNTING_SCHEMA_VERSION",
     "JOURNAL_MODE",
     "FILL_SOURCES",
+    "RECON_BASIS_DIVERGENCE",
     "RECON_CLEAN",
     "RECON_DEGRADED",
     "RECON_MISMATCH",
@@ -862,6 +971,7 @@ __all__ = [
     "latest_sync_run",
     "mark_symbol_mismatch",
     "read_all_cost_basis",
+    "read_fills_by_symbol",
     "read_cost_basis",
     "read_metadata",
     "record_fill",

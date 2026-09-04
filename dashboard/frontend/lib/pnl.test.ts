@@ -121,3 +121,12 @@ test("only CLEAN is green", () => {
   assert.equal(statusTone("UNKNOWN"), "ATTENTION");
   assert.equal(statusTone(null), "MUTED");
 });
+
+test("an explained basis divergence is neutral - not green, and not an alarm", () => {
+  // The ledger and the broker hold the same shares at the same prices and
+  // relieve sold lots differently. Green would claim they agree on a number
+  // they do not; amber would claim nobody knows why, which is no longer true.
+  assert.equal(statusTone("BASIS_DIVERGENCE"), "NEUTRAL");
+  assert.notEqual(statusTone("BASIS_DIVERGENCE"), statusTone("CLEAN"));
+  assert.notEqual(statusTone("BASIS_DIVERGENCE"), statusTone("DEGRADED"));
+});
