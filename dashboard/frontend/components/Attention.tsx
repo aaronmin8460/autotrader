@@ -1,11 +1,17 @@
+"use client";
+
 /**
  * The one banner on the page, and it only appears when something is wrong.
  *
- * A rail in the state's colour and a list of reasons - not a filled block.
+ * A rail in the state's colour and a list of reasons — not a filled block.
  * `PAUSED` gets a tinted background because trading being blocked is the one
  * condition on this screen that genuinely warrants being loud; `ATTENTION`
  * does not, because a warning that shouts every time is a warning nobody
  * reads twice.
+ *
+ * The reason strings come from the runtime and are rendered verbatim: they
+ * name client order ids, symbols and reconciliation outcomes, and translating
+ * a machine's own account of why it stopped would be inventing one.
  */
 
 import type { Overview } from "@/lib/types";
@@ -20,16 +26,12 @@ export function Attention({ overview }: { overview: Overview }) {
   return (
     <div
       role="status"
-      className={cn(
-        "card",
-        "border-l-2 pr-4 pl-3.5",
-        paused ? "tint-neg border-l-neg" : "border-l-warn",
-      )}
+      className={cn("panel border-s-2 pe-4 ps-3.5", paused ? "tint-neg border-s-neg" : "border-s-warn")}
     >
       <div className="py-3">
         <div
           className={cn(
-            "text-[11px] leading-none font-medium tracking-[0.06em] uppercase",
+            "text-meta leading-none font-medium tracking-[0.06em] uppercase",
             toneText(overview.system_state_tone),
           )}
         >
@@ -37,7 +39,7 @@ export function Attention({ overview }: { overview: Overview }) {
         </div>
         <ul className="mt-2 space-y-1">
           {reasons.map((reason) => (
-            <li key={reason} className="text-[12.5px] leading-snug text-ink-2">
+            <li key={reason} className="text-table leading-snug text-ink-2">
               {reason}
             </li>
           ))}

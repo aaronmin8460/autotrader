@@ -1,89 +1,167 @@
 @import "tailwindcss";
 
-/* --------------------------------------------------------------------------
-   Design tokens.
+/* ==========================================================================
+   AUTOTRADER INSTITUTIONAL GLASS — the design system, in one file.
 
-   Dark is the designed mode: the values below are the dark palette, and the
-   light overrides sit in one media query. Every component uses semantic token
-   utilities (`bg-surface`, `text-ink-2`, `border-line`) and never a raw colour,
-   so light mode is not a second design to maintain - it is the same design
-   with one block of variables swapped.
+   Every colour, size, radius, depth, duration and layer used anywhere in the
+   application is declared here. Components reference tokens through Tailwind
+   utilities (`bg-surface-1`, `text-ink-2`, `border-subtle`) and never a raw
+   value; the only literals a component may carry are the geometry of a bar or
+   a chart, which is data, not design.
 
-   Colour is semantic, and there are exactly five semantics:
+   THE ONE RULE. Trading data readability comes first. Translucency exists at
+   exactly one level - floating chrome - and never behind a number. Content
+   surfaces are opaque.
 
-     green   healthy · positive P&L · safe
-     red     loss · error · a hard cap actually breached
-     amber   warning · degraded · near a limit
-     violet  observation · simulation · a shadow that cannot trade
-     gray    masked · inactive · metadata
+   Colour carries five meanings and nothing else:
 
-   Nothing here is decorative colour, and status is never colour alone.
-   -------------------------------------------------------------------------- */
+     positive   gain · healthy · confirmed
+     negative   loss · a hard cap actually breached · failure
+     warning    near a limit · pending · degraded but working
+     interactive  selected · focused · a link
+     observe    observation-only strategy (violet). Never a trading colour.
+
+   A normal 90% gross book is NOT red. Red is a breach, not a big number.
+   Status is never colour alone: every status prints its word.
+   ========================================================================== */
 
 @theme {
+  /* --- typography ------------------------------------------------------- */
   --font-sans:
-    ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+    "Inter var", Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", "Apple SD Gothic Neo",
+    "Noto Sans KR", "Malgun Gothic", Arial, sans-serif;
   --font-mono:
     ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
     "Liberation Mono", monospace;
 
-  --color-canvas: var(--app-canvas);
-  --color-surface: var(--app-surface);
+  /* Type scale. Named by role, not by size, so a component asks for a role. */
+  --text-display: 2.375rem;      /* 38px - the account's primary figure      */
+  --text-display--line-height: 1;
+  --text-title: 1.5rem;          /* 24px - page title                        */
+  --text-title--line-height: 1.15;
+  --text-value: 1.375rem;        /* 22px - a section's headline value        */
+  --text-value--line-height: 1.1;
+  --text-value-sm: 1.0625rem;    /* 17px - a compact headline value          */
+  --text-value-sm--line-height: 1.15;
+  --text-heading: 0.875rem;      /* 14px - card / section heading            */
+  --text-heading--line-height: 1.25;
+  --text-body: 0.8125rem;        /* 13px - body                              */
+  --text-body--line-height: 1.4;
+  --text-table: 0.78125rem;      /* 12.5px - table cell                      */
+  --text-table--line-height: 1.35;
+  --text-meta: 0.6875rem;        /* 11px - metadata                          */
+  --text-meta--line-height: 1.3;
+  --text-eyebrow: 0.625rem;      /* 10px - uppercase label                   */
+  --text-eyebrow--line-height: 1.2;
+
+  /* --- spacing ---------------------------------------------------------- */
+  --spacing: 0.25rem;            /* Tailwind's base step: 1 = 4px            */
+
+  /* --- radius ----------------------------------------------------------- */
+  --radius-xs: 3px;              /* pills, tags, table chrome               */
+  --radius-sm: 5px;              /* inputs, segmented controls              */
+  --radius-md: 8px;              /* panels                                  */
+  --radius-lg: 12px;             /* floating surfaces, drawers              */
+
+  /* --- depth ------------------------------------------------------------ */
+  --shadow-raise: 0 1px 2px rgb(0 0 0 / 0.28);
+  --shadow-float: 0 8px 24px -8px rgb(0 0 0 / 0.5), 0 2px 6px rgb(0 0 0 / 0.24);
+  --shadow-overlay: 0 24px 64px -16px rgb(0 0 0 / 0.62);
+
+  /* --- motion ----------------------------------------------------------- */
+  --duration-instant: 90ms;
+  --duration-fast: 140ms;
+  --duration-slow: 220ms;
+  --ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* --- z layers --------------------------------------------------------- */
+  --z-content: 0;
+  --z-sticky: 10;      /* sticky table headers                              */
+  --z-sidebar: 30;
+  --z-topbar: 40;
+  --z-overlay: 60;     /* drawer scrim + drawer                             */
+  --z-tooltip: 70;
+
+  /* --- colour (bound to the runtime variables below) --------------------- */
+  --color-bg: var(--app-bg);
+  --color-surface-0: var(--app-surface-0);
+  --color-surface-1: var(--app-surface-1);
   --color-surface-2: var(--app-surface-2);
-  --color-sunken: var(--app-sunken);
-  --color-line: var(--app-line);
-  --color-line-strong: var(--app-line-strong);
+  --color-surface-3: var(--app-surface-3);
+  --color-float: var(--app-float);
+
+  --color-subtle: var(--app-subtle);
+  --color-active: var(--app-active);
+
   --color-ink: var(--app-ink);
   --color-ink-2: var(--app-ink-2);
   --color-ink-3: var(--app-ink-3);
+
   --color-pos: var(--app-pos);
   --color-neg: var(--app-neg);
   --color-warn: var(--app-warn);
   --color-accent: var(--app-accent);
   --color-observe: var(--app-observe);
-
-  --radius-card: 10px;
 }
 
-:root {
+/* --------------------------------------------------------------------------
+   Palettes.
+
+   Dark is the designed mode and the default: `data-theme` is written onto
+   <html> by a pre-paint bootstrap script, so there is no flash and no
+   dependence on the operating system's setting. `light` is a complete second
+   palette, not a filter - every token is redefined, and only the tokens.
+   -------------------------------------------------------------------------- */
+
+:root,
+:root[data-theme="dark"] {
   color-scheme: dark;
 
-  --app-canvas: #08090b;
-  --app-surface: #0e1114;
-  --app-surface-2: #13181c;
-  --app-sunken: #0b0e10;
-  --app-line: #1a2025;
-  --app-line-strong: #28313a;
-  --app-ink: #e9ecee;
-  --app-ink-2: #9ba5ab;
-  --app-ink-3: #66717a;
-  --app-pos: #41b36a;
-  --app-neg: #e35a52;
-  --app-warn: #d7a23f;
-  --app-accent: #5ea6de;
-  --app-observe: #9d8df5;
+  --app-bg: #080b0e;             /* level 0 - the page                       */
+  --app-surface-0: #0c1013;      /* level 0.5 - a grouping band              */
+  --app-surface-1: #11171b;      /* level 1 - where content lives            */
+  --app-surface-2: #171f24;      /* level 1 raised - hover, header, stripe   */
+  --app-surface-3: #1d262c;      /* level 1 selected                         */
+  --app-float: 20 27 32;         /* level 2 - floating, used with /alpha     */
+
+  --app-subtle: #1c242a;
+  --app-active: #33414a;
+
+  --app-ink: #e9eef2;
+  --app-ink-2: #a3b0ba;
+  --app-ink-3: #7c8b96;
+
+  --app-pos: #4cb782;
+  --app-neg: #e8615a;
+  --app-warn: #ddA33f;
+  --app-accent: #62a9e8;
+  --app-observe: #a595f7;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color-scheme: light;
+:root[data-theme="light"] {
+  color-scheme: light;
 
-    --app-canvas: #f3f4f6;
-    --app-surface: #ffffff;
-    --app-surface-2: #f8f9fa;
-    --app-sunken: #f5f6f7;
-    --app-line: #e3e6e9;
-    --app-line-strong: #cfd5da;
-    --app-ink: #14181b;
-    --app-ink-2: #5b6570;
-    --app-ink-3: #8a949c;
-    --app-pos: #1b7f45;
-    --app-neg: #c33a35;
-    --app-warn: #8c6414;
-    --app-accent: #2b6ea3;
-    --app-observe: #5f4fd1;
-  }
+  --app-bg: #eef0f3;
+  --app-surface-0: #f5f6f8;
+  --app-surface-1: #ffffff;
+  --app-surface-2: #f4f6f8;
+  --app-surface-3: #e9edf1;
+  --app-float: 255 255 255;
+
+  --app-subtle: #e0e4e9;
+  --app-active: #b9c2ca;
+
+  --app-ink: #10161a;
+  --app-ink-2: #4c5964;
+  --app-ink-3: #66747f;
+
+  --app-pos: #14794a;
+  --app-neg: #bd3a33;
+  --app-warn: #8a5d0c;
+  --app-accent: #1f6aa8;
+  --app-observe: #5942c8;
 }
 
 html,
@@ -92,46 +170,92 @@ body {
 }
 
 body {
-  background-color: var(--color-canvas);
+  background-color: var(--color-bg);
   color: var(--color-ink);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
-/* Every figure on this page is meant to be compared down a column. */
-.num {
+/* --------------------------------------------------------------------------
+   Numerals.
+
+   Every figure on this application is meant to be compared down a column and
+   to not move when it changes. Applied broadly rather than per call site.
+   -------------------------------------------------------------------------- */
+.num,
+table,
+input,
+time {
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum" 1;
 }
 
 /* A label small enough to disappear until it is looked for. */
 .eyebrow {
-  font-size: 10px;
-  line-height: 1.2;
-  letter-spacing: 0.08em;
+  font-size: var(--text-eyebrow);
+  line-height: var(--text-eyebrow--line-height);
+  letter-spacing: 0.075em;
   text-transform: uppercase;
   font-weight: 500;
 }
 
-/* The card: one hairline, a slightly lifted surface, no inner borders. */
-.card {
-  background-color: var(--color-surface);
-  border: 1px solid color-mix(in srgb, var(--color-line) 85%, transparent);
-  border-radius: var(--radius-card);
-  box-shadow:
-    0 1px 0 color-mix(in srgb, var(--color-canvas) 60%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--color-canvas) 30%, transparent);
+/* --------------------------------------------------------------------------
+   Surfaces.
+
+   LEVEL 1 - `.panel`. Where every number lives. Opaque, one hairline, no
+   inner borders. Grouping inside a panel is done with space, not boxes.
+
+   LEVEL 2 - `.floating`. Chrome only: the sidebar, the top bar, drawers,
+   tooltips. This is the only translucency in the system, and nothing that has
+   to be read precisely is ever placed on it over moving content.
+   -------------------------------------------------------------------------- */
+.panel {
+  background-color: var(--color-surface-1);
+  border: 1px solid var(--color-subtle);
+  border-radius: var(--radius-md);
+}
+
+.panel-flat {
+  background-color: var(--color-surface-1);
+  border-radius: var(--radius-md);
+}
+
+.floating {
+  background-color: rgb(var(--app-float) / 0.82);
+  -webkit-backdrop-filter: saturate(150%) blur(14px);
+  backdrop-filter: saturate(150%) blur(14px);
+  border-color: var(--color-subtle);
+}
+
+/* A browser without backdrop-filter must not get a see-through bar. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .floating {
+    background-color: var(--color-surface-1);
+  }
+}
+
+.overlay-surface {
+  background-color: rgb(var(--app-float) / 0.94);
+  -webkit-backdrop-filter: saturate(150%) blur(20px);
+  backdrop-filter: saturate(150%) blur(20px);
+  box-shadow: var(--shadow-overlay);
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .overlay-surface {
+    background-color: var(--color-surface-1);
+  }
 }
 
 /* A definition term that carries a tooltip. Dotted, never underlined. */
 .hint {
-  text-decoration: underline dotted color-mix(in srgb, var(--color-ink-3) 70%, transparent);
+  text-decoration: underline dotted color-mix(in srgb, var(--color-ink-3) 65%, transparent);
   text-underline-offset: 3px;
   cursor: help;
 }
 
-/* Tables scroll inside their own card rather than moving the page. */
+/* Tables scroll inside their own panel rather than moving the page. */
 .scroll-x {
   overflow-x: auto;
   overscroll-behavior-x: contain;
@@ -142,7 +266,7 @@ body {
 }
 
 .scroll-x::-webkit-scrollbar-thumb {
-  background-color: var(--color-line-strong);
+  background-color: var(--color-active);
   border-radius: 4px;
 }
 
@@ -150,19 +274,69 @@ body {
   background-color: transparent;
 }
 
-/* Clickable rows: a focus ring that survives dark mode. */
+/* A sticky table header that stays legible over scrolling rows. */
+.sticky-head th {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  background-color: var(--color-surface-1);
+}
+
+/* Clickable rows: a focus ring that survives both palettes. */
 .row-link {
   cursor: pointer;
 }
 
-.row-link:focus-visible {
+.row-link:focus-visible,
+.focus-ring:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: -2px;
 }
 
-/* Drawer transitions, removed entirely under reduced motion. */
-.drawer-panel {
-  transition: transform 160ms ease-out;
+/* --------------------------------------------------------------------------
+   Motion. Only where it communicates state, and never on a number.
+   -------------------------------------------------------------------------- */
+.motion-drawer {
+  animation: drawer-in var(--duration-slow) var(--ease-out);
+}
+
+.motion-fade {
+  animation: fade-in var(--duration-fast) var(--ease-out);
+}
+
+@keyframes drawer-in {
+  from {
+    transform: translateX(16px);
+    opacity: 0;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* Calm loading: a slow sweep, never a spinner, never on real data. */
+.skeleton {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-surface-2) 0%,
+    var(--color-surface-3) 40%,
+    var(--color-surface-2) 80%
+  );
+  background-size: 220% 100%;
+  animation: skeleton-sweep 1.6s var(--ease-in-out) infinite;
+  border-radius: var(--radius-xs);
+}
+
+@keyframes skeleton-sweep {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -80% 0;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -170,30 +344,39 @@ body {
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .skeleton {
+    background-image: none;
+    background-color: var(--color-surface-2);
   }
 }
 
 /* --------------------------------------------------------------------------
-   Tints.
-
-   The only place a semantic colour is used as a background rather than as
-   text. Mixed against the surface so the card still reads as a card, not as a
-   coloured banner.
+   Tints. The only place a semantic colour becomes a background rather than
+   text, mixed into the surface so a panel still reads as a panel.
    -------------------------------------------------------------------------- */
-
 .tint-neg {
-  background-color: color-mix(in srgb, var(--color-neg) 8%, var(--color-surface));
+  background-color: color-mix(in srgb, var(--color-neg) 9%, var(--color-surface-1));
 }
 
 .tint-warn {
-  background-color: color-mix(in srgb, var(--color-warn) 8%, var(--color-surface));
+  background-color: color-mix(in srgb, var(--color-warn) 9%, var(--color-surface-1));
 }
 
 .tint-observe {
-  background-color: color-mix(in srgb, var(--color-observe) 7%, var(--color-surface));
+  background-color: color-mix(in srgb, var(--color-observe) 7%, var(--color-surface-1));
 }
 
 .tint-pos {
-  background-color: color-mix(in srgb, var(--color-pos) 7%, var(--color-surface));
+  background-color: color-mix(in srgb, var(--color-pos) 7%, var(--color-surface-1));
+}
+
+/* Korean sets slightly tighter than the Latin stack at the same size; without
+   this a translated table header gains a pixel of leading and moves the row. */
+:root[lang="ko"] .eyebrow {
+  letter-spacing: 0.04em;
 }

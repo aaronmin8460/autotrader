@@ -1,3 +1,5 @@
+"use client";
+
 /**
  * A price sparkline: one line, one baseline, one colour for direction.
  *
@@ -10,6 +12,7 @@
 
 import type { ChartSeries } from "@/lib/charts";
 import { chartUnavailableLabel } from "@/lib/charts";
+import { useI18n } from "@/lib/i18n";
 import { sparkPath } from "@/lib/spark";
 
 import { cn } from "../ui";
@@ -28,9 +31,10 @@ export function Sparkline({
   height?: number;
   className?: string;
 }) {
+  const { t } = useI18n();
   if (!series) {
     return (
-      <span className={cn("inline-block text-[10px] text-ink-3", className)} aria-label="Chart loading">
+      <span className={cn("inline-block text-eyebrow text-ink-3", className)} aria-label={t("chart.loading")}>
         …
       </span>
     );
@@ -38,7 +42,7 @@ export function Sparkline({
   if (!series.available || series.points.length < 2) {
     return (
       <span
-        className={cn("inline-block text-[10px] text-ink-3", className)}
+        className={cn("inline-block text-eyebrow text-ink-3", className)}
         title={chartUnavailableLabel(series.unavailable_reason)}
       >
         N/A

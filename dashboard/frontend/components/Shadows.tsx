@@ -18,32 +18,33 @@ import { useState, type KeyboardEvent } from "react";
 
 import type { A1BOverview, A1BSymbolRow } from "@/lib/a1b";
 import { CHART_RANGES, useChartBatch, type ChartRange } from "@/lib/charts";
-import { percent, relative, signedPercent, stampUtc } from "@/lib/format";
-import type { ServiceUnitRow } from "@/lib/services";
-import { displayStatus } from "@/lib/services";
+import { percent, signedPercent } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
+import { useFormat } from "@/lib/i18n/useFormat";
+import type { ServiceUnitRow, ServiceUnitsPanel } from "@/lib/services";
+import { A1B_SHADOW_KEY, displayStatus, serviceUnit } from "@/lib/services";
 import { STATUS_REASON_LABELS, shadowStatusLabel, shadowTone, type ShadowOverview, type ShadowStatus } from "@/lib/shadow";
 import type { ShadowComparison } from "@/lib/shadows";
 
 import { LineChart } from "./charts/LineChart";
-import { Card, Empty, Field, Pill, RangeSelector, Status, Tag, Td, Th, cn } from "./ui";
+import { Card, Empty, Field, Pill, SegmentedTimeRange, Status, Tag, Td, Th, cn } from "./ui";
 
 export function ShadowsBanner() {
+  const { t } = useI18n();
   return (
-    <section aria-label="Shadows scope" className="card tint-observe px-5 py-4">
+    <section aria-label={t("shadows.observationOnly")} className="panel tint-observe px-5 py-4">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <span className="text-[13px] leading-none font-semibold tracking-tight text-ink">Shadows — observation only</span>
-        <Tag tone="SHADOW" title="No process on this page can submit, cancel or replace an order.">
-          Zero order mutation
+        <span className="text-heading leading-none font-semibold tracking-tight text-ink">
+          {t("shadows.observationOnly")}
+        </span>
+        <Tag tone="SHADOW" title={t("shadows.zeroOrderMutationHint")}>
+          {t("shadows.zeroOrderMutation")}
         </Tag>
-        <Tag tone="SHADOW" title="Every figure here is compounded from recorded decisions, from a normalized 100, with no costs.">
-          Simulated · no broker order
+        <Tag tone="SHADOW" title={t("shadows.simulatedHint")}>
+          {t("shadows.simulated")}
         </Tag>
       </div>
-      <p className="mt-2 max-w-[100ch] text-[12px] leading-snug text-ink-2">
-        These are decisions <strong className="font-semibold text-ink">recorded, not taken</strong>. The
-        observers behind this page hold no execution path; no order has been placed, no position exists,
-        and no figure here is broker account equity. The account&apos;s real orders are on Operations.
-      </p>
+      <p className="mt-2 max-w-[104ch] text-table leading-snug text-ink-2">{t("shadows.banner")}</p>
     </section>
   );
 }
@@ -63,7 +64,8 @@ export interface ShadowCardModel {
   simulatedExposure: number | null;
   turnover: string;
   observationCount: number;
-  parity: string;
+  /** Cumulative mismatches, or null when the concept does not apply. */
+  parityCount: number | null;
   parityTone: "POSITIVE" | "ATTENTION" | "MUTED";
   zeroOrder: { intents: number; linked: number; extra: number | null; holds: boolean };
   codeSha: string | null;
@@ -71,6 +73,8 @@ export interface ShadowCardModel {
 }
 
 export function ShadowCard({ model, generatedAt }: { model: ShadowCardModel; generatedAt: string | null }) {
+  const { t } = useI18n();
+  const format = useFormat();
   const unit = model.unit ? displayStatus(model.unit) : null;
   return (
     <Card
@@ -78,7 +82,7 @@ export function ShadowCard({ model, generatedAt }: { model: ShadowCardModel; gen
       title={model.name}
       meta={
         <>
-          {unit ? <Status tone={unit.tone} title={model.unit?.detail}>{unit.status}</Status> : <Status tone="MUTED">Unit unknown</Status>}
+          {unit ? <Status tone={unit.tone} title={model.unit?.detail}>{unit.status}</Status> : <Status tone="MUTED">{t("shadows.unitUnknown")}</Status>}
           <Pill tone={shadowTone(model.status)} emphasis title={STATUS_REASON_LABELS[model.statusReason] ?? model.statusReason}>
             {shadowStatusLabel(model.status)}
           </Pill>
@@ -86,56 +90,69 @@ export function ShadowCard({ model, generatedAt }: { model: ShadowCardModel; gen
       }
     >
       <div className="flex flex-wrap items-center gap-2">
-        <Tag tone="SHADOW">Observation only</Tag>
-        <Tag tone="SHADOW">Zero orders</Tag>
+        <Tag tone="SHADOW">{t("strategies.observationOnly")}</Tag>
+        <Tag tone="SHADOW">{t("strategies.capability.zeroOrders")}</Tag>
         <Tag title={model.mode}>{model.mode}</Tag>
       </div>
       <div className="mt-4 grid grid-cols-2 gap-x-5 gap-y-3.5 sm:grid-cols-4">
-        <Field label="Universe" title={model.universeNote}>
-          <span className="num">{model.universeSize} symbols</span>
+        <Field label={t("strategies.universe")} title={model.universeNote}>
+          <span className="num">{t("strategies.symbols", { count: model.universeSize })}</span>
         </Field>
-        <Field label="Last completed cycle">
+        <Field label={t("strategies.lastCycle")}>
           <span className="num">
-            {model.lastCycleAt ? stampUtc(model.lastCycleAt, generatedAt) : "—"}
-            {model.lastCycleAt ? <span className="ml-1.5 text-[11px] text-ink-3">{relative(model.lastCycleAt, generatedAt)}</span> : null}
+            {model.lastCycleAt ? format.stamp(model.lastCycleAt, generatedAt) : "—"}
+            {model.lastCycleAt ? (
+              <span className="ms-1.5 text-meta text-ink-3">{format.relative(model.lastCycleAt, generatedAt)}</span>
+            ) : null}
           </span>
         </Field>
-        <Field label="Latest regime">{model.regime ?? "—"}</Field>
-        <Field label="Simulated exposure" title="Fraction of the hypothetical book held long at the latest bar. Not account exposure.">
+        <Field label={t("shadows.latestRegime")}>{model.regime ?? "—"}</Field>
+        <Field label={t("shadows.simulatedExposure")} title={t("shadows.simulatedExposureHint")}>
           <span className="num">{percent(model.simulatedExposure, 1)}</span>
         </Field>
-        <Field label="Simulated turnover">
+        <Field label={t("shadows.simulatedTurnover")}>
           <span className="num">{model.turnover}</span>
         </Field>
-        <Field label="Observations">
+        <Field label={t("shadows.observations")}>
           <span className="num">
-            {model.observationCount} · {model.cyclesRecorded} bars
+            {model.observationCount} · {model.cyclesRecorded} {t("shadows.bars")}
           </span>
         </Field>
         <Field
-          label="Parity / mismatch"
+          label={t("shadows.parity")}
           title={
             model.key === "a1b"
               ? "A1-B has no execution counterpart to disagree with, so no parity figure exists."
               : "Cumulative bars on which the paper runtime's independently computed EDA-1 answer disagreed with this observer's; such a symbol is excluded from mutation for that bar."
           }
         >
-          <Status tone={model.parityTone}>{model.parity}</Status>
+          <Status tone={model.parityTone}>
+            {model.parityCount === null
+              ? t("shadows.parityNA")
+              : model.parityCount === 0
+                ? t("shadows.parityClean")
+                : t(model.parityCount === 1 ? "shadows.parityMismatch" : "shadows.parityMismatches", {
+                    count: model.parityCount,
+                  })}
+          </Status>
         </Field>
-        <Field label="Code · policy">
-          <span className="num text-[11.5px]">
+        <Field label={t("shadows.codePolicy")}>
+          <span className="num text-meta">
             {model.codeSha ? model.codeSha.slice(0, 10) : "—"}
             {model.policy ? ` · ${model.policy.slice(0, 12)}` : ""}
           </span>
         </Field>
       </div>
-      <div className={cn("mt-4 rounded-[6px] px-3 py-2.5 ring-1", model.zeroOrder.holds ? "ring-observe/30" : "ring-neg/50 tint-neg")}>
+      <div className={cn("mt-4 rounded-sm px-3 py-2.5 ring-1", model.zeroOrder.holds ? "ring-observe/30" : "ring-neg/50 tint-neg")}>
         <Status tone={model.zeroOrder.holds ? "SHADOW" : "NEGATIVE"}>
-          {model.zeroOrder.holds ? "Zero-order proof holds" : "Zero-order invariant violated"}
+          {model.zeroOrder.holds ? t("shadows.zeroOrderProof") : t("shadows.zeroOrderViolated")}
         </Status>
-        <span className="num ml-3 text-[11px] text-ink-3">
-          intents {model.zeroOrder.intents} · linked {model.zeroOrder.linked}
-          {model.zeroOrder.extra !== null ? ` · non-simulated rows ${model.zeroOrder.extra}` : ""}
+        <span className="num ml-3 text-meta text-ink-3">
+          {t("shadows.intents")} {model.zeroOrder.intents} · {t("shadows.linked")}{" "}
+          {model.zeroOrder.linked}
+          {model.zeroOrder.extra !== null
+            ? ` · ${t("shadows.nonSimulatedRows")} ${model.zeroOrder.extra}`
+            : ""}
         </span>
       </div>
     </Card>
@@ -143,17 +160,18 @@ export function ShadowCard({ model, generatedAt }: { model: ShadowCardModel; gen
 }
 
 export function ShadowComparisonTable({ comparison }: { comparison: ShadowComparison }) {
+  const { t } = useI18n();
   return (
     <Card
       tone="SHADOW"
-      title="EDA-1 Shadow vs A1-B U30"
+      title={t("shadows.comparison")}
       meta={
         comparison.insufficient ? (
           <Pill tone="ATTENTION" emphasis title={comparison.warning}>
-            Insufficient sample
+            {t("shadows.insufficientSample")}
           </Pill>
         ) : (
-          <Tag tone="SHADOW">Sample thresholds met</Tag>
+          <Tag tone="SHADOW">{t("shadows.thresholdsMet")}</Tag>
         )
       }
       bodyClassName=""
@@ -161,22 +179,24 @@ export function ShadowComparisonTable({ comparison }: { comparison: ShadowCompar
       <div className="scroll-x">
         <table className="w-full min-w-[720px] border-collapse">
           <thead>
-            <tr className="border-b border-line">
-              <Th>Metric</Th>
+            <tr className="border-b border-subtle">
+              <Th>{t("shadows.title")}</Th>
               <Th>EDA-1 Shadow</Th>
               <Th>A1-B U30 Shadow</Th>
             </tr>
           </thead>
           <tbody>
             {comparison.rows.map((row) => (
-              <tr key={row.key} className="border-b border-line/70 last:border-0">
+              <tr key={row.key} className="border-b border-subtle/70 last:border-0">
                 <Td className="hint text-ink-2" title={row.hint}>
                   {row.label}
                 </Td>
                 {[row.eda1, row.a1b].map((cell, index) => (
                   <Td key={index} className={cn("num", cell.conclusive ? "text-ink" : "text-warn")}>
                     {cell.text}
-                    {cell.raw ? <span className="ml-2 text-[10.5px] text-ink-3">raw {cell.raw} · not a conclusion</span> : null}
+                    {cell.raw ? (
+                      <span className="ms-2 text-eyebrow text-ink-3">{t("shadows.raw", { value: cell.raw })}</span>
+                    ) : null}
                   </Td>
                 ))}
               </tr>
@@ -184,45 +204,48 @@ export function ShadowComparisonTable({ comparison }: { comparison: ShadowCompar
           </tbody>
         </table>
       </div>
-      <p className="px-4 pt-3 pb-3 text-[11.5px] leading-snug text-ink-3">{comparison.warning}</p>
+      <p className="px-4 pt-3 pb-3 text-meta leading-snug text-ink-3">{comparison.warning}</p>
     </Card>
   );
 }
 
 function A1BSymbolChart({ symbol, onClose }: { symbol: string; onClose: () => void }) {
+  const { t } = useI18n();
   const [range, setRange] = useState<ChartRange>("1D");
   const { series } = useChartBatch([symbol], range);
   return (
-    <div className="border-t border-line px-4 py-3">
+    <div className="border-t border-subtle px-4 py-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-[12.5px] font-semibold text-ink">
+        <span className="text-table font-semibold text-ink">
           {symbol} <span className="text-ink-3">price · observation universe</span>
         </span>
         <div className="flex items-center gap-2">
-          <RangeSelector options={CHART_RANGES} value={range} onChange={setRange} label={`${symbol} chart range`} />
+          <SegmentedTimeRange options={CHART_RANGES} value={range} onChange={setRange} label={t("chart.range")} />
           <button
             type="button"
             onClick={onClose}
-            className="rounded-[4px] px-2 py-1 text-[10px] font-medium tracking-[0.06em] text-ink-3 uppercase ring-1 ring-line hover:text-ink focus-visible:outline-2 focus-visible:outline-accent"
+            className="rounded-xs px-2 py-1 text-eyebrow font-medium tracking-[0.06em] text-ink-3 uppercase ring-1 ring-subtle hover:text-ink focus-visible:outline-2 focus-visible:outline-accent"
           >
-            Close
+            {t("common.close")}
           </button>
         </div>
       </div>
       <div className="mt-2 max-w-[880px]">
         <LineChart series={series[symbol]} />
       </div>
-      <p className="mt-1 text-[11px] text-ink-3">Price only. No simulated action is drawn on this chart.</p>
+      <p className="mt-1 text-meta text-ink-3">{t("chart.priceOnly")}</p>
     </div>
   );
 }
 
 export function A1BUniverse({ overview, generatedAt }: { overview: A1BOverview | null; generatedAt: string | null }) {
+  const { t } = useI18n();
+  const format = useFormat();
   const [selected, setSelected] = useState<string | null>(null);
   if (!overview) {
     return (
       <Card tone="SHADOW" title="A1-B U30 universe">
-        <Empty headline="The A1-B shadow API is not answering." />
+        <Empty headline={t("shadows.apiDown")} />
       </Card>
     );
   }
@@ -251,7 +274,7 @@ export function A1BUniverse({ overview, generatedAt }: { overview: A1BOverview |
       <div className="scroll-x">
         <table className="w-full min-w-[820px] border-collapse">
           <thead>
-            <tr className="border-b border-line">
+            <tr className="border-b border-subtle">
               <Th>Symbol</Th>
               <Th title="The stance accumulator: 1 after a BUY, 0 after a SELL, starting flat at deployment.">Stance</Th>
               <Th>V3 signal</Th>
@@ -270,11 +293,11 @@ export function A1BUniverse({ overview, generatedAt }: { overview: A1BOverview |
                 key={row.symbol}
                 role="button"
                 tabIndex={0}
-                aria-label={`Show ${row.symbol} chart`}
+                aria-label={t("drawer.showChart", { symbol: row.symbol })}
                 aria-pressed={selected === row.symbol}
                 onClick={() => setSelected(selected === row.symbol ? null : row.symbol)}
                 onKeyDown={open(row.symbol)}
-                className={cn("row-link border-b border-line/70 last:border-0 hover:bg-surface-2", selected === row.symbol && "bg-surface-2")}
+                className={cn("row-link border-b border-subtle/70 last:border-0 hover:bg-surface-2", selected === row.symbol && "bg-surface-2")}
               >
                 <Td className="font-medium text-ink">{row.symbol}</Td>
                 <Td>
@@ -293,7 +316,7 @@ export function A1BUniverse({ overview, generatedAt }: { overview: A1BOverview |
                 <Td className="text-ink-2">{row.archetype_label === null ? "—" : `A${row.archetype_label}`}</Td>
                 <Td className="text-ink-3">{row.alias_scored === null ? "—" : row.alias_scored ? "reference alias" : "own name"}</Td>
                 <Td numeric className="text-ink-3">
-                  {row.bar_timestamp ? stampUtc(row.bar_timestamp, generatedAt) : "—"}
+                  {row.bar_timestamp ? format.stamp(row.bar_timestamp, generatedAt) : "—"}
                 </Td>
                 <Td numeric className="text-ink-2">
                   {row.reference_close?.toFixed(2) ?? "—"}
@@ -304,13 +327,14 @@ export function A1BUniverse({ overview, generatedAt }: { overview: A1BOverview |
         </table>
       </div>
       {selected ? <A1BSymbolChart symbol={selected} onClose={() => setSelected(null)} /> : (
-        <p className="px-4 pt-2 pb-3 text-[11px] text-ink-3">Select a symbol for its price chart. Charts load one symbol at a time.</p>
+        <p className="px-4 pt-2 pb-3 text-meta text-ink-3">{t("chart.selectSymbol")}</p>
       )}
     </Card>
   );
 }
 
 export function A1BDetail({ overview, generatedAt }: { overview: A1BOverview | null; generatedAt: string | null }) {
+  const format = useFormat();
   if (!overview) return null;
   const { service, regime, hypothetical, summary } = overview;
   return (
@@ -333,7 +357,7 @@ export function A1BDetail({ overview, generatedAt }: { overview: A1BOverview | n
           <Field label="Labelled symbols">
             <span className="num">{service.labeled_symbols ?? "—"}</span>
           </Field>
-          <Field label="Observer started">{service.started_at ? stampUtc(service.started_at, generatedAt) : "—"}</Field>
+          <Field label="Observer started">{service.started_at ? format.stamp(service.started_at, generatedAt) : "—"}</Field>
           <Field label="Session (broker calendar)">{service.session_confirmed_open ? "Open — confirmed" : "No session confirmed today"}</Field>
           <Field label="Regime">
             {regime.state ?? "—"} <span className="text-ink-3">{regime.session_date ?? ""}</span>
@@ -347,7 +371,7 @@ export function A1BDetail({ overview, generatedAt }: { overview: A1BOverview | n
             <span className="num">{summary.regime_transitions}</span>
           </Field>
         </div>
-        <p className="mt-3 text-[11px] leading-snug text-ink-3">{service.invariant_note}</p>
+        <p className="mt-3 text-meta leading-snug text-ink-3">{service.invariant_note}</p>
       </Card>
       <Card tone="SHADOW" title="A1-B hypothetical book" meta={<Pill tone="SHADOW" emphasis>{hypothetical.label}</Pill>}>
         <div className="grid grid-cols-2 gap-x-5 gap-y-3.5 sm:grid-cols-3">
@@ -372,7 +396,7 @@ export function A1BDetail({ overview, generatedAt }: { overview: A1BOverview | n
             <span className="num">{hypothetical.steps}</span>
           </Field>
         </div>
-        <p className="mt-3 text-[11.5px] leading-snug text-warn">{hypothetical.sample_warning}</p>
+        <p className="mt-3 text-meta leading-snug text-warn">{hypothetical.sample_warning}</p>
       </Card>
     </div>
   );
@@ -403,12 +427,7 @@ export function shadowCards(
         eda1 && eda1Book ? eda1Book.current_long_symbols.length / Math.max(1, eda1.service.universe.length) : null,
       turnover: eda1Book?.turnover_per_step === null || eda1Book?.turnover_per_step === undefined ? "—" : `${eda1Book.turnover_per_step.toFixed(3)} Δ/step`,
       observationCount: eda1?.comparison.bars_compared ?? 0,
-      parity:
-        parityMismatches === null
-          ? "N/A"
-          : parityMismatches === 0
-            ? "Parity clean"
-            : `${parityMismatches} mismatch${parityMismatches === 1 ? "" : "es"}`,
+      parityCount: parityMismatches,
       parityTone: parityMismatches === null ? "MUTED" : parityMismatches === 0 ? "POSITIVE" : "ATTENTION",
       zeroOrder: {
         intents: eda1?.service.order_intents_in_database ?? 0,
@@ -437,7 +456,7 @@ export function shadowCards(
           ? "—"
           : `${percent(a1b.hypothetical.turnover_per_step, 2)} wt/step`,
       observationCount: a1b?.service.observations_recorded ?? 0,
-      parity: "N/A",
+      parityCount: null,
       parityTone: "MUTED",
       zeroOrder: {
         intents: a1b?.service.order_intents_in_database ?? 0,
@@ -449,4 +468,47 @@ export function shadowCards(
       policy: a1b?.service.policy_hash ?? null,
     },
   ];
+}
+
+/**
+ * The Overview's condensed shadow row.
+ *
+ * Both observers as one violet strip: unit state, what each one is, and the
+ * standing statement that neither can act. It carries no performance figure at
+ * all — a summary is exactly the place a hypothetical index would be mistaken
+ * for account equity, so the numbers stay on the Shadows page behind their
+ * sample thresholds.
+ */
+export function ShadowSummary({ services }: { services: ServiceUnitsPanel | null }) {
+  const { t } = useI18n();
+  const rows = [
+    { key: "equity_shadow", name: "Equity Shadow · V3 + EDA-1" },
+    { key: A1B_SHADOW_KEY, name: "A1-B U30 Shadow" },
+  ] as const;
+
+  return (
+    <Card tone="SHADOW" title={t("shadows.observationOnly")} bodyClassName="">
+      <div className="divide-y divide-subtle/70 px-4">
+        {rows.map((row) => {
+          const unit = serviceUnit(services, row.key);
+          const shown = unit ? displayStatus(unit) : { status: "UNKNOWN", tone: "ATTENTION" as const };
+          return (
+            <div key={row.key} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-3">
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <span className="text-table font-medium text-ink">{row.name}</span>
+                <Tag tone="SHADOW" title={t("strategies.observationOnlyHint")}>
+                  {t("strategies.observationOnly")}
+                </Tag>
+                <Tag tone="SHADOW">{t("strategies.capability.zeroOrders")}</Tag>
+              </div>
+              <Status tone={shown.tone} title={unit?.detail ?? t("status.unknownHint")}>
+                {shown.status}
+              </Status>
+            </div>
+          );
+        })}
+      </div>
+      <p className="px-4 pt-1 pb-3.5 text-meta leading-snug text-ink-3">{t("shadows.banner")}</p>
+    </Card>
+  );
 }

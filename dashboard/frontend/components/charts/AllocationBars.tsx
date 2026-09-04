@@ -1,3 +1,5 @@
+"use client";
+
 /**
  * The allocation: one horizontal bar per slice, largest first, cash last.
  *
@@ -9,6 +11,7 @@
 
 import type { AllocationSlice } from "@/lib/portfolio";
 import { money, percent } from "@/lib/format";
+import { useI18n } from "@/lib/i18n";
 
 import { cn } from "../ui";
 
@@ -16,7 +19,7 @@ const KIND_FILL: Record<AllocationSlice["kind"], string> = {
   EQUITY: "bg-accent",
   CRYPTO: "bg-warn",
   CASH: "bg-ink-3",
-  OTHER: "bg-line-strong",
+  OTHER: "bg-active",
 };
 
 export function StructureStrip({
@@ -28,19 +31,20 @@ export function StructureStrip({
   targetGross: number | null;
   hardCap: number | null;
 }) {
+  const { t } = useI18n();
   const equity = slices.filter((slice) => slice.kind === "EQUITY" || slice.kind === "OTHER");
   const crypto = slices.filter((slice) => slice.kind === "CRYPTO");
   const cash = slices.filter((slice) => slice.kind === "CASH");
   const sum = (items: AllocationSlice[]) => items.reduce((total, slice) => total + (slice.fraction ?? 0), 0);
   const segments = [
-    { key: "equity", label: "Equity", fraction: sum(equity), fill: "bg-accent" },
-    { key: "crypto", label: "Crypto", fraction: sum(crypto), fill: "bg-warn" },
-    { key: "cash", label: "Cash", fraction: sum(cash), fill: "bg-ink-3" },
+    { key: "equity", label: t("portfolio.equitySleeve"), fraction: sum(equity), fill: "bg-accent" },
+    { key: "crypto", label: t("portfolio.cryptoSleeve"), fraction: sum(crypto), fill: "bg-warn" },
+    { key: "cash", label: t("portfolio.cash"), fraction: sum(cash), fill: "bg-ink-3" },
   ].filter((segment) => segment.fraction > 0);
 
   return (
     <div>
-      <div className="relative h-3 w-full overflow-hidden rounded-[3px] bg-line-strong/60" role="img" aria-label="Account structure">
+      <div className="relative h-3 w-full overflow-hidden rounded-xs bg-active/60" role="img" aria-label={t("portfolio.structure")}>
         <div className="flex h-full w-full">
           {segments.map((segment) => (
             <div
@@ -66,44 +70,45 @@ export function StructureStrip({
           />
         ) : null}
       </div>
-      <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-ink-3">
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-meta text-ink-3">
         {segments.map((segment) => (
           <span key={segment.key} className="inline-flex items-center gap-1.5">
-            <span className={cn("inline-block size-2 rounded-[2px]", segment.fill)} aria-hidden />
+            <span className={cn("inline-block size-2 rounded-xs", segment.fill)} aria-hidden />
             {segment.label} <span className="num text-ink-2">{percent(segment.fraction, 1)}</span>
           </span>
         ))}
         {targetGross !== null ? (
-          <span className="num">target {percent(targetGross, 0)}</span>
+          <span className="num">{t("account.target")} {percent(targetGross, 0)}</span>
         ) : null}
-        {hardCap !== null ? <span className="num text-neg/80">cap {percent(hardCap, 0)}</span> : null}
+        {hardCap !== null ? <span className="num text-neg/80">{t("account.hardCap")} {percent(hardCap, 0)}</span> : null}
       </div>
     </div>
   );
 }
 
 export function AllocationBars({ slices }: { slices: AllocationSlice[] }) {
+  const { t } = useI18n();
   const max = Math.max(...slices.map((slice) => slice.fraction ?? 0), 0.0001);
   return (
-    <ul className="space-y-1.5" aria-label="Allocation by position">
+    <ul className="space-y-1.5" aria-label={t("portfolio.allocation")}>
       {slices.map((slice) => (
         <li key={slice.label} className="grid grid-cols-[64px_minmax(0,1fr)_56px_92px] items-center gap-2">
           <span
             className={cn(
-              "truncate text-[12px] font-medium",
+              "truncate text-table font-medium",
               slice.kind === "CASH" ? "text-ink-2" : "text-ink",
             )}
           >
             {slice.label}
           </span>
-          <span className="h-2 w-full overflow-hidden rounded-[2px] bg-line-strong/40" aria-hidden>
+          <span className="h-2 w-full overflow-hidden rounded-xs bg-active/40" aria-hidden>
             <span
-              className={cn("block h-full rounded-[2px]", KIND_FILL[slice.kind])}
+              className={cn("block h-full rounded-xs", KIND_FILL[slice.kind])}
               style={{ width: `${((slice.fraction ?? 0) / max) * 100}%` }}
             />
           </span>
-          <span className="num text-right text-[12px] text-ink">{percent(slice.fraction, 1)}</span>
-          <span className="num text-right text-[11.5px] text-ink-3">{money(slice.value)}</span>
+          <span className="num text-right text-table text-ink">{percent(slice.fraction, 1)}</span>
+          <span className="num text-right text-meta text-ink-3">{money(slice.value)}</span>
         </li>
       ))}
     </ul>

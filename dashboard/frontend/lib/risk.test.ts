@@ -184,7 +184,19 @@ test("an unreadable broker leaves every row UNAVAILABLE rather than zero", () =>
 });
 
 test("the risk, metrics and paper components carry no stale limit text", () => {
-  for (const file of ["components/Risk.tsx", "components/Metrics.tsx", "components/Portfolio.tsx", "components/EquityPaper.tsx", "components/charts/ExposureRail.tsx", "lib/risk.ts"]) {
+  // Dashboard V3 split Metrics.tsx into AccountSummary.tsx and added the
+  // market-state panel; both render policy figures and both are guarded.
+  for (const file of [
+    "components/Risk.tsx",
+    "components/AccountSummary.tsx",
+    "components/MarketState.tsx",
+    "components/Portfolio.tsx",
+    "components/EquityPaper.tsx",
+    "components/charts/ExposureRail.tsx",
+    "lib/risk.ts",
+    "lib/rail.ts",
+    "app/risk/page.tsx",
+  ]) {
     const text = source(file);
     assert.ok(!/(^|[^0-9.])30%/.test(text), `${file} names a 30% limit`);
     assert.ok(!/(^|[^0-9.])5%/.test(text), `${file} names a 5% limit`);
