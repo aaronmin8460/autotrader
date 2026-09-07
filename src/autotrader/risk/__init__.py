@@ -6,6 +6,12 @@ per symbol, 30% total exposure, a 2% daily-loss halt on new entries, long only,
 no leverage. Every limit is a USD **notional** ceiling; only the quantity
 representation changed when the project pivoted to crypto.
 
+A policy may additionally carry an absolute USD ceiling - `max_position_notional`
+and `max_total_notional` - which binds beside the fractional one, tighter of the
+two winning. It exists for a small-capital operational validation, whose promise
+is a number of dollars rather than a share of the account; a percentage-only
+ceiling would authorize a larger position every day the account gained.
+
 It is the stage between a signal and an order intent (docs/SPEC.md section
 6A), and it deliberately cannot reach past itself: nothing here submits an
 order, constructs a broker client, touches the network, or persists anything.
@@ -23,6 +29,7 @@ from autotrader.risk.engine import (
     MAX_DAILY_LOSS_FRACTION,
     MAX_POSITION_FRACTION,
     MAX_TOTAL_EXPOSURE_FRACTION,
+    NO_ABSOLUTE_CEILING,
     NO_POSITION_TO_EXIT,
     POSITION_LIMIT,
     QUANTITY_EXPONENT,
@@ -50,6 +57,7 @@ __all__ = [
     "MAX_DAILY_LOSS_FRACTION",
     "MAX_POSITION_FRACTION",
     "MAX_TOTAL_EXPOSURE_FRACTION",
+    "NO_ABSOLUTE_CEILING",
     "NO_POSITION_TO_EXIT",
     "POSITION_LIMIT",
     "QUANTITY_EXPONENT",

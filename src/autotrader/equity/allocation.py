@@ -71,11 +71,25 @@ POLICY_RESERVED_UNIVERSE = "C_RESERVED_UNIVERSE"
 #: in the registry, hash-stable, as the rollback target.
 POLICY_FRACTIONAL_RESERVED_90 = "EDA1_FRACTIONAL_RESERVED_90"
 
+#: The $100 real-money operational validation policy.
+#:
+#: `EDA1_FRACTIONAL_RESERVED_90`'s exact shape and exact percentages, plus a
+#: set of **absolute USD ceilings** that do not move when the account does.
+#: Nothing about the strategy changes and nothing about the proportions
+#: changes: at $100 of equity the two policies size identically, to the cent.
+#: What the absolute ceilings add is the promise the percentages cannot make -
+#: that a month of gains does not quietly authorize a larger position. A
+#: percentage-only policy on a profitable account is an automatically scaling
+#: one, and the first month of real money is an operational validation, not a
+#: compounding mandate.
+POLICY_LIVE_VALIDATION_100 = "LIVE_VALIDATION_100"
+
 POLICY_IDS: tuple[str, ...] = (
     POLICY_EQUAL_ACTIVE,
     POLICY_FIXED_PRO_RATA,
     POLICY_RESERVED_UNIVERSE,
     POLICY_FRACTIONAL_RESERVED_90,
+    POLICY_LIVE_VALIDATION_100,
 )
 
 # --------------------------------------------------------------------------
@@ -117,6 +131,48 @@ REBALANCE_MIN_SLOT_FRACTION = Decimal("0.01")
 #: quantum - the broker publishes no equity trade increment - chosen at the
 #: precision the broker reports positions in.
 FRACTIONAL_SHARE_INCREMENT = Decimal("0.000000001")
+
+# --------------------------------------------------------------------------
+# The LIVE_VALIDATION_100 absolute ceilings, named once, here.
+#
+# Every one of these is a number of US dollars, not a fraction. They are the
+# figures the operator authorized for the first real-money month, and they are
+# deliberately expressed in the unit the authorization was given in: "about a
+# hundred dollars" is a dollar statement, and re-deriving it as a percentage of
+# whatever the account happens to hold would lose exactly the property that
+# made it an authorization.
+# --------------------------------------------------------------------------
+
+#: The absolute bound on aggregate exposure. Nothing this policy sizes, and
+#: nothing the Risk Engine approves under it, may project account-wide gross
+#: past this figure - not after a good month, not after a deposit, not ever,
+#: while this policy is the one running. It is the outer of the three and it
+#: binds none of the arithmetic directly: the hard ceiling below is what Risk
+#: enforces, and this is the number that ceiling is checked against, so a
+#: future edit that raised the hard ceiling past the authorization would fail
+#: the policy's own constructor rather than quietly widen the mandate.
+LIVE_VALIDATION_CAPITAL_BOUND = Decimal("100")
+
+#: The gross the book AIMS for. Ten reserved slots of $9 each.
+LIVE_VALIDATION_TARGET_GROSS_NOTIONAL = Decimal("90")
+
+#: The gross no new entry may project past, enforced by the Risk Engine
+#: against broker truth on every order, both books counted.
+LIVE_VALIDATION_HARD_GROSS_NOTIONAL = Decimal("95")
+
+#: The hard per-symbol ceiling, in dollars. It is `HARD_SYMBOL_GROSS_CAP` of
+#: the capital bound - 11% of $100 - so the two representations agree at the
+#: authorized capital and the dollar one keeps agreeing afterwards. Assignment
+#: sizes each slot at $9, so this never binds at assignment; it bounds drift.
+#:
+#: It is also the answer to the arithmetic trap a small account creates. Ten
+#: symbols and $100 means $9 a slot, which is small enough that an operator
+#: might reasonably wonder whether the universe should just be narrowed - and
+#: narrowing it would put a double-digit percentage of the whole account into
+#: one name. This ceiling makes that impossible to reach by accident: no single
+#: symbol may hold more than $11 while this policy is running, whatever the
+#: universe is doing.
+LIVE_VALIDATION_SYMBOL_NOTIONAL = Decimal("11")
 
 #: Weights are quantized to this many decimal places, rounding **down**.
 #:
@@ -171,6 +227,22 @@ class AllocationPolicy:
     #: real floors or a 15-minute runtime churns on every price tick.
     deadband_min_notional: Decimal = _ZERO
     deadband_slot_fraction: Decimal = _ZERO
+    #: The absolute USD gross this book AIMS for, or None for "the percentage
+    #: is the whole story". Set, it tightens every assignment: a slot is the
+    #: smaller of `weight * equity` and `target_gross_notional / universe_size`.
+    target_gross_notional: Decimal | None = None
+    #: The absolute USD gross no entry may project past, or None. Carried into
+    #: the Risk Engine as `max_total_notional`, where it is enforced against
+    #: broker truth rather than against this module's arithmetic.
+    hard_gross_notional: Decimal | None = None
+    #: The absolute USD ceiling on one symbol, or None. Carried into the Risk
+    #: Engine as `max_position_notional`, and applied here as well so that no
+    #: plan this module produces can exceed it even before Risk sees it.
+    per_symbol_notional: Decimal | None = None
+    #: The outer authorization, in USD, or None. Nothing reads it to size
+    #: anything; the constructor checks the ceilings against it, so a policy
+    #: whose hard gross drifted past what was authorized cannot be built.
+    capital_bound: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.policy_id not in POLICY_IDS:
@@ -212,6 +284,83 @@ class AllocationPolicy:
                 "field defaults that would silently mean the legacy behaviour under "
                 "the new name."
             )
+        self._require_coherent_absolute_ceilings()
+        if self.policy_id == POLICY_LIVE_VALIDATION_100 and (
+            not self.fractional
+            or self.target_gross is None
+            or self.target_gross_notional is None
+            or self.hard_gross_notional is None
+            or self.per_symbol_notional is None
+            or self.capital_bound is None
+        ):
+            raise AllocationError(
+                f"{POLICY_LIVE_VALIDATION_100} names a frozen parameter set whose whole "
+                "purpose is the absolute dollar ceilings; construct it through "
+                "allocation_policy_for() rather than with field defaults that would "
+                "silently mean an uncapped percentage policy under the name of a "
+                "capped one."
+            )
+
+    def _require_coherent_absolute_ceilings(self) -> None:
+        """Refuse a set of dollar ceilings that do not describe one mandate.
+
+        Ordered outward - a slot inside the target, the target inside the hard
+        ceiling, the hard ceiling inside the authorization - and each step is
+        checked rather than assumed. The last one is the one that matters
+        politically as well as arithmetically: it is what makes "raise the hard
+        cap past what was authorized" a constructor failure instead of an edit
+        nobody notices.
+        """
+        for name, value in (
+            ("target_gross_notional", self.target_gross_notional),
+            ("hard_gross_notional", self.hard_gross_notional),
+            ("per_symbol_notional", self.per_symbol_notional),
+            ("capital_bound", self.capital_bound),
+        ):
+            if value is not None and (not value.is_finite() or value <= _ZERO):
+                raise AllocationError(
+                    f"{name} must be a positive, finite number of USD when set, got {value}."
+                )
+        target, hard = self.target_gross_notional, self.hard_gross_notional
+        if target is not None and hard is not None and target > hard:
+            raise AllocationError(
+                f"target_gross_notional {target} exceeds hard_gross_notional {hard}: a "
+                "target past the hard ceiling would be a ceiling the allocator plans "
+                "to violate."
+            )
+        if hard is not None and self.capital_bound is not None and hard > self.capital_bound:
+            raise AllocationError(
+                f"hard_gross_notional {hard} exceeds the authorized capital_bound "
+                f"{self.capital_bound}. The bound is the authorization; a ceiling above "
+                "it is exposure nobody approved."
+            )
+        per_symbol = self.per_symbol_notional
+        if per_symbol is not None and hard is not None and per_symbol > hard:
+            raise AllocationError(
+                f"per_symbol_notional {per_symbol} exceeds hard_gross_notional {hard}: one "
+                "symbol cannot be allowed more than the whole book."
+            )
+
+    @property
+    def slot_notional_ceiling(self) -> Decimal | None:
+        """The most one reserved slot may be assigned, in USD, or None.
+
+        The absolute counterpart of `budget / universe_size`, and tightened by
+        the per-symbol ceiling so a plan cannot exceed that one either. `None`
+        when the policy carries no absolute ceilings at all, which is every
+        policy the sizing study froze.
+        """
+        candidates = [
+            value
+            for value in (
+                None
+                if self.target_gross_notional is None
+                else self.target_gross_notional / Decimal(self.universe_size),
+                self.per_symbol_notional,
+            )
+            if value is not None
+        ]
+        return min(candidates) if candidates else None
 
     @property
     def budget_target(self) -> Decimal:
@@ -226,6 +375,22 @@ class AllocationPolicy:
         policy emits its own complete parameter set - every constant that
         changes its behaviour is in its hash.
         """
+        if self.policy_id == POLICY_LIVE_VALIDATION_100:
+            return {
+                "policy_id": self.policy_id,
+                "per_symbol_cap": str(self.per_symbol_cap),
+                "total_cap": str(self.total_cap),
+                "target_gross": str(self.budget_target),
+                "universe_size": self.universe_size,
+                "fractional": self.fractional,
+                "fractional_increment": str(FRACTIONAL_SHARE_INCREMENT),
+                "deadband_min_notional": str(self.deadband_min_notional),
+                "deadband_slot_fraction": str(self.deadband_slot_fraction),
+                "target_gross_notional": str(self.target_gross_notional),
+                "hard_gross_notional": str(self.hard_gross_notional),
+                "per_symbol_notional": str(self.per_symbol_notional),
+                "capital_bound": str(self.capital_bound),
+            }
         if self.policy_id == POLICY_FRACTIONAL_RESERVED_90:
             return {
                 "policy_id": self.policy_id,
@@ -312,7 +477,11 @@ def target_weights(
 
     if policy.policy_id == POLICY_EQUAL_ACTIVE:
         weight = min(budget / Decimal(count), policy.per_symbol_cap)
-    elif policy.policy_id in (POLICY_RESERVED_UNIVERSE, POLICY_FRACTIONAL_RESERVED_90):
+    elif policy.policy_id in (
+        POLICY_RESERVED_UNIVERSE,
+        POLICY_FRACTIONAL_RESERVED_90,
+        POLICY_LIVE_VALIDATION_100,
+    ):
         # One reserved slot per universe symbol, used while LONG and left idle
         # while FLAT. The fractional policy is the same shape under its own
         # constants: budget/N <= 9% sits below the 11% hard cap by design, so
@@ -478,6 +647,14 @@ def plan_allocation(
                 )
             price = Decimal(price)
             notional = policy_notional(weight, account_equity)
+            slot_ceiling = policy.slot_notional_ceiling
+            if slot_ceiling is not None:
+                # The absolute ceiling, applied to the assignment itself and
+                # not only to the Risk check that follows it. Risk would refuse
+                # an over-large order anyway, but a plan that had to be clamped
+                # downstream is a plan that was wrong when it was written, and
+                # the durable target row would record the wrong number.
+                notional = min(notional, slot_ceiling)
             target = (
                 fractional_shares(notional, price)
                 if policy.fractional
@@ -561,6 +738,24 @@ def allocation_policy_for(policy_id: str) -> AllocationPolicy:
             deadband_min_notional=REBALANCE_MIN_ABSOLUTE_NOTIONAL,
             deadband_slot_fraction=REBALANCE_MIN_SLOT_FRACTION,
         )
+    if policy_id == POLICY_LIVE_VALIDATION_100:
+        # Every percentage is the champion's, unchanged and deliberately so:
+        # this is the validated policy under a spending limit, not a second
+        # strategy. Only the four dollar figures are new.
+        return AllocationPolicy(
+            policy_id=POLICY_LIVE_VALIDATION_100,
+            per_symbol_cap=HARD_SYMBOL_GROSS_CAP,
+            total_cap=HARD_ACCOUNT_GROSS_CAP,
+            target_gross=TARGET_ACCOUNT_GROSS,
+            universe_size=RESERVED_EQUITY_SLOTS,
+            fractional=True,
+            deadband_min_notional=REBALANCE_MIN_ABSOLUTE_NOTIONAL,
+            deadband_slot_fraction=REBALANCE_MIN_SLOT_FRACTION,
+            target_gross_notional=LIVE_VALIDATION_TARGET_GROSS_NOTIONAL,
+            hard_gross_notional=LIVE_VALIDATION_HARD_GROSS_NOTIONAL,
+            per_symbol_notional=LIVE_VALIDATION_SYMBOL_NOTIONAL,
+            capital_bound=LIVE_VALIDATION_CAPITAL_BOUND,
+        )
     return AllocationPolicy(policy_id=policy_id)
 
 
@@ -574,10 +769,17 @@ def risk_policy_for(policy: AllocationPolicy) -> RiskPolicy:
     no way to express a different value. Every legacy policy keeps the default
     5%/30%/2% engine policy exactly as validated.
     """
-    if policy.policy_id == POLICY_FRACTIONAL_RESERVED_90:
+    if policy.policy_id in (POLICY_FRACTIONAL_RESERVED_90, POLICY_LIVE_VALIDATION_100):
+        # The absolute ceilings are passed through unchanged, and are `None`
+        # for the fractional-90 policy, which carries none. That is what makes
+        # this one function correct for both: the dollar ceilings are not a
+        # different kind of limit needing a different code path, they are the
+        # same limit expressed in the unit the authorization used.
         return RiskPolicy(
             max_position_fraction=float(policy.per_symbol_cap),
             max_total_exposure_fraction=float(policy.total_cap),
+            max_position_notional=policy.per_symbol_notional,
+            max_total_notional=policy.hard_gross_notional,
         )
     return DEFAULT_POLICY
 
@@ -609,7 +811,12 @@ __all__ = [
     "FRACTIONAL_SHARE_INCREMENT",
     "HARD_ACCOUNT_GROSS_CAP",
     "HARD_SYMBOL_GROSS_CAP",
+    "LIVE_VALIDATION_CAPITAL_BOUND",
+    "LIVE_VALIDATION_HARD_GROSS_NOTIONAL",
+    "LIVE_VALIDATION_SYMBOL_NOTIONAL",
+    "LIVE_VALIDATION_TARGET_GROSS_NOTIONAL",
     "POLICY_EQUAL_ACTIVE",
+    "POLICY_LIVE_VALIDATION_100",
     "POLICY_FRACTIONAL_RESERVED_90",
     "REBALANCE_MIN_ABSOLUTE_NOTIONAL",
     "REBALANCE_MIN_SLOT_FRACTION",

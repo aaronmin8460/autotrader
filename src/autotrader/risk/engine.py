@@ -28,6 +28,18 @@ market *value* of a position, not a count of units, so the arithmetic is
 ``quantity * reference_price`` measured against a dollar ceiling. Only the
 quantity representation changed in the pivot; the policy did not.
 
+**A cap may also be an absolute number of dollars.** `max_position_notional`
+and `max_total_notional` are optional USD ceilings that sit *beside* the
+fractional ones, and the tighter of the pair binds. They exist for the case a
+percentage cannot express: a small-capital operational validation, where the
+promise is "never more than this many dollars at risk" rather than "never more
+than this share of the account". A percentage-only ceiling authorizes a larger
+dollar position every day the account gains, which is exactly the automatic
+scaling a validation must not do. Both default to `None`, so every policy that
+predates them computes the arithmetic it always did, and carrying one can only
+ever tighten a policy - the code path is a `min`, and there is no branch that
+lets an absolute ceiling widen a fractional one.
+
 **Entries are gated; exits are not.** Every limit here exists to stop the
 account from *adding* risk. None of them may stop it from *removing* risk, so
 a SELL that only reduces an existing long is evaluated separately: the
@@ -86,6 +98,16 @@ MAX_TOTAL_EXPOSURE_FRACTION = 0.30
 
 #: Daily loss at which new entries halt, as a fraction of the UTC-day baseline.
 MAX_DAILY_LOSS_FRACTION = 0.02
+
+#: The absolute-ceiling fields default to this: *no absolute ceiling*.
+#:
+#: A fractional cap is a statement about the account's shape and it scales with
+#: the account: 5% of $100,000 is $5,000, and 5% of $200,000 is $10,000. That is
+#: the right rule for a book whose mandate is "hold this proportion", and it is
+#: the wrong rule for a validation whose mandate is "risk no more than this many
+#: dollars, whatever happens". The two are expressed separately, and a policy
+#: carrying both is bound by whichever is tighter at the moment of the decision.
+NO_ABSOLUTE_CEILING: Decimal | None = None
 
 #: Approved quantities are quantized **down** to this exponent.
 #:
@@ -171,6 +193,23 @@ class RiskPolicy:
     max_daily_loss_fraction: float = MAX_DAILY_LOSS_FRACTION
     long_only: bool = True
     allow_leverage: bool = False
+    #: An absolute USD ceiling on one symbol's market value, or None.
+    #:
+    #: Applied **beside** `max_position_fraction`, never instead of it: the
+    #: headroom is measured against the smaller of the two, so adding one can
+    #: only ever tighten a policy. `None` - the default, and every policy that
+    #: existed before this field - means the fractional cap is the only cap,
+    #: which keeps every validated policy's behaviour bit for bit.
+    max_position_notional: Decimal | None = NO_ABSOLUTE_CEILING
+    #: An absolute USD ceiling on aggregate long exposure, or None. Same
+    #: relationship to `max_total_exposure_fraction` as the field above.
+    #:
+    #: This is the field that makes a small-capital validation actually stay
+    #: small. A percentage ceiling grows with the account, so a validation that
+    #: only ever said "95% of equity" would be authorizing a larger dollar
+    #: position every day the account made money - which is precisely the
+    #: automatic scaling an operational validation is not supposed to do.
+    max_total_notional: Decimal | None = NO_ABSOLUTE_CEILING
 
 
 #: The V0.2 policy: 5% per symbol, 30% total, a 2% daily-loss halt, long only,
@@ -351,6 +390,30 @@ def _require_supported_policy(policy: RiskPolicy) -> None:
         raise RiskInputError("policy.long_only must be True; short selling is out of scope.")
     if policy.allow_leverage:
         raise RiskInputError("policy.allow_leverage must be False; leverage is out of scope.")
+    for name, ceiling in (
+        ("max_position_notional", policy.max_position_notional),
+        ("max_total_notional", policy.max_total_notional),
+    ):
+        if ceiling is None:
+            continue
+        if not isinstance(ceiling, Decimal) or not ceiling.is_finite() or ceiling <= 0:
+            raise RiskInputError(
+                f"policy.{name} must be a positive, finite Decimal number of USD, or None "
+                f"for no absolute ceiling. Got {ceiling!r}. A float is refused for the same "
+                "reason a float quantity is: an absolute dollar ceiling that is a binary "
+                "approximation is not the ceiling it reads as."
+            )
+    if (
+        policy.max_position_notional is not None
+        and policy.max_total_notional is not None
+        and policy.max_position_notional > policy.max_total_notional
+    ):
+        raise RiskInputError(
+            f"policy.max_position_notional ({policy.max_position_notional}) exceeds "
+            f"policy.max_total_notional ({policy.max_total_notional}): one symbol's ceiling "
+            "cannot be larger than the whole book's, and a policy that says otherwise "
+            "describes a limit it does not mean."
+        )
 
 
 def _require_coherent_context(context: RiskContext) -> None:
@@ -448,6 +511,18 @@ def max_quantity_for_notional(notional: Decimal, price: Decimal) -> Decimal:
     return quantity if quantity > 0 else _ZERO
 
 
+def _tightest(fractional_ceiling: Decimal, absolute_ceiling: Decimal | None) -> Decimal:
+    """The binding ceiling: the fractional one, tightened by the absolute one.
+
+    Deliberately `min`, never a replacement. An absolute ceiling is an extra
+    promise a policy makes; it can take headroom away and it must never be able
+    to hand any back, so a policy can only be made stricter by carrying one.
+    """
+    if absolute_ceiling is None:
+        return fractional_ceiling
+    return min(fractional_ceiling, absolute_ceiling)
+
+
 def _entry_headroom(context: RiskContext, policy: RiskPolicy) -> tuple[Decimal, str]:
     """The USD notional an entry may still use, and the constraint that caps it.
 
@@ -456,13 +531,18 @@ def _entry_headroom(context: RiskContext, policy: RiskPolicy) -> tuple[Decimal, 
     the reported constraint is deterministic.
     """
     equity = _decimal(context.equity)
-    position_remaining = max(
-        _ZERO, equity * _decimal(policy.max_position_fraction) - _decimal(context.symbol_exposure)
+    # The tighter of the two ceilings, evaluated fresh against today's equity.
+    # `_tightest` returns the fractional ceiling unchanged when no absolute one
+    # is set, so every policy written before absolute ceilings existed computes
+    # exactly the arithmetic it always did.
+    position_ceiling = _tightest(
+        equity * _decimal(policy.max_position_fraction), policy.max_position_notional
     )
-    portfolio_remaining = max(
-        _ZERO,
-        equity * _decimal(policy.max_total_exposure_fraction) - _decimal(context.total_exposure),
+    total_ceiling = _tightest(
+        equity * _decimal(policy.max_total_exposure_fraction), policy.max_total_notional
     )
+    position_remaining = max(_ZERO, position_ceiling - _decimal(context.symbol_exposure))
+    portfolio_remaining = max(_ZERO, total_ceiling - _decimal(context.total_exposure))
     # Cash is the no-leverage rule: an entry may only spend money already held.
     limits = (
         (position_remaining, POSITION_LIMIT),
@@ -610,10 +690,16 @@ def evaluate_risk(
     per-symbol cap, the total-exposure cap, and available cash - all measured
     as USD notional::
 
-        position_remaining  = max(0, equity * 0.05 - symbol_exposure)
-        portfolio_remaining = max(0, equity * 0.30 - total_exposure)
+        position_ceiling    = min(equity * 0.05, max_position_notional)
+        total_ceiling       = min(equity * 0.30, max_total_notional)
+        position_remaining  = max(0, position_ceiling - symbol_exposure)
+        portfolio_remaining = max(0, total_ceiling - total_exposure)
         max_notional        = min(position_remaining, portfolio_remaining, cash)
         max_quantity        = max_notional / reference_price   (rounded down)
+
+    Each `min` collapses to its fractional term when the policy sets no
+    absolute ceiling, which is every policy validated before this field
+    existed.
 
     An oversized BUY is **clamped** to `max_quantity` and approved, with
     `reason_code` naming the binding constraint; a `max_quantity` of zero is
@@ -660,6 +746,7 @@ __all__ = [
     "MAX_DAILY_LOSS_FRACTION",
     "MAX_POSITION_FRACTION",
     "MAX_TOTAL_EXPOSURE_FRACTION",
+    "NO_ABSOLUTE_CEILING",
     "NO_POSITION_TO_EXIT",
     "POSITION_LIMIT",
     "QUANTITY_EXPONENT",

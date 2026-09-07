@@ -165,7 +165,14 @@ def test_default_policy_stance_is_long_only_and_unlevered() -> None:
 
 
 def test_the_whole_share_policy_flag_is_gone() -> None:
-    """Crypto is fractionable; a flag whose only legal value is False is not a policy."""
+    """Crypto is fractionable; a flag whose only legal value is False is not a policy.
+
+    The field set is pinned exactly, not merely checked for one absence, so a
+    field cannot be added to the policy without a reader of this test noticing.
+    The two absolute-notional ceilings are listed because they were added
+    deliberately, default to `None`, and are asserted elsewhere to leave every
+    pre-existing policy's arithmetic unchanged.
+    """
     fields = {field.name for field in dataclasses.fields(RiskPolicy)}
     assert "whole_shares_only" not in fields
     assert fields == {
@@ -174,9 +181,17 @@ def test_the_whole_share_policy_flag_is_gone() -> None:
         "max_daily_loss_fraction",
         "long_only",
         "allow_leverage",
+        "max_position_notional",
+        "max_total_notional",
     }
     with pytest.raises(TypeError):
         RiskPolicy(whole_shares_only=True)  # type: ignore[call-arg]
+
+
+def test_the_absolute_ceilings_default_to_absent() -> None:
+    """CRITICAL. Every policy that predates them computes what it always did."""
+    assert DEFAULT_POLICY.max_position_notional is None
+    assert DEFAULT_POLICY.max_total_notional is None
 
 
 def test_module_constants_match_the_default_policy() -> None:
