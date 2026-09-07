@@ -373,11 +373,67 @@ def test_the_credential_template_ships_empty() -> None:
     assert "ALPACA_SECRET_KEY=\n" in text
 
 
+def test_the_real_money_credential_template_ships_empty() -> None:
+    text = (ENV_ROOT / "autotrader-equity-live.secrets.env.example").read_text()
+    assert "ALPACA_LIVE_API_KEY=\n" in text
+    assert "ALPACA_LIVE_SECRET_KEY=\n" in text
+
+
+def test_the_real_money_credentials_do_not_share_the_paper_variable_names() -> None:
+    """CRITICAL. Disjoint names are what make cross-contamination structural.
+
+    A paper secrets file loaded into the real-money process must yield no
+    credential at all rather than a working paper one, and the reverse must be
+    equally true. That property is a property of the *names*, so it is asserted
+    on the templates rather than left to the code that reads them.
+    """
+    live = (ENV_ROOT / "autotrader-equity-live.secrets.env.example").read_text()
+    paper = (ENV_ROOT / "autotrader-equity-paper.secrets.env.example").read_text()
+    live_names = set(re.findall(r"^([A-Z_]+)=", live, re.MULTILINE))
+    paper_names = set(re.findall(r"^([A-Z_]+)=", paper, re.MULTILINE))
+    assert live_names and paper_names
+    assert live_names.isdisjoint(paper_names), live_names & paper_names
+
+
+def test_the_real_money_default_posture_is_disarmed() -> None:
+    """CRITICAL. A freshly provisioned host arms nothing."""
+    text = (ENV_ROOT / "autotrader-equity-live.env.example").read_text()
+    assert "AUTOTRADER_LIVE_ARMED=false" in text
+    assert "AUTOTRADER_LIVE_ARMED=true" not in text
+    assert "AUTOTRADER_EQUITY_LIVE_ARGS=\n" in text
+
+
+def test_the_real_money_account_pin_ships_unset() -> None:
+    """There is no unpinned mode, so an unset pin is a refusal to start."""
+    text = (ENV_ROOT / "autotrader-equity-live.env.example").read_text()
+    assert "AUTOTRADER_LIVE_ACCOUNT_FINGERPRINT=\n" in text
+
+
+def test_the_real_money_arm_file_is_the_only_place_that_arms() -> None:
+    """The off switch has to act on the same file the on switch wrote."""
+    armed = [
+        path for path in deploy_text_files() if "AUTOTRADER_LIVE_ARMED=true" in path.read_text()
+    ]
+    assert [path.name for path in armed] == ["autotrader-equity-live.arm.env.example"]
+
+
+def test_the_real_money_store_is_not_shared_with_any_other_runtime() -> None:
+    """A real-money intent and a paper intent must not reach one table."""
+    live = (ENV_ROOT / "autotrader-equity-live.env.example").read_text()
+    for foreign in (
+        "/var/lib/autotrader-equity-paper/",
+        "/var/lib/autotrader/autotrader.db",
+        "/var/lib/autotrader-accounting/",
+    ):
+        assert foreign not in live, foreign
+
+
 #: Alpaca keys are alphanumeric and 20+ characters. This is a shape check, not
 #: a vault: it catches a real key pasted into a tracked file, which is the
 #: mistake that actually happens.
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    r"\b(ALPACA_API_KEY|ALPACA_SECRET_KEY)[ \t]*=[ \t]*['\"]?([A-Za-z0-9/+_-]{16,})",
+    r"\b(ALPACA_API_KEY|ALPACA_SECRET_KEY|ALPACA_LIVE_API_KEY|ALPACA_LIVE_SECRET_KEY)"
+    r"[ \t]*=[ \t]*['\"]?([A-Za-z0-9/+_-]{16,})",
     re.IGNORECASE,
 )
 _ALLOWED_PLACEHOLDERS = re.compile(r"PLACEHOLDER|REPLACE|EXAMPLE|YOUR_|\.\.\.|xxx", re.IGNORECASE)
