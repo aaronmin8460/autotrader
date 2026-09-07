@@ -31,6 +31,14 @@ ever sized against a deposit that has not settled.
 new entries, because the daily-loss halt would otherwise be measuring the
 transfer instead of the trading.
 
+*The real-money boundary is one file and it cannot place anything.* It builds
+and proves a client; every gate refuses on its own; a paper client handed to it
+is refused; and a credential shared with paper is refused.
+
+*A cash account is sized against settled money.* Buying power below cash means
+unsettled proceeds, and spending those is a violation rather than a trade. The
+margin figures the paper account actually reports are asserted unaffected.
+
 *Nothing here is a second strategy.* At the authorized capital the validation
 policy and the paper champion produce identical targets, to the cent, and
 every policy the sizing study froze still digests to the hash it published.
@@ -63,7 +71,19 @@ from autotrader.equity.allocation import (
     plan_allocation,
     risk_policy_for,
 )
+from autotrader.execution import live as live_module
+from autotrader.execution.live import (
+    LIVE_API_KEY_ENV,
+    LIVE_SECRET_KEY_ENV,
+    LIVE_TRADING_BASE_URL,
+    MissingLiveCredentialsError,
+    NotLiveEnvironmentError,
+    create_live_trading_client,
+    require_live_submission_allowed,
+    verify_live_environment,
+)
 from autotrader.execution.models import OrderSide
+from autotrader.execution.paper import PaperAccountState, build_risk_context
 from autotrader.live.armstate import (
     ARM_CONFIRMATION_TOKEN,
     LIVE_ARMED_ENV,
@@ -734,3 +754,191 @@ def test_the_guard_does_not_care_about_direction_or_size() -> None:
     """Any movement at all means the day's equity change is not trading."""
     assert cash_flow_block_reason([flow("CSD", "0.01")], risk_day=RISK_DAY) is not None
     assert cash_flow_block_reason([flow("JNLC", "-5")], risk_day=RISK_DAY) is not None
+
+
+# ==========================================================================
+# The real-money boundary
+# ==========================================================================
+
+
+class FakeLiveClient:
+    """A client that looks like the real-money one to every structural check."""
+
+    _base_url = "https://api.alpaca.markets"
+    _sandbox = False
+
+    def __init__(self, number: str = "223456788990") -> None:
+        self._number = number
+
+    def get_account(self) -> FakeAccount:
+        return FakeAccount(self._number)
+
+
+class FakePaperShapedClient:
+    _base_url = "https://paper-api.alpaca.markets"
+    _sandbox = True
+
+    def get_account(self) -> FakeAccount:
+        return FakeAccount("PA12345TN1")
+
+
+def test_the_live_verifier_refuses_a_paper_client() -> None:
+    """CRITICAL. A real-money runtime handed a paper client must stop.
+
+    This is the mirror-image of the paper check and the load-bearing one: a
+    paper client CAN be constructed - it is what the rest of the system builds
+    - so handing one to this runtime would mean a process reporting real-money
+    activity while trading paper.
+    """
+    with pytest.raises(NotLiveEnvironmentError):
+        verify_live_environment(FakePaperShapedClient())
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        {"_base_url": "https://paper-api.alpaca.markets", "_sandbox": False},
+        {"_base_url": None, "_sandbox": False},
+        {"_base_url": 42, "_sandbox": False},
+        {"_base_url": "https://api.alpaca.markets", "_sandbox": True},
+        {"_base_url": "https://api.alpaca.markets", "_sandbox": None},
+    ],
+)
+def test_an_unprovable_environment_fails_closed(attributes: dict[str, object]) -> None:
+    """There is no "probably live". Missing, wrong-typed, or elsewhere all refuse."""
+    client = type("Ambiguous", (), attributes)()
+    with pytest.raises(NotLiveEnvironmentError):
+        verify_live_environment(client)
+
+
+def test_the_live_verifier_accepts_a_live_shaped_client() -> None:
+    assert verify_live_environment(FakeLiveClient()) == LIVE_TRADING_BASE_URL
+
+
+def test_missing_real_money_credentials_refuse_by_name_not_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(LIVE_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(LIVE_SECRET_KEY_ENV, raising=False)
+    with pytest.raises(MissingLiveCredentialsError) as caught:
+        create_live_trading_client()
+    assert LIVE_API_KEY_ENV in str(caught.value)
+
+
+def test_a_credential_shared_with_paper_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CRITICAL. Two environments sharing one credential is not two environments.
+
+    Disjoint variable names stop a paper key reaching the live host by
+    accident. They cannot stop somebody pasting the same key into both files,
+    and a system that did that would report two separate environments while
+    having one.
+    """
+    monkeypatch.setenv(LIVE_API_KEY_ENV, "SHAREDKEYSHAREDKEY00")
+    monkeypatch.setenv(LIVE_SECRET_KEY_ENV, "secret")
+    monkeypatch.setenv("ALPACA_API_KEY", "SHAREDKEYSHAREDKEY00")
+    with pytest.raises(MissingLiveCredentialsError, match="same value"):
+        create_live_trading_client()
+
+
+def test_the_full_gate_chain_refuses_at_every_stage(
+    store: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CRITICAL. Environment, then identity, then arming. Each one alone refuses."""
+    client = FakeLiveClient()
+    pin = account_fingerprint("223456788990")
+
+    monkeypatch.delenv(LIVE_ACCOUNT_FINGERPRINT_ENV, raising=False)
+    with pytest.raises(AccountIdentityError):
+        require_live_submission_allowed(store, client)
+
+    monkeypatch.setenv(LIVE_ACCOUNT_FINGERPRINT_ENV, "0" * 32)
+    with pytest.raises(AccountIdentityError):
+        require_live_submission_allowed(store, client)
+
+    monkeypatch.setenv(LIVE_ACCOUNT_FINGERPRINT_ENV, pin)
+    monkeypatch.delenv(LIVE_ARMED_ENV, raising=False)
+    with pytest.raises(LiveDisarmedError):
+        require_live_submission_allowed(store, client)
+
+    monkeypatch.setenv(LIVE_ARMED_ENV, "true")
+    with pytest.raises(LiveDisarmedError):
+        require_live_submission_allowed(store, client)
+
+    arm_live_trading(store, now=NOW, reason="first day", confirmation=ARM_CONFIRMATION_TOKEN)
+    fingerprint, arm_state = require_live_submission_allowed(store, client)
+    assert fingerprint == pin
+    assert arm_state.state == STATE_ARMED
+
+
+def test_a_wrong_account_is_refused_even_when_fully_armed(
+    store: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CRITICAL. Being armed against the wrong account is not permission."""
+    monkeypatch.setenv(LIVE_ACCOUNT_FINGERPRINT_ENV, account_fingerprint("223456788990"))
+    monkeypatch.setenv(LIVE_ARMED_ENV, "true")
+    arm_live_trading(store, now=NOW, reason="first day", confirmation=ARM_CONFIRMATION_TOKEN)
+    with pytest.raises(AccountIdentityError):
+        require_live_submission_allowed(store, FakeLiveClient("999999999999"))
+
+
+def test_the_live_client_disables_the_sdk_request_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CRITICAL. An SDK retry on POST /orders would defeat at-most-once."""
+
+    class Recording:
+        def __init__(self, **kwargs: object) -> None:
+            self._retry = 3
+
+    monkeypatch.setattr(live_module, "TradingClient", Recording)
+    monkeypatch.setenv(LIVE_API_KEY_ENV, "k")
+    monkeypatch.setenv(LIVE_SECRET_KEY_ENV, "s")
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    assert create_live_trading_client()._retry == 0
+
+
+# ==========================================================================
+# Cash-account settlement: spendable cash is the tighter figure
+# ==========================================================================
+
+
+def account_state(cash: float, buying_power: float | None) -> PaperAccountState:
+    return PaperAccountState(
+        equity=50.0,
+        cash=cash,
+        status="ACTIVE",
+        trading_blocked=False,
+        account_blocked=False,
+        trade_suspended_by_user=False,
+        buying_power=buying_power,
+    )
+
+
+def test_a_margin_account_is_completely_unaffected() -> None:
+    """CRITICAL non-regression. Buying power exceeds cash, so the min is cash.
+
+    These are the figures the paper account actually reported on the day this
+    was written, so the assertion is against production truth rather than an
+    invented pair.
+    """
+    paper = account_state(cash=10_072.75, buying_power=287_157.69)
+    assert paper.spendable_cash == paper.cash
+
+
+def test_a_cash_account_holding_unsettled_proceeds_is_sized_down() -> None:
+    """CRITICAL. Buying with unsettled proceeds is a violation, not a trade."""
+    assert account_state(cash=50.0, buying_power=5.0).spendable_cash == 5.0
+
+
+def test_an_unreadable_buying_power_falls_back_to_cash() -> None:
+    assert account_state(cash=50.0, buying_power=None).spendable_cash == 50.0
+
+
+def test_the_risk_context_uses_the_spendable_figure() -> None:
+    context = build_risk_context(
+        account_state(cash=50.0, buying_power=5.0),
+        {},
+        "SPY",
+        daily_baseline_equity=Decimal(50),
+    )
+    assert context.cash == 5.0

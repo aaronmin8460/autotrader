@@ -839,12 +839,14 @@ def reconcile_paper_state(
     confirmations: int = NOT_FOUND_CONFIRMATIONS,
     recheck_delay_seconds: float = NOT_FOUND_RECHECK_DELAY_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
+    verify_environment: Callable[[TradingClient], str] = verify_paper_environment,
 ) -> ReconciliationResult:
     """Reconcile local state against Alpaca paper, and report whether trading is safe.
 
     The whole pass, in order:
 
-    1. prove the trading client reaches Alpaca **paper**, or stop;
+    1. prove the trading client reaches the environment the caller requires
+       (**paper** unless a caller says otherwise), or stop;
     2. read the account, which is also the authentication check;
     3. read every open paper position, which refuses any short;
     4. for each intent whose truth still depends on the broker, ask about its
@@ -886,6 +888,21 @@ def reconcile_paper_state(
     re-read that a not-found answer has to survive. They are parameters so a
     test can run the same logic without waiting; the defaults are what an
     operator gets.
+
+    `verify_environment` is step 1, and it is a parameter for one reason only:
+    the real-money runtime has to reconcile too, and it has to reconcile
+    against *its* broker. It defaults to `verify_paper_environment`, so every
+    existing caller - the CLI, the timers, the crypto and equity paper
+    runtimes - proves paper exactly as it always did and cannot be handed a
+    live client by omission.
+
+    What it deliberately is **not** is a way to skip the check. The parameter's
+    type is a function that must either return or raise, both callers pass one
+    that proves a specific environment, and passing something permissive would
+    be as visible in a diff as deleting the check outright. The alternative -
+    a second copy of this entire pass for real money - would mean two
+    implementations of "reconciliation never places an order", which is the
+    property this module exists to guarantee.
 
     Returns a `ReconciliationResult`. Ask it `safe_to_trade`.
     """
@@ -933,7 +950,7 @@ def reconcile_paper_state(
         return fail(f"no paper trading client could be built: {error}")
 
     try:
-        verify_paper_environment(client)
+        verify_environment(client)
     except ExecutionError as error:
         return fail(str(error))
 

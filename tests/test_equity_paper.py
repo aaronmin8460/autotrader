@@ -339,8 +339,29 @@ def test_a_client_that_does_not_report_itself_a_sandbox_is_rejected() -> None:
         require_paper_account(Ambiguous())
 
 
-def test_the_repository_constructs_exactly_one_trading_client() -> None:
-    """CRITICAL. The structural proof that a live environment is unreachable."""
+#: The ONE module permitted to name the real-money environment.
+#:
+#: Before real money existed this guard needed no exception, and "live is
+#: unexpressible" was the whole statement. It now has exactly one, named here
+#: rather than pattern-matched, so the guard is *stricter* than it was: it
+#: previously could not say how many exceptions there were, and it can now say
+#: there is one and which file it is. A second file saying what that one says
+#: fails these tests.
+LIVE_BOUNDARY = ("execution", "live.py")
+
+
+def _is_live_boundary(path: Path) -> bool:
+    return (path.parent.name, path.name) == LIVE_BOUNDARY
+
+
+def test_the_repository_constructs_exactly_two_trading_clients() -> None:
+    """CRITICAL. One paper factory, one real-money factory, and nothing else.
+
+    The count is the structural proof. Any third construction - a convenience
+    wrapper, a test double promoted into `src`, a second live path for some
+    other product - fails here, which is the property that matters far more
+    than the exact number being two.
+    """
     root = Path(__file__).resolve().parents[1] / "src"
     hits = [
         (path, line)
@@ -348,26 +369,84 @@ def test_the_repository_constructs_exactly_one_trading_client() -> None:
         for line in path.read_text(encoding="utf-8").splitlines()
         if "TradingClient(" in line and "def " not in line and not line.strip().startswith("#")
     ]
-    assert len(hits) == 1, hits
-    assert hits[0][0].name == "paper.py"
-    assert hits[0][0].parent.name == "execution"
+    located = sorted((path.parent.name, path.name) for path, _ in hits)
+    assert located == [("execution", "live.py"), ("execution", "paper.py")], hits
 
 
-def test_no_source_file_names_a_live_endpoint_or_a_paper_false_argument() -> None:
-    """CRITICAL. There is nothing to reject because there is nothing to select.
+def test_only_the_live_boundary_names_the_real_money_environment() -> None:
+    """CRITICAL. The exception is one audited file, and it is bounded by name.
 
-    Docstrings and comments are stripped first. This package's own prose names
-    what it forbids - "``paper=False`` appears nowhere in the package" - so a
-    naive substring scan would trip over the sentence that states the rule.
+    Docstrings and comments are stripped first. Both packages' prose names what
+    they forbid - "``paper=False`` appears nowhere" - so a naive substring scan
+    would trip over the sentence that states the rule.
     """
     from test_runtime import code_without_prose
 
     root = Path(__file__).resolve().parents[1] / "src"
+    exceptions = []
     for path in root.rglob("*.py"):
         code = code_without_prose(path.read_text(encoding="utf-8"))
-        assert "paper=False" not in code, path
-        assert "TRADING_LIVE" not in code, path
+        names_live = "paper=False" in code or "TRADING_LIVE" in code
+        if names_live:
+            exceptions.append(path)
+            assert _is_live_boundary(path), path
+        # The literal hostname is banned everywhere, with no exception at all:
+        # the live boundary takes its URL from the SDK's own enum, so it never
+        # needs to type one.
         assert "api.alpaca.markets" not in code.replace("paper-api.alpaca.markets", ""), path
+    assert [path.name for path in exceptions] == ["live.py"], exceptions
+
+
+def test_the_live_boundary_cannot_submit_cancel_or_transfer() -> None:
+    """CRITICAL. It builds and proves a client. It does not place anything.
+
+    At-most-once lives in exactly one implementation, and a second copy of it
+    for real money would be the most dangerous thing this program could add.
+    The real-money path therefore reaches the broker through the same
+    submission function the paper path does, and this asserts the boundary
+    module contains no route of its own.
+    """
+    from test_runtime import code_without_prose
+
+    from autotrader.execution import live as live_module
+
+    code = code_without_prose(Path(live_module.__file__).read_text(encoding="utf-8"))
+    for forbidden in (
+        "submit_order",
+        "cancel_order",
+        "cancel_orders",
+        "replace_order",
+        "close_position",
+        "close_all_positions",
+        "MarketOrderRequest",
+        "LimitOrderRequest",
+        "transfer",
+        "withdraw",
+    ):
+        assert forbidden not in code, forbidden
+
+
+def test_the_paper_factory_is_untouched_by_the_live_boundary() -> None:
+    """CRITICAL. Nothing on the paper path may import the real-money module."""
+    from test_runtime import code_without_prose
+
+    root = Path(__file__).resolve().parents[1] / "src"
+    for path in root.rglob("*.py"):
+        if _is_live_boundary(path):
+            continue
+        code = code_without_prose(path.read_text(encoding="utf-8"))
+        assert "execution.live" not in code, path
+        assert "create_live_trading_client" not in code, path
+
+
+def test_the_two_environments_read_disjoint_credential_variables() -> None:
+    """CRITICAL. Isolation is a property of the names, not of anybody's care."""
+    from autotrader.execution import live as live_module
+    from autotrader.execution import paper as paper_module
+
+    live_names = {live_module.LIVE_API_KEY_ENV, live_module.LIVE_SECRET_KEY_ENV}
+    paper_names = {paper_module._API_KEY_ENV, paper_module._SECRET_KEY_ENV}
+    assert live_names.isdisjoint(paper_names)
 
 
 def test_the_runtime_config_has_no_field_that_could_select_an_environment() -> None:

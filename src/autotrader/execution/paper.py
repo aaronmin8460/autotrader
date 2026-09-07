@@ -598,6 +598,36 @@ class PaperAccountState:
     trading_blocked: bool
     account_blocked: bool
     trade_suspended_by_user: bool
+    #: The broker's own answer to "how much of that cash can be spent right
+    #: now", or None when it could not be read.
+    #:
+    #: On a **margin** account this is always larger than cash - four times it,
+    #: for the paper account this system has always run against - so
+    #: `spendable_cash` below returns cash unchanged and nothing about the
+    #: validated behaviour moves.
+    #:
+    #: On a **cash** account it can be *smaller*, and that is why the field
+    #: exists. `cash` there includes proceeds from a sale that has not settled
+    #: yet, and buying with unsettled proceeds is a good-faith violation rather
+    #: than a trade. A 15-minute rebalancing strategy sells and buys inside one
+    #: session by design, so this is not a remote edge case for a real-money
+    #: cash account - it is the ordinary Tuesday.
+    buying_power: float | None = None
+
+    @property
+    def spendable_cash(self) -> float:
+        """Cash that can actually fund an entry right now. The tighter figure.
+
+        A `min`, so it can only ever tighten: a margin account is unaffected
+        because its buying power exceeds its cash, and a cash account holding
+        unsettled proceeds is sized against what has settled. An unreadable
+        buying power falls back to cash, which is the pre-existing behaviour
+        and is the right fallback on a margin account; a cash account whose
+        buying power could not be read is caught by the account gate instead.
+        """
+        if self.buying_power is None:
+            return self.cash
+        return min(self.cash, self.buying_power)
 
     @property
     def tradable(self) -> bool:
@@ -685,6 +715,17 @@ def fetch_paper_account_state(client: TradingClient) -> PaperAccountState:
             "a usable account. Refusing to size an order against it."
         )
 
+    # Read defensively and never required. A broker that does not report it
+    # leaves `spendable_cash` equal to cash, which is what every caller got
+    # before this field existed.
+    raw_buying_power = getattr(account, "buying_power", None)
+    try:
+        buying_power = None if raw_buying_power is None else _to_float(raw_buying_power, "bp")
+    except UnsupportedBrokerStateError:
+        buying_power = None
+    if buying_power is not None and buying_power < 0:
+        buying_power = 0.0
+
     status = account.status.value if isinstance(account.status, Enum) else str(account.status)
     return PaperAccountState(
         equity=equity,
@@ -693,6 +734,7 @@ def fetch_paper_account_state(client: TradingClient) -> PaperAccountState:
         trading_blocked=bool(account.trading_blocked),
         account_blocked=bool(account.account_blocked),
         trade_suspended_by_user=bool(account.trade_suspended_by_user),
+        buying_power=buying_power,
     )
 
 
@@ -1130,7 +1172,7 @@ def build_risk_context(
     `RiskContext`               Source
     ==========================  ====================================================
     `equity`                    `TradeAccount.equity`
-    `cash`                      `TradeAccount.cash`
+    `cash`                      ``min(TradeAccount.cash, buying_power)``
     `start_of_day_equity`       the stored UTC-day baseline
     `daily_pnl`                 `equity - baseline`
     `total_exposure`            sum of positive **long** position market values
@@ -1142,6 +1184,16 @@ def build_risk_context(
     `total_exposure` is summed from the positions themselves rather than read
     from `long_market_value`, so the total and the per-symbol figure it must
     contain always come from one source and cannot disagree.
+
+    `cash` is `PaperAccountState.spendable_cash`, which is the tighter of the
+    account's cash and its buying power. On a margin account the two never
+    disagree in the direction that matters - buying power is a multiple of cash
+    - so this is the same number the validated paper path has always used. On a
+    **cash** account they do disagree: cash counts proceeds from an unsettled
+    sale, and spending those is a good-faith violation rather than a purchase.
+    Sizing against the settled figure is the same doctrine as refusing to size
+    against a deposit that has not arrived, applied to a different reason for
+    money not being available yet.
 
     The daily baseline is the **UTC-day** figure, never `TradeAccount.last_equity`:
     that field is an equity-session previous close, and a market that never
@@ -1170,7 +1222,7 @@ def build_risk_context(
     baseline = float(daily_baseline_equity)
     return RiskContext(
         equity=account.equity,
-        cash=max(0.0, account.cash),
+        cash=max(0.0, account.spendable_cash),
         total_exposure=total_exposure,
         symbol_exposure=symbol_exposure,
         current_position_quantity=held.quantity if held is not None else _ZERO,
