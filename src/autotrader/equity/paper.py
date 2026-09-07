@@ -166,6 +166,21 @@ STAGE_C: tuple[str, ...] = EQUITY_SYMBOLS
 
 ROLLOUT_STAGES: Mapping[str, tuple[str, ...]] = {"A": STAGE_A, "B": STAGE_B, "C": STAGE_C}
 
+#: The environment label a target row records. It is an **audit label**, not a
+#: switch: nothing reads it to decide which broker to reach, and the broker is
+#: chosen entirely by which client factory the calling command builds. It exists
+#: so a row in a store can say which kind of money it was about.
+#:
+#: It is deliberately a runtime constructor argument rather than an
+#: `EquityPaperConfig` field. The config is asserted to carry no field that
+#: could select an environment, and that assertion is worth keeping exactly as
+#: it is: the config describes a *strategy* configuration, and the day it also
+#: describes which broker to reach is the day reading it stops telling you
+#: whether real money is involved.
+ENVIRONMENT_PAPER = "PAPER"
+ENVIRONMENT_LIVE = "LIVE"
+KNOWN_ENVIRONMENTS = frozenset({ENVIRONMENT_PAPER, ENVIRONMENT_LIVE})
+
 #: The namespace prefix a paper account number carries. A second, independent
 #: confirmation of the environment: `verify_paper_environment` proves which host
 #: the client will reach, and this proves which account answered.
@@ -367,7 +382,7 @@ CREATE_PAPER_TARGETS = """
         -- before an id exists.
         client_order_id    TEXT UNIQUE,
         engine             TEXT NOT NULL CHECK (engine <> ''),
-        environment        TEXT NOT NULL CHECK (environment = 'PAPER'),
+        environment        TEXT NOT NULL CHECK (environment IN ('PAPER', 'LIVE')),
         sizing_policy      TEXT NOT NULL CHECK (sizing_policy <> ''),
         sizing_config_hash TEXT NOT NULL CHECK (sizing_config_hash <> ''),
         rollout_stage      TEXT NOT NULL CHECK (rollout_stage <> ''),
@@ -767,7 +782,14 @@ class EquityPaperRuntime:
         shutdown: ShutdownRequest | None = None,
         logger: logging.Logger | None = None,
         strategy_run_id: int | None = None,
+        environment: str = ENVIRONMENT_PAPER,
     ) -> None:
+        if environment not in KNOWN_ENVIRONMENTS:
+            raise EquityPaperError(
+                f"Unknown environment label {environment!r}. Known labels: "
+                f"{', '.join(sorted(KNOWN_ENVIRONMENTS))}."
+            )
+        self._environment = environment
         self._connection = connection
         self._config = config
         self._market_data = market_data
@@ -879,7 +901,7 @@ class EquityPaperRuntime:
                 f"{', '.join(PAPER_DECISION_ORDER)}). Sizing policy "
                 f"{policy.policy_id} ({policy.config_hash()[:12]}), per-symbol cap "
                 f"{policy.per_symbol_cap}, total cap {policy.total_cap}. Environment: "
-                "PAPER ONLY."
+                f"{self._environment}."
             ),
         )
         log_event(
@@ -897,7 +919,7 @@ class EquityPaperRuntime:
             lookback_bars=self._config.lookback_bars,
             state_sessions=self._config.state_sessions,
             code_sha=self._config.code_sha,
-            environment="PAPER",
+            environment=self._environment,
         )
 
     def _refresh_safety_heartbeat(self) -> None:
@@ -1813,7 +1835,7 @@ class EquityPaperRuntime:
                 (
                     None,
                     EDA1_ENGINE_VERSION,
-                    "PAPER",
+                    self._environment,
                     policy.policy_id,
                     policy.config_hash(),
                     self._config.stage,
@@ -1873,13 +1895,17 @@ class EquityPaperRuntime:
             message=(
                 f"Equity EDA-1 PAPER cycle at stage {self._config.stage}: {summary}. "
                 f"Sizing policy {self._config.policy.policy_id} "
-                f"({self._config.policy.config_hash()[:12]}). Environment: PAPER ONLY."
+                f"({self._config.policy.config_hash()[:12]}). Environment: "
+                f"{self._environment}."
             ),
         )
 
 
 __all__ = [
+    "ENVIRONMENT_LIVE",
+    "ENVIRONMENT_PAPER",
     "EQUITY_PAPER_LOCK_SCOPE",
+    "KNOWN_ENVIRONMENTS",
     "EVENT_PAPER_CYCLE",
     "EVENT_PAPER_PARITY_MISMATCH",
     "EVENT_PAPER_STARTED",

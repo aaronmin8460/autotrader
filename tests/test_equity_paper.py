@@ -425,17 +425,43 @@ def test_the_live_boundary_cannot_submit_cancel_or_transfer() -> None:
         assert forbidden not in code, forbidden
 
 
-def test_the_paper_factory_is_untouched_by_the_live_boundary() -> None:
-    """CRITICAL. Nothing on the paper path may import the real-money module."""
+#: Every module allowed to reach the real-money boundary, named exhaustively.
+#:
+#: `execution/live.py` is the boundary itself; `equity/live.py` is the
+#: real-money startup sequence, which is the only thing that legitimately needs
+#: it. Both are named rather than pattern-matched, so a third module acquiring
+#: a route to real money fails this test rather than joining a wildcard.
+REAL_MONEY_MODULES = {("execution", "live.py"), ("equity", "live.py")}
+
+
+def test_nothing_on_the_paper_path_can_reach_the_real_money_boundary() -> None:
+    """CRITICAL. The set of modules that can reach real money is closed.
+
+    Asserted as an exact set, in both directions: every importer must be a
+    named real-money module, and the paper modules the validated runtime is
+    built from must not be among them. A test that only checked the second half
+    would pass while the set quietly grew.
+    """
     from test_runtime import code_without_prose
 
     root = Path(__file__).resolve().parents[1] / "src"
+    importers = set()
     for path in root.rglob("*.py"):
-        if _is_live_boundary(path):
-            continue
         code = code_without_prose(path.read_text(encoding="utf-8"))
-        assert "execution.live" not in code, path
-        assert "create_live_trading_client" not in code, path
+        if "execution.live" in code or "create_live_trading_client" in code:
+            importers.add((path.parent.name, path.name))
+    assert importers <= REAL_MONEY_MODULES, importers - REAL_MONEY_MODULES
+
+    for paper_module in (
+        ("execution", "paper.py"),
+        ("execution", "equity.py"),
+        ("equity", "paper.py"),
+        ("equity", "shadow.py"),
+        ("reconciliation", "engine.py"),
+        ("runtime", "runner.py"),
+        ("risk", "engine.py"),
+    ):
+        assert paper_module not in importers, paper_module
 
 
 def test_the_two_environments_read_disjoint_credential_variables() -> None:

@@ -28,6 +28,13 @@ from autotrader.equity.allocation import (
     plan_allocation,
     risk_policy_for,
 )
+from autotrader.equity.live import (
+    ArmedLiveGateway,
+    LiveStartupError,
+    ReconciliationBlockedError,
+    verify_live_startup,
+)
+from autotrader.execution.live import NotLiveEnvironmentError
 from autotrader.execution.models import OrderSide
 from autotrader.execution.paper import (
     AmbiguousSubmissionError,
@@ -35,10 +42,24 @@ from autotrader.execution.paper import (
     DuplicatePreflightUnavailableError,
     ExecutionOutcome,
 )
+from autotrader.live.armstate import (
+    ARM_CONFIRMATION_TOKEN,
+    LIVE_ARMED_ENV,
+    LiveDisarmedError,
+    arm_live_trading,
+    disarm_live_trading,
+)
+from autotrader.live.identity import (
+    LIVE_ACCOUNT_FINGERPRINT_ENV,
+    AccountIdentityError,
+    account_fingerprint,
+)
+from autotrader.reconciliation.models import ReconciliationResult, ReconciliationStatus
 from autotrader.state import sqlite as state
 from autotrader.state.sqlite import connect, initialize_database
 from conftest import establish_account_safety
 from test_equity_execution import (
+    FakeDataClient,
     FakeTradingClient,
     api_error,
     make_account,
@@ -65,8 +86,10 @@ FULLY_FUNDED = "100"
 
 @pytest.fixture(autouse=True)
 def closed_gate_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The submission gate is shut unless a case deliberately opens it."""
+    """Every gate is shut unless a case deliberately opens it."""
     monkeypatch.delenv("AUTOTRADER_PAPER_TRADING_ENABLED", raising=False)
+    monkeypatch.delenv(LIVE_ARMED_ENV, raising=False)
+    monkeypatch.delenv(LIVE_ACCOUNT_FINGERPRINT_ENV, raising=False)
 
 
 @pytest.fixture()
@@ -399,3 +422,221 @@ def test_no_plan_at_any_equity_produces_a_short_or_leverage(equity: str) -> None
         assert item.delta_quantity >= 0
         if item.side is OrderSide.SELL:
             assert item.delta_quantity <= item.actual_quantity
+
+
+# ==========================================================================
+# Startup: the sequence a real-money process must complete before it may trade
+# ==========================================================================
+
+
+class StartupClient(FakeTradingClient):
+    """A client that looks real-money to every structural check.
+
+    `get_orders` is added rather than inherited: the paper fakes never needed
+    one, and the startup sequence reads the open-order list because an order
+    already at the broker is the single most important thing a real-money
+    process can discover about itself before it starts.
+    """
+
+    def __init__(self, open_orders: list | None = None, **kwargs) -> None:
+        kwargs.setdefault("account", make_account(equity="50", cash="50"))
+        super().__init__(base_url="https://api.alpaca.markets", sandbox=False, **kwargs)
+        self._open_orders = open_orders or []
+
+    def get_orders(self, request=None):
+        return list(self._open_orders)
+
+
+def clean_pass(_connection=None, **_kwargs):
+    return ReconciliationResult(
+        status=ReconciliationStatus.CLEAN,
+        started_at=T0,
+        completed_at=T0,
+        issues=(),
+        orders_checked=0,
+        positions_checked=10,
+        symbols=U10,
+        dry_run=False,
+    )
+
+
+def verdict(status: ReconciliationStatus):
+    def _pass(_connection=None, **_kwargs):
+        return ReconciliationResult(
+            status=status,
+            started_at=T0,
+            completed_at=T0,
+            issues=(),
+            orders_checked=0,
+            positions_checked=0,
+            symbols=(),
+            dry_run=False,
+        )
+
+    return _pass
+
+
+@pytest.fixture()
+def pinned(monkeypatch: pytest.MonkeyPatch) -> str:
+    pin = account_fingerprint("PA0000000000")
+    monkeypatch.setenv(LIVE_ACCOUNT_FINGERPRINT_ENV, pin)
+    return pin
+
+
+def test_startup_establishes_the_ceilings_from_the_settled_balance(
+    store: sqlite3.Connection, pinned: str
+) -> None:
+    """CRITICAL. $50 verified means $45 / $47.50 / $50, computed at startup."""
+    report = verify_live_startup(store, StartupClient(), policy=LIVE, now=T0, reconcile=clean_pass)
+    assert report.account_fingerprint == pinned
+    assert report.ceilings.target_gross == Decimal("45.00")
+    assert report.ceilings.hard_gross == Decimal("47.50")
+    assert report.ceilings.exposure_bound == Decimal("50.00")
+    assert report.armed is False
+
+
+@pytest.mark.parametrize("status", [ReconciliationStatus.UNRESOLVED, ReconciliationStatus.FAILED])
+def test_startup_refuses_when_reconciliation_does_not_permit_trading(
+    store: sqlite3.Connection, pinned: str, status: ReconciliationStatus
+) -> None:
+    """CRITICAL. Only CLEAN and REPAIRED are permission."""
+    with pytest.raises(ReconciliationBlockedError, match=status.value):
+        verify_live_startup(store, StartupClient(), policy=LIVE, now=T0, reconcile=verdict(status))
+
+
+def test_startup_accepts_a_repaired_pass(store: sqlite3.Connection, pinned: str) -> None:
+    report = verify_live_startup(
+        store,
+        StartupClient(),
+        policy=LIVE,
+        now=T0,
+        reconcile=verdict(ReconciliationStatus.REPAIRED),
+    )
+    assert report.reconciliation_status == "REPAIRED"
+
+
+def test_startup_refuses_a_paper_client(store: sqlite3.Connection, pinned: str) -> None:
+    """CRITICAL. A real-money runtime handed a paper client must stop."""
+    with pytest.raises(NotLiveEnvironmentError):
+        verify_live_startup(store, FakeTradingClient(), policy=LIVE, now=T0, reconcile=clean_pass)
+
+
+def test_startup_refuses_an_unpinned_runtime(
+    store: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(LIVE_ACCOUNT_FINGERPRINT_ENV, raising=False)
+    with pytest.raises(AccountIdentityError):
+        verify_live_startup(store, StartupClient(), policy=LIVE, now=T0, reconcile=clean_pass)
+
+
+def test_startup_refuses_a_non_tradable_account(store: sqlite3.Connection, pinned: str) -> None:
+    blocked = make_account(equity="50", cash="50")
+    object.__setattr__(blocked, "trading_blocked", True)
+    with pytest.raises(LiveStartupError, match="cannot place orders"):
+        verify_live_startup(
+            store, StartupClient(account=blocked), policy=LIVE, now=T0, reconcile=clean_pass
+        )
+
+
+def test_startup_reports_an_open_order_rather_than_hiding_it(
+    store: sqlite3.Connection, pinned: str
+) -> None:
+    """An order found at startup is surfaced; the cycle guard then blocks BUYs."""
+    client = StartupClient(open_orders=[make_order("autotrader-x", symbol="SPY")])
+    report = verify_live_startup(store, client, policy=LIVE, now=T0, reconcile=clean_pass)
+    assert report.open_order_count == 1
+
+
+def test_startup_completes_while_disarmed(store: sqlite3.Connection, pinned: str) -> None:
+    """CRITICAL. A disarmed runtime must still observe, reconcile and report.
+
+    This is what the read-only soak is: the whole sequence runs, the account is
+    read, reconciliation runs, the ceilings are computed - and the arm switch is
+    reported as off rather than demanded.
+    """
+    report = verify_live_startup(store, StartupClient(), policy=LIVE, now=T0, reconcile=clean_pass)
+    assert report.armed is False
+    assert report.reconciliation_status == "CLEAN"
+
+
+# ==========================================================================
+# The armed gateway: the switch is asked per order, not per process
+# ==========================================================================
+
+
+def test_a_disarmed_gateway_never_reaches_the_broker(
+    store: sqlite3.Connection, gate: None, pinned: str
+) -> None:
+    """CRITICAL. DISARMED means zero broker mutation calls."""
+    client = StartupClient()
+    gateway = ArmedLiveGateway(trading_client=client, data_client=FakeDataClient(10.0), policy=LIVE)
+    with pytest.raises(LiveDisarmedError):
+        gateway.execute(
+            store,
+            symbol="SPY",
+            side=OrderSide.BUY,
+            requested_quantity=Decimal("0.4"),
+            now=T0,
+            strategy_run_id=None,
+        )
+    assert client.submit_calls == []
+    assert state.list_order_intents(store) == []
+
+
+def test_an_armed_gateway_against_the_wrong_account_never_reaches_the_broker(
+    store: sqlite3.Connection,
+    gate: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CRITICAL. Armed against the wrong account is not permission."""
+    monkeypatch.setenv(LIVE_ACCOUNT_FINGERPRINT_ENV, "0" * 32)
+    monkeypatch.setenv(LIVE_ARMED_ENV, "true")
+    arm_live_trading(store, now=T0, reason="test", confirmation=ARM_CONFIRMATION_TOKEN)
+    client = StartupClient()
+    gateway = ArmedLiveGateway(trading_client=client, data_client=FakeDataClient(10.0), policy=LIVE)
+    with pytest.raises(AccountIdentityError):
+        gateway.execute(
+            store,
+            symbol="SPY",
+            side=OrderSide.BUY,
+            requested_quantity=Decimal("0.4"),
+            now=T0,
+            strategy_run_id=None,
+        )
+    assert client.submit_calls == []
+
+
+def test_disarming_mid_session_stops_the_very_next_order(
+    store: sqlite3.Connection,
+    gate: None,
+    pinned: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CRITICAL. A switch that waited for a restart would not be a kill switch."""
+    monkeypatch.setenv(LIVE_ARMED_ENV, "true")
+    arm_live_trading(store, now=T0, reason="first day", confirmation=ARM_CONFIRMATION_TOKEN)
+    client = StartupClient()
+    gateway = ArmedLiveGateway(trading_client=client, data_client=FakeDataClient(10.0), policy=LIVE)
+
+    first = gateway.execute(
+        store,
+        symbol="SPY",
+        side=OrderSide.BUY,
+        requested_quantity=Decimal("0.4"),
+        now=T0,
+        strategy_run_id=None,
+    )
+    assert first.outcome is ExecutionOutcome.SUBMITTED
+    assert len(client.submit_calls) == 1
+
+    disarm_live_trading(store, now=T0, reason="operator saw something odd")
+    with pytest.raises(LiveDisarmedError):
+        gateway.execute(
+            store,
+            symbol="QQQ",
+            side=OrderSide.BUY,
+            requested_quantity=Decimal("0.4"),
+            now=T0,
+            strategy_run_id=None,
+        )
+    assert len(client.submit_calls) == 1  # unchanged
