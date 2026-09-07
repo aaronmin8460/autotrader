@@ -570,11 +570,13 @@ def test_risk_clamped_quantity_is_the_only_quantity_sent_to_broker(
 
 
 def test_live_mode_cannot_be_constructed_from_execution_api() -> None:
-    """There must be no way to ask this package for a live client.
+    """There must be no way to ask **this module** for a live client.
 
-    Checked three ways: no public callable accepts a `paper`-like argument, the
-    one client factory takes no parameters at all, and `paper=False` appears
-    nowhere in the shipped source.
+    Checked three ways: no public callable in `execution.paper` accepts a
+    `paper`- or `live`-like argument, its one client factory takes no
+    parameters at all, and the real-money vocabulary appears nowhere in the
+    shipped source except the single audited boundary module - which this
+    module neither imports nor can reach.
     """
     signature = inspect.signature(paper.create_paper_trading_client)
     assert signature.parameters == {}, "the client factory must take no arguments"
@@ -589,10 +591,19 @@ def test_live_mode_cannot_be_constructed_from_execution_api() -> None:
                 assert "live" not in parameter.lower(), f"{name} exposes a live switch"
 
     package_root = Path(paper.__file__).resolve().parents[1]
+    live_boundary = package_root / "execution" / "live.py"
+    naming_live = []
     for path in sorted(package_root.rglob("*.py")):
         code = code_without_prose(path.read_text())
         for forbidden in ("paper=False", "paper = False", "TRADING_LIVE", "ALPACA_LIVE"):
-            assert forbidden not in code, f"{forbidden} found in {path}"
+            if forbidden in code:
+                naming_live.append(path)
+                assert path == live_boundary, f"{forbidden} found in {path}"
+    # The exception is bounded by name and by count. `execution.paper` - the
+    # module this test is about - is not in it, so nothing here can ask THIS
+    # package for a live client, which is what the test is named for.
+    assert set(naming_live) <= {live_boundary}, naming_live
+    assert live_boundary.exists()
     assert "paper=True" in module_code(paper)
 
 

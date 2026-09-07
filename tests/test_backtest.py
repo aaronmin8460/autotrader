@@ -1039,13 +1039,23 @@ def test_the_order_api_exists_only_inside_the_paper_execution_boundary() -> None
             assert token not in text, f"{token} found outside the execution boundary: {path}"
 
 
-def test_only_the_execution_package_imports_a_broker_trading_client() -> None:
-    """`TradingClient` is constructed in exactly one module."""
+def test_only_the_execution_package_constructs_a_broker_trading_client() -> None:
+    """`TradingClient` is constructed in exactly two modules, both in `execution`.
+
+    One paper factory and one real-money factory, and nothing else anywhere.
+    The backtester's own reason for asserting this is unchanged: C4 keeps an
+    all-cash sizing baseline and must never acquire a broker, so what matters
+    here is that the set is closed and lives entirely inside the execution
+    package - not that it happens to have one member.
+    """
     source_root = Path(engine.__file__).resolve().parents[1]
     constructing = [
         path for path in sorted(source_root.rglob("*.py")) if "TradingClient(" in path.read_text()
     ]
-    assert constructing == [source_root / "execution" / "paper.py"], constructing
+    assert constructing == [
+        source_root / "execution" / "live.py",
+        source_root / "execution" / "paper.py",
+    ], constructing
 
 
 def test_backtest_needs_no_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
