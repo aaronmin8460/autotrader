@@ -406,9 +406,8 @@ def test_the_live_boundary_cannot_submit_cancel_or_transfer() -> None:
     submission function the paper path does, and this asserts the boundary
     module contains no route of its own.
     """
-    from test_runtime import code_without_prose
-
     from autotrader.execution import live as live_module
+    from test_runtime import code_without_prose
 
     code = code_without_prose(Path(live_module.__file__).read_text(encoding="utf-8"))
     for forbidden in (
