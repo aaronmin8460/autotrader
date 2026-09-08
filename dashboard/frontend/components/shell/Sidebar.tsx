@@ -3,14 +3,17 @@
 /**
  * The left navigation: a LEVEL 2 floating rail, collapsible to icons.
  *
- * Eight destinations, two of them nested under Strategies. The nesting is the
- * information architecture, not decoration: Equity Paper and Shadows are two
- * views of the same question — what is deployed, and what only watches — and
- * a strategy that grew a top-level tab of its own is how a navigation stops
- * being a navigation.
+ * Nine destinations, three of them nested under Strategies. The nesting is the
+ * information architecture, not decoration: Equity Paper, Live and Shadows are
+ * three views of the same question — what is deployed against real money, what
+ * is deployed against paper, and what only watches — and a strategy that grew a
+ * top-level tab of its own is how a navigation stops being a navigation.
  *
- * Shadows carries the violet accent wherever it appears, including here, so
- * the observation boundary is visible before the page loads.
+ * Two accents survive collapse, so both boundaries are visible before the page
+ * loads: Shadows is violet wherever it appears, and **Live is amber**, the only
+ * destination in the rail where an order can reach a real broker. Neither
+ * accent is the message — every item prints its name, and Live additionally
+ * carries a REAL MONEY tag whenever the rail is expanded.
  *
  * Collapsed, every item keeps its accessible name and its tooltip; the icon is
  * never the only label.
@@ -26,6 +29,7 @@ import { navCollapsedPref } from "@/lib/prefs";
 import { cn } from "../ui";
 import {
   CollapseIcon,
+  LiveIcon,
   OrdersIcon,
   OverviewIcon,
   PaperIcon,
@@ -42,6 +46,7 @@ const ICONS: Record<SectionKey, () => React.JSX.Element> = {
   portfolio: PortfolioIcon,
   strategies: StrategiesIcon,
   equityPaper: PaperIcon,
+  live: LiveIcon,
   shadows: ShadowIcon,
   orders: OrdersIcon,
   risk: RiskIcon,
@@ -98,11 +103,18 @@ export function Sidebar() {
                     isActive
                       ? item.observe
                         ? "bg-surface-3 text-observe"
-                        : "bg-surface-3 text-ink"
+                        : item.live
+                          ? "bg-surface-3 text-warn"
+                          : "bg-surface-3 text-ink"
                       : "text-ink-3 hover:bg-surface-2 hover:text-ink-2",
                   )}
                 >
-                  <span className={cn(item.observe && !isActive && "text-observe/70")}>
+                  <span
+                    className={cn(
+                      item.observe && !isActive && "text-observe/70",
+                      item.live && !isActive && "text-warn/70",
+                    )}
+                  >
                     <Icon />
                   </span>
                   {collapsed ? (
@@ -110,12 +122,22 @@ export function Sidebar() {
                   ) : (
                     <span className="truncate text-table font-medium">{label}</span>
                   )}
+                  {item.live && !collapsed ? (
+                    <span
+                      className={cn(
+                        "shrink-0 rounded-xs px-1 py-px text-[9px] leading-none font-semibold",
+                        "tracking-[0.06em] uppercase text-warn ring-1 ring-warn/40",
+                      )}
+                    >
+                      {t("live.realMoney")}
+                    </span>
+                  ) : null}
                   {isActive && !collapsed ? (
                     <span
                       aria-hidden
                       className={cn(
                         "ms-auto h-3.5 w-[2px] rounded-full",
-                        item.observe ? "bg-observe" : "bg-accent",
+                        item.observe ? "bg-observe" : item.live ? "bg-warn" : "bg-accent",
                       )}
                     />
                   ) : null}

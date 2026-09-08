@@ -64,6 +64,19 @@ export function StrategiesIcon() {
   );
 }
 
+/**
+ * Live. A filled dot inside a ring: the only solid glyph in the rail, because
+ * it is the only destination where an order reaches real money.
+ */
+export function LiveIcon() {
+  return (
+    <Glyph>
+      <circle cx="8" cy="8" r="6" />
+      <circle cx="8" cy="8" r="2.25" fill="currentColor" stroke="none" />
+    </Glyph>
+  );
+}
+
 export function OrdersIcon() {
   return (
     <Glyph>

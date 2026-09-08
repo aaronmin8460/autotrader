@@ -58,6 +58,46 @@ test("no required Korean string is still the English one", () => {
     "risk.status.unavailable",
     "shadows.parityNA",
     "sd.codeSha",
+    // ---- LIVE ----------------------------------------------------------
+    // Environment names and canonical machine states. Translating any of
+    // these would change what the dashboard claims: ARMED and DISARMED are
+    // the literal values of the durable arm switch, the service words are the
+    // five states the unit reports, and the identity and guard words are
+    // status codes the backend emits. Where a Korean reader needs help, the
+    // explanatory sentence beside the code IS translated - see
+    // `live.arm.disarmedIsSafe`, `live.service.notInstalledIsExpected` and
+    // `live.guard.exitsAvailable`.
+    "nav.live",
+    "live.title",
+    "live.ready.yes",
+    "live.ready.no",
+    "live.arm.armed",
+    "live.arm.disarmed",
+    "live.withdrawal.on",
+    "live.withdrawal.off",
+    "live.identity.pinned",
+    "live.identity.notPinned",
+    "live.identity.mismatch",
+    "live.identity.unknown",
+    "live.service.notInstalled",
+    "live.service.disabled",
+    "live.service.stopped",
+    "live.service.running",
+    "live.service.unknown",
+    "live.guard.inactive",
+    "live.guard.unknown",
+    "live.status.unknown",
+    "env.live",
+    "env.paper",
+    // The frozen accounting contract names one concept one way and calls a
+    // second name for it "a defect, not a convenience". Profit Reserve and
+    // Trading Cash Reserve are those names, and the whole point of the pair is
+    // that a reader can tell them apart - which a translation would undo.
+    // OBSERVE ONLY is the literal `withdrawal_mode`.
+    "live.reserve",
+    "live.reserve.observeOnly",
+    "live.reserve.tradingCashReserve",
+    "live.reserve.profitReserve",
   ]);
   const untranslated: string[] = [];
   for (const [key, value] of Object.entries(ko)) {

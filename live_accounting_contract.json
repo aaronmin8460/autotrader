@@ -1,0 +1,464 @@
+{
+  "contract": "LIVE_ACCOUNTING_API_CONTRACT",
+  "contract_version": "1.0.0",
+  "frozen": true,
+  "base_sha": "fd6cae4a2ef1f92ec5e6133774a12f847c139e41",
+  "route": "/api/live-accounting/summary",
+  "methods_allowed": [
+    "GET",
+    "HEAD"
+  ],
+  "money_representation": "exact decimal strings, never floats, never exponent notation",
+  "timestamp_representation": "ISO 8601 with an explicit UTC offset",
+  "canonical_naming_rule": "One canonical name per concept. flow_adjusted_equity is THE name for broker equity net of external flows; adjusted_equity, performance_equity and normalized_equity are forbidden as aliases in backend, API and frontend alike.",
+  "terminology_warning": "profit_reserve_* is ACCOUNTING ONLY and is not the EDA-1 cash reserve. The EDA-1 cash reserve is trading liquidity held back by the allocation policy (10% at target, 5% further to the hard cap) and it changes position sizing. The Profit Reserve changes nothing: it is a notional earmark against future withdrawal. No field in this contract is an input to any sizing, risk or trading decision.",
+  "fields": [
+    {
+      "name": "contract_version",
+      "type": "string",
+      "nullable": false,
+      "units": "none",
+      "authoritative_source": "this contract file",
+      "calculation": "The frozen contract version. Bumping it is a deliberate act, never a side effect of an implementation change."
+    },
+    {
+      "name": "generated_at",
+      "type": "iso8601_utc",
+      "nullable": false,
+      "units": "instant",
+      "authoritative_source": "the reading process clock",
+      "calculation": "When this payload was assembled. Not a data timestamp; see data_freshness.",
+      "timestamp_semantics": "UTC, second resolution or finer"
+    },
+    {
+      "name": "account_fingerprint",
+      "type": "string",
+      "nullable": false,
+      "units": "32 hex chars",
+      "authoritative_source": "autotrader.live.identity.account_fingerprint",
+      "calculation": "SHA-256 of the broker account number, first 32 hex characters. Every field in this payload is scoped to this one account. A payload whose fingerprint does not match the pin must be discarded, not displayed."
+    },
+    {
+      "name": "environment",
+      "type": "string",
+      "nullable": false,
+      "units": "enum LIVE",
+      "authoritative_source": "the accounting store metadata",
+      "calculation": "Always the literal LIVE. This contract describes the real-money book only; Paper has its own, separate accounting and is never aggregated into these figures."
+    },
+    {
+      "name": "accounting_inception_at",
+      "type": "iso8601_utc",
+      "nullable": true,
+      "units": "instant",
+      "authoritative_source": "live_accounting_state.inception_at",
+      "calculation": "The instant the accounting baseline was frozen. Every 'since inception' figure is measured from here. NULL before inception is established, and in that state accounting_status is NOT_INITIALIZED and every derived money field is NULL.",
+      "timestamp_semantics": "UTC. Flows at exactly this instant are PRE_INCEPTION (the boundary is exclusive on the later side: a flow counts only if strictly after)."
+    },
+    {
+      "name": "baseline_equity",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "broker equity at the inception snapshot",
+      "calculation": "Opening CAPITAL. Not profit, and never re-counted as a deposit. Frozen once; a change requires an explicit documented rebuild."
+    },
+    {
+      "name": "baseline_cash",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "broker cash at the inception snapshot",
+      "calculation": "Recorded for audit. No derived figure depends on it."
+    },
+    {
+      "name": "current_broker_equity",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "broker GET /account equity",
+      "calculation": "What the broker reported at the last checkpoint. NULL when the broker could not be read; accounting_status is then BROKER_UNAVAILABLE and no downstream figure is fabricated."
+    },
+    {
+      "name": "current_cash",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "broker GET /account cash",
+      "calculation": "Total cash the broker reports. On a cash account this includes unsettled sale proceeds and is NOT withdrawable cash."
+    },
+    {
+      "name": "broker_withdrawable_cash",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "none available on this API",
+      "calculation": "Authoritatively withdrawable settled cash. This broker's Trading API exposes no such field, so this is ALWAYS NULL and broker_withdrawable_cash_status says why. It is never inferred from cash, buying_power or equity."
+    },
+    {
+      "name": "broker_withdrawable_cash_status",
+      "type": "string",
+      "nullable": false,
+      "units": "enum",
+      "authoritative_source": "this implementation",
+      "calculation": "One of VERIFIED, NOT_EXPOSED_BY_BROKER, UNKNOWN. Today it is NOT_EXPOSED_BY_BROKER."
+    },
+    {
+      "name": "confirmed_deposits",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "external_cash_flows, classified EXTERNAL_DEPOSIT",
+      "calculation": "Sum of confirmed external deposits with settle_at strictly after accounting_inception_at. Excludes the flow that delivered baseline_equity. Excludes anything pending, and anything classified UNKNOWN_EXTERNAL_FLOW."
+    },
+    {
+      "name": "confirmed_withdrawals",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "external_cash_flows, classified EXTERNAL_WITHDRAWAL",
+      "calculation": "Sum of confirmed external withdrawals since inception, as a POSITIVE magnitude."
+    },
+    {
+      "name": "net_external_flows",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "derived",
+      "calculation": "confirmed_deposits - confirmed_withdrawals. Signed: positive means capital was added on net."
+    },
+    {
+      "name": "pending_flows_excluded_count",
+      "type": "integer",
+      "nullable": false,
+      "units": "count",
+      "authoritative_source": "external_cash_flows, status not confirmed",
+      "calculation": "How many broker activities were seen but are not yet confirmed under the accepted rule. They have ZERO accounting effect. Operator expectation is never a source."
+    },
+    {
+      "name": "unknown_external_flow_count",
+      "type": "integer",
+      "nullable": false,
+      "units": "count",
+      "authoritative_source": "external_cash_flows, classified UNKNOWN_EXTERNAL_FLOW",
+      "calculation": "How many activities could not be classified safely. Any value above zero forces accounting_status = UNKNOWN_EXTERNAL_FLOW and suppresses the reserve, bucket and preview figures. Fail closed."
+    },
+    {
+      "name": "last_external_flow_at",
+      "type": "iso8601_utc",
+      "nullable": true,
+      "units": "instant",
+      "authoritative_source": "external_cash_flows max settle_at",
+      "calculation": "Settle time of the most recent CONFIRMED external flow since inception. NULL when there is none.",
+      "timestamp_semantics": "UTC, the broker's own transaction time."
+    },
+    {
+      "name": "flow_adjusted_equity",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "derived",
+      "calculation": "current_broker_equity - net_external_flows. THE canonical name for this concept. There is no adjusted_equity, performance_equity or normalized_equity anywhere in this system; a second name for this number is a defect."
+    },
+    {
+      "name": "trading_pnl_since_inception",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "derived",
+      "calculation": "flow_adjusted_equity - baseline_equity. Invariant: unchanged by any deposit and by any withdrawal."
+    },
+    {
+      "name": "realized_pnl",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "the existing realized-P&L accounting ledger",
+      "calculation": "Net realized P&L since inception, from the authoritative weighted-average-cost ledger. This contract consumes that ledger; it does not reimplement it. NULL when the ledger is unreadable or its reconciliation verdict is not trustworthy."
+    },
+    {
+      "name": "unrealized_pnl",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "broker position unrealized P&L",
+      "calculation": "Mark-to-market on open positions. NULL when positions could not be read."
+    },
+    {
+      "name": "realized_pnl_basis_status",
+      "type": "string",
+      "nullable": true,
+      "units": "enum",
+      "authoritative_source": "accounting_reconciliation_runs",
+      "calculation": "The realized ledger's own verdict, surfaced rather than hidden: CLEAN, BASIS_DIVERGENCE, DEGRADED, MISMATCH, UNKNOWN. BASIS_DIVERGENCE means the broker relieved different lots than the ledger did; realized_pnl is still a real number but its split against unrealized differs from the broker's."
+    },
+    {
+      "name": "time_weighted_return",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "ratio",
+      "authoritative_source": "derived from the checkpoint chain",
+      "calculation": "Flow-neutral return since inception, as a ratio (0.06 means +6%). Sub-period returns are chained; each sub-period containing a confirmed flow is bounded conservatively. See twr_convention. External flows cannot mechanically move this figure."
+    },
+    {
+      "name": "twr_convention",
+      "type": "string",
+      "nullable": false,
+      "units": "enum",
+      "authoritative_source": "this implementation",
+      "calculation": "Always CONSERVATIVE_MIN. For a sub-period from equity B to equity E containing net confirmed flow F, the sub-period return is min((E-F)/B - 1, E/(B+F) - 1): the lower of the flow-at-end and flow-at-start endpoint assumptions. With F=0 both limbs are equal and this is the ordinary return. With zero market movement both limbs are exactly zero, so a flow alone never moves TWR. The lower limb is taken because a deposit flatters the flow-at-end limb and a withdrawal flatters the flow-at-start limb, and this program refuses to be flattered by either."
+    },
+    {
+      "name": "twr_subperiods",
+      "type": "integer",
+      "nullable": false,
+      "units": "count",
+      "authoritative_source": "derived",
+      "calculation": "How many sub-periods the chain was built from. One per interval between consecutive checkpoints."
+    },
+    {
+      "name": "twr_bounded_subperiods",
+      "type": "integer",
+      "nullable": false,
+      "units": "count",
+      "authoritative_source": "derived",
+      "calculation": "How many of those sub-periods contained a confirmed flow and were therefore bounded rather than measured exactly. Zero means TWR is exact."
+    },
+    {
+      "name": "adjusted_equity_hwm",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "performance_checkpoints, DAILY_CLOSE only",
+      "calculation": "The maximum flow_adjusted_equity over AUTHORITATIVE completed-day checkpoints, floored at baseline_equity. Intraday prints never raise it. A deposit cannot raise it, because it is a maximum of a flow-adjusted quantity."
+    },
+    {
+      "name": "adjusted_equity_hwm_at",
+      "type": "iso8601_utc",
+      "nullable": true,
+      "units": "instant",
+      "authoritative_source": "performance_checkpoints",
+      "calculation": "The completed-day checkpoint that set the current HWM.",
+      "timestamp_semantics": "UTC"
+    },
+    {
+      "name": "observed_intraday_peak",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "performance_checkpoints, any kind",
+      "calculation": "The highest flow_adjusted_equity ever observed including intraday reads. INFORMATIONAL ONLY. No reserve, bucket or preview figure may be derived from it."
+    },
+    {
+      "name": "current_drawdown_from_adjusted_hwm",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "ratio",
+      "authoritative_source": "derived",
+      "calculation": "flow_adjusted_equity / adjusted_equity_hwm - 1. Zero or negative. Deposits and withdrawals can neither create nor erase it."
+    },
+    {
+      "name": "profit_reserve_policy_id",
+      "type": "string",
+      "nullable": false,
+      "units": "identity",
+      "authoritative_source": "the frozen reserve policy",
+      "calculation": "Always PROFIT_RESERVE_OBSERVE_V1 for the first month."
+    },
+    {
+      "name": "profit_reserve_policy_hash",
+      "type": "string",
+      "nullable": false,
+      "units": "sha256 hex",
+      "authoritative_source": "canonical JSON of the reserve policy",
+      "calculation": "Digest of the reserve policy parameter set. A changed rate changes this hash."
+    },
+    {
+      "name": "profit_reserve_rate",
+      "type": "decimal_string",
+      "nullable": false,
+      "units": "ratio",
+      "authoritative_source": "the frozen reserve policy",
+      "calculation": "0.20 \u2014 a PROVISIONAL first-month observation rate, not a permanent investment decision. Prompt 4 revisits it."
+    },
+    {
+      "name": "new_hwm_profit",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "derived at the last authoritative checkpoint",
+      "calculation": "max(0, flow_adjusted_equity - prior reserve HWM) at the most recent completed-day checkpoint. Deposits do not increase it; withdrawals do not decrease it; only account performance above the prior HWM creates it."
+    },
+    {
+      "name": "profit_reserve_accrued",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "profit_reserve_events, summed",
+      "calculation": "Lifetime sum of reserve accruals: profit_reserve_rate x new_hwm_profit at each new authoritative HWM. An ACCOUNTING ALLOCATION ONLY. No money moved and no broker cash was segregated.",
+      "observe_only_semantics": "Accrual continues under OBSERVE_ONLY. It confers no entitlement and triggers nothing."
+    },
+    {
+      "name": "withdrawal_bucket_balance",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "derived from profit_reserve_events and allocated withdrawals",
+      "calculation": "prior bucket + accruals - withdrawals allocated against it. Floored at zero, never negative. A VIRTUAL ledger line: not a bank account, not broker-segregated cash, and it does not reduce trading capital.",
+      "observe_only_semantics": "Recorded but never actionable during OBSERVE_ONLY."
+    },
+    {
+      "name": "unreserved_withdrawal_total",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "derived",
+      "calculation": "Lifetime sum of the portion of confirmed withdrawals that exceeded the bucket at the time they settled. Flagged rather than absorbed: it means capital, not harvested profit, left the account."
+    },
+    {
+      "name": "withdrawal_preview",
+      "type": "decimal_string",
+      "nullable": true,
+      "units": "USD",
+      "authoritative_source": "derived",
+      "calculation": "INFORMATIONAL. The bucket balance when harvest_eligible is true AND flow_adjusted_equity is at or above adjusted_equity_hwm; otherwise 0. Not a guaranteed broker-transferable amount, and explicitly not a claim that the broker would settle it.",
+      "observe_only_semantics": "Display only. It is never an instruction and never an authorization."
+    },
+    {
+      "name": "harvest_eligible",
+      "type": "boolean",
+      "nullable": false,
+      "units": "none",
+      "authoritative_source": "derived",
+      "calculation": "Whether a completed monthly checkpoint has occurred since the last harvest. Reserve accrual is continuous; harvest eligibility is monthly. This system produces no daily transfer recommendation."
+    },
+    {
+      "name": "next_harvest_checkpoint_at",
+      "type": "iso8601_utc",
+      "nullable": true,
+      "units": "instant",
+      "authoritative_source": "derived",
+      "calculation": "The end of the current UTC month, which is the earliest instant harvest_eligible could next become true.",
+      "timestamp_semantics": "UTC"
+    },
+    {
+      "name": "withdrawal_authorized",
+      "type": "boolean",
+      "nullable": false,
+      "units": "none",
+      "authoritative_source": "the frozen reserve policy",
+      "calculation": "ALWAYS FALSE during the first-month validation.",
+      "observe_only_semantics": "Hard-coded false under OBSERVE_ONLY. Not a computed value that could become true."
+    },
+    {
+      "name": "authorized_withdrawal_amount",
+      "type": "decimal_string",
+      "nullable": false,
+      "units": "USD",
+      "authoritative_source": "the frozen reserve policy",
+      "calculation": "ALWAYS 0 during the first-month validation.",
+      "observe_only_semantics": "Hard-coded zero under OBSERVE_ONLY."
+    },
+    {
+      "name": "withdrawal_mode",
+      "type": "string",
+      "nullable": false,
+      "units": "enum",
+      "authoritative_source": "the frozen reserve policy",
+      "calculation": "Always OBSERVE_ONLY.",
+      "observe_only_semantics": "The only value this build can emit. No code path sets any other."
+    },
+    {
+      "name": "automatic_transfer_enabled",
+      "type": "boolean",
+      "nullable": false,
+      "units": "none",
+      "authoritative_source": "the frozen reserve policy",
+      "calculation": "ALWAYS FALSE. No ACH, wire, transfer, scheduling or broker withdrawal call exists in this package, and the broker's Trading API exposes no transfer endpoint to call.",
+      "observe_only_semantics": "False structurally, not by configuration."
+    },
+    {
+      "name": "last_accounting_checkpoint_at",
+      "type": "iso8601_utc",
+      "nullable": true,
+      "units": "instant",
+      "authoritative_source": "performance_checkpoints max taken_at",
+      "calculation": "When the accounting layer last recorded broker truth.",
+      "timestamp_semantics": "UTC"
+    },
+    {
+      "name": "last_completed_day_checkpoint_at",
+      "type": "iso8601_utc",
+      "nullable": true,
+      "units": "instant",
+      "authoritative_source": "performance_checkpoints, DAILY_CLOSE",
+      "calculation": "The most recent AUTHORITATIVE checkpoint. HWM, reserve and harvest all key off this, never off an intraday read.",
+      "timestamp_semantics": "UTC"
+    },
+    {
+      "name": "accounting_status",
+      "type": "string",
+      "nullable": false,
+      "units": "enum",
+      "authoritative_source": "derived",
+      "calculation": "One of NOT_INITIALIZED, CLEAN, STALE, UNKNOWN_EXTERNAL_FLOW, REBUILD_REQUIRED, BROKER_UNAVAILABLE, ACCOUNT_MISMATCH. Anything other than CLEAN means the derived figures are suppressed to NULL rather than shown as precise wrong numbers."
+    },
+    {
+      "name": "accounting_status_detail",
+      "type": "string",
+      "nullable": true,
+      "units": "none",
+      "authoritative_source": "derived",
+      "calculation": "A sentence an operator can act on. NULL when status is CLEAN."
+    },
+    {
+      "name": "data_freshness_seconds",
+      "type": "integer",
+      "nullable": true,
+      "units": "seconds",
+      "authoritative_source": "derived",
+      "calculation": "generated_at minus last_accounting_checkpoint_at. NULL before the first checkpoint."
+    },
+    {
+      "name": "data_freshness",
+      "type": "string",
+      "nullable": false,
+      "units": "enum",
+      "authoritative_source": "derived",
+      "calculation": "FRESH, STALE or UNKNOWN. STALE past the staleness horizon; the horizon is stated in the contract document."
+    },
+    {
+      "name": "rebuild_count",
+      "type": "integer",
+      "nullable": false,
+      "units": "count",
+      "authoritative_source": "live_accounting_state",
+      "calculation": "How many times derived state has been deterministically rebuilt from the ledger, e.g. because a backdated flow arrived. A rebuild is recorded, never silent."
+    },
+    {
+      "name": "last_rebuild_at",
+      "type": "iso8601_utc",
+      "nullable": true,
+      "units": "instant",
+      "authoritative_source": "live_accounting_state",
+      "calculation": "When the last rebuild happened. NULL when there has never been one.",
+      "timestamp_semantics": "UTC"
+    },
+    {
+      "name": "live_ready",
+      "type": "boolean",
+      "nullable": true,
+      "units": "none",
+      "authoritative_source": "Prompt-1 Live safety state",
+      "calculation": "Passed through from the Prompt-1 startup report. This package NEVER computes or influences it. NULL when the safety state could not be read."
+    },
+    {
+      "name": "live_armed",
+      "type": "boolean",
+      "nullable": true,
+      "units": "none",
+      "authoritative_source": "Prompt-1 durable arm row and environment gate",
+      "calculation": "Passed through from the Prompt-1 arm state. This package NEVER computes, sets or clears it. NULL when it could not be read; a NULL is displayed as unknown, never as false."
+    }
+  ]
+}

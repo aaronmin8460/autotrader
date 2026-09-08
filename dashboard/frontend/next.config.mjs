@@ -1,15 +1,19 @@
 /**
  * The dashboard frontend never talks to an API cross-origin.
  *
- * Five API prefixes are rewritten to five loopback FastAPI processes, so the
+ * Seven API prefixes are rewritten to seven loopback FastAPI processes, so the
  * browser only ever sees one origin. That removes the need for a CORS policy
  * entirely - and a CORS policy is a thing you can get wrong, on APIs that have
  * no authentication in front of them.
  *
- * **Five upstreams, deliberately.** They are separate processes, running as
+ * **Seven upstreams, deliberately.** They are separate processes, running as
  * separate users, reading separate records - and one of those records is at a
  * different schema version from the others, which is why "separate" here is
- * enforced by the kernel rather than by convention:
+ * enforced by the kernel rather than by convention. The last two are real
+ * money, and their separation matters most: a paper credential and a
+ * real-money credential must never sit in one process, and keeping them on
+ * different ports makes "which account is this figure from" a question about a
+ * port rather than about a code path:
  *
  *   /api/dashboard/*          :8000  the trading database and the broker
  *                                    account, as the trading service identity
@@ -23,9 +27,18 @@
  *                                    one identity that can read it
  *   /api/market-charts/*      :8004  provider bars for the charts and nothing
  *                                    else; opens no record at all
+ *   /api/live-accounting/*    :8005  REAL MONEY. The frozen accounting
+ *                                    contract: flows, flow-adjusted equity,
+ *                                    the high-water mark, the profit reserve
+ *                                    and the withdrawal bucket
+ *   /api/live-safety/*        :8006  REAL MONEY. The arm switch, the account
+ *                                    pin and the enforced exposure ceilings
  *
- * All five rewrites are still GET-only at the edge: Caddy answers 405 to any
- * method other than GET or HEAD before any upstream is reached.
+ * All seven rewrites are still GET-only at the edge: Caddy answers 405 to any
+ * method other than GET or HEAD before any upstream is reached. Neither
+ * real-money service defines a write route to reach in the first place: both
+ * declare `ALLOWED_METHODS = {GET, HEAD}` and both assert it against their own
+ * assembled route table.
  *
  * The `*_API_ORIGIN` variables exist only to move the ports. They are read at
  * build and server start, never shipped to the browser, and none is
@@ -36,6 +49,9 @@ const shadowApiOrigin = process.env.EQUITY_SHADOW_API_ORIGIN ?? "http://127.0.0.
 const paperApiOrigin = process.env.EQUITY_PAPER_API_ORIGIN ?? "http://127.0.0.1:8002";
 const a1bApiOrigin = process.env.EQUITY_A1B_SHADOW_API_ORIGIN ?? "http://127.0.0.1:8003";
 const chartsApiOrigin = process.env.MARKET_CHARTS_API_ORIGIN ?? "http://127.0.0.1:8004";
+const liveAccountingApiOrigin =
+  process.env.LIVE_ACCOUNTING_API_ORIGIN ?? "http://127.0.0.1:8005";
+const liveSafetyApiOrigin = process.env.LIVE_SAFETY_API_ORIGIN ?? "http://127.0.0.1:8006";
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -61,6 +77,14 @@ const nextConfig = {
       {
         source: "/api/market-charts/:path*",
         destination: `${chartsApiOrigin}/api/market-charts/:path*`,
+      },
+      {
+        source: "/api/live-accounting/:path*",
+        destination: `${liveAccountingApiOrigin}/api/live-accounting/:path*`,
+      },
+      {
+        source: "/api/live-safety/:path*",
+        destination: `${liveSafetyApiOrigin}/api/live-safety/:path*`,
       },
     ];
   },
