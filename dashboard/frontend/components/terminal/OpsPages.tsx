@@ -37,6 +37,7 @@ export function RiskCenterPage() {
     { label: "LIVE ARMED", ...armed, detail: live?.arm.reason },
     { label: "ACCOUNT PIN", value: live?.identity.status === "PINNED" ? "PASS" : live?.identity.status === "MISMATCH" ? "BLOCKED" : "UNKNOWN", tone: toneFor(live?.identity.status), detail: live?.identity.fingerprint_short },
     { label: "RECONCILIATION", ...directStatus(live?.reconciliation.safe_to_trade, Boolean(live?.reconciliation.available)), detail: live?.reconciliation.status },
+    { label: "EXECUTION ACCOUNT SAFETY", ...directStatus(live?.account_safety.safe_to_trade, Boolean(live?.account_safety.available)), detail: live?.account_safety.state },
     { label: "ACCOUNTING", ...accounting, detail: summary?.accounting_status_detail },
     { label: "POLICY HASH", value: live?.risk.policy_config_hash ? "PASS" : "UNKNOWN", tone: live?.risk.policy_config_hash ? "good" as const : "unknown" as const, detail: live?.risk.policy_config_hash?.slice(0, 12) },
     { label: "DATA FRESHNESS", value: summary?.data_freshness === "FRESH" ? "PASS" : summary?.data_freshness === "STALE" ? "WARN" : "UNKNOWN", tone: toneFor(summary?.data_freshness), detail: summary?.data_freshness_seconds === null || summary?.data_freshness_seconds === undefined ? null : `${summary.data_freshness_seconds}s old` },

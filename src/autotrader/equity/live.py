@@ -182,6 +182,7 @@ def verify_live_startup(
         trading_client=client,
         now=now,
         symbols=EQUITY_SYMBOLS,
+        required_symbols=EQUITY_SYMBOLS,
         verify_environment=verify_live_environment,
     )
     if not result.safe_to_trade:

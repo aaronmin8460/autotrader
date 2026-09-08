@@ -122,6 +122,20 @@ export interface LiveReconciliationPanel {
   completed_at: string | null;
   issues: number | null;
   unresolved: number | null;
+  required_symbols: string[];
+  positions_checked: number | null;
+  coverage_complete: boolean | null;
+  detail: string | null;
+}
+
+export interface LiveAccountSafetyPanel {
+  available: boolean;
+  state: string | null;
+  safe_to_trade: boolean | null;
+  established: boolean;
+  reason: string | null;
+  source: string | null;
+  updated_at: string | null;
   detail: string | null;
 }
 
@@ -135,6 +149,7 @@ export interface LiveSafetyPanel {
   risk: LiveRiskEnvelope;
   deposit_day_guard: DepositDayGuardPanel;
   reconciliation: LiveReconciliationPanel;
+  account_safety: LiveAccountSafetyPanel;
   service: LiveServicePanel;
   code_sha: string | null;
   notices: string[];

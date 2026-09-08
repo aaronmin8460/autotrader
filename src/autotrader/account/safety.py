@@ -186,20 +186,27 @@ def halt_account_for_reconciliation(
     )
 
 
-def missing_universe_symbols(result: ReconciliationResult) -> tuple[str, ...]:
-    """Tracked symbols a pass did not cover, in the frozen universe's order.
+def missing_universe_symbols(
+    result: ReconciliationResult,
+    *,
+    required_symbols: tuple[str, ...] = TRADABLE_SYMBOLS,
+) -> tuple[str, ...]:
+    """Required symbols a pass did not cover, in authoritative scope order.
 
-    Empty means the pass was account-wide. Anything else means it was narrower
-    than the account it is being asked to vouch for.
+    Empty means the pass covered the explicitly selected reconciliation scope.
+    The legacy shared Paper/Crypto account keeps ``TRADABLE_SYMBOLS`` as its
+    default. A runtime with a genuinely separate account and store, such as
+    Live Equity, must supply its own authoritative scope explicitly.
     """
     covered = {symbol.upper() for symbol in result.symbols}
-    return tuple(symbol for symbol in TRADABLE_SYMBOLS if symbol.upper() not in covered)
+    return tuple(symbol for symbol in required_symbols if symbol.upper() not in covered)
 
 
 def apply_reconciliation_result(
     connection: sqlite3.Connection,
     result: ReconciliationResult,
     *,
+    required_symbols: tuple[str, ...] = TRADABLE_SYMBOLS,
     source: str = SOURCE_RECONCILIATION,
     now: datetime,
 ) -> state.AccountSafetyState:
@@ -214,15 +221,16 @@ def apply_reconciliation_result(
     an ambiguous `client_order_id`, and a discovery like that is account-wide
     news. An existing `UNSAFE_UNKNOWN` is left in place rather than downgraded.
 
-    **The pass is safe and covered every tracked symbol** - so the account is
-    `SAFE`. This is the only transition that opens the gate, and it requires
-    both halves: a clean answer, and a complete view.
+    **The pass is safe and covered every symbol required by this runtime** - so
+    the account is `SAFE`. This is the only transition that opens the gate, and
+    it requires both halves: a clean answer, and a complete view. The required
+    universe is explicit; the shared Paper/Crypto default remains all legacy
+    tracked symbols, while Live Equity supplies its isolated Equity universe.
 
-    **The pass is safe but narrower than the account** - so nothing changes. A
-    crypto-only pass has not established that the equity book is understood, so
-    it may not clear a halt; but it also found nothing wrong, so inventing a
-    halt from it would stop the system for a fact nobody observed. Vouching for
-    less than it looked at, in either direction, is the failure mode here.
+    **The pass is safe but did not cover the required scope** - so the account
+    is halted as `UNSAFE_RECONCILIATION`. A stale earlier SAFE row must not
+    survive a later incomplete pass. This is missing safety evidence, not an
+    invented broker mismatch, and the reason records the exact missing symbols.
 
     A `dry_run` pass never moves the halt at all. It repairs nothing and records
     nothing, so it has established nothing - it is the audit mode, and an audit
@@ -245,17 +253,25 @@ def apply_reconciliation_result(
             now=now,
         )
 
-    missing = missing_universe_symbols(result)
+    missing = missing_universe_symbols(result, required_symbols=required_symbols)
     if missing:
-        # Safe, but narrower than the account. Reported, not acted on.
-        return read_account_safety(connection)
+        return halt_account_for_reconciliation(
+            connection,
+            source=source,
+            detail=(
+                f"A reconciliation pass covered {len(result.symbols)} symbol(s), but "
+                f"the required {len(required_symbols)}-symbol scope is incomplete; "
+                f"missing: {', '.join(missing)}."
+            ),
+            now=now,
+        )
 
     return state.set_account_safety_state(
         connection,
         account_state=state.ACCOUNT_SAFETY_SAFE,
         reason=(
-            f"A full-universe reconciliation pass over all {len(TRADABLE_SYMBOLS)} "
-            f"tracked symbols is {result.status.value}: {result.orders_checked} "
+            f"A complete reconciliation pass over all {len(required_symbols)} "
+            f"required symbols is {result.status.value}: {result.orders_checked} "
             f"order(s) verified against the broker, {result.repaired_count} repaired, "
             "nothing unresolved."
         ),

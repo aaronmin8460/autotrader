@@ -47,6 +47,7 @@ from fastapi import FastAPI
 
 from autotrader.dashboard import live_safety, live_terminal
 from autotrader.dashboard.service_units import read_unit_properties
+from autotrader.equity import EQUITY_SYMBOLS
 from autotrader.execution.equity import fetch_open_paper_orders
 from autotrader.live.activity import LiveActivityError, read_cash_flow_events
 from autotrader.live.armstate import read_arm_state
@@ -77,13 +78,23 @@ def _live_database_path() -> Path | None:
     return Path(raw) if raw else None
 
 
-def _local_state() -> tuple[object | None, live_safety.LiveReconciliationPanel]:
-    """Read the durable arm row and latest finished reconciliation, without writes."""
+def _unknown_account_safety(detail: str) -> live_safety.LiveAccountSafetyPanel:
+    return live_safety.LiveAccountSafetyPanel(available=False, detail=detail)
+
+
+def _local_state() -> tuple[
+    object | None,
+    live_safety.LiveReconciliationPanel,
+    live_safety.LiveAccountSafetyPanel,
+]:
+    """Read arm, latest reconciliation, and durable execution safety without writes."""
     database = _live_database_path()
     if database is None or not database.exists():
-        return None, live_safety.LiveReconciliationPanel(
-            available=False,
-            detail="The dedicated Live operational store does not exist.",
+        detail = "The dedicated Live operational store does not exist."
+        return (
+            None,
+            live_safety.LiveReconciliationPanel(available=False, detail=detail),
+            _unknown_account_safety(detail),
         )
     try:
         uri = f"file:{database.resolve()}?mode=ro"
@@ -93,27 +104,53 @@ def _local_state() -> tuple[object | None, live_safety.LiveReconciliationPanel]:
             connection.execute("PRAGMA query_only = 1")
             arm = read_arm_state(connection)
             latest = state.latest_reconciliation_run(connection)
+            safety = state.read_account_safety_state(connection)
         finally:
             connection.close()
     except Exception as error:  # noqa: BLE001 - unknown remains unknown, and details are sanitized
-        return None, live_safety.LiveReconciliationPanel(
-            available=False,
-            detail=(
-                f"The dedicated Live operational store could not be read ({type(error).__name__})."
-            ),
+        detail = (
+            f"The dedicated Live operational store could not be read ({type(error).__name__})."
         )
-    if latest is None:
-        return arm, live_safety.LiveReconciliationPanel(
-            available=False,
-            detail="No real-money reconciliation run has completed in this store.",
+        return (
+            None,
+            live_safety.LiveReconciliationPanel(available=False, detail=detail),
+            _unknown_account_safety(detail),
         )
-    return arm, live_safety.LiveReconciliationPanel(
+    safety_panel = live_safety.LiveAccountSafetyPanel(
         available=True,
-        status=latest.status,
-        safe_to_trade=latest.safe_to_trade,
-        completed_at=latest.completed_at.astimezone(UTC).isoformat(),
-        issues=latest.issues_count,
-        unresolved=latest.unresolved_count,
+        state=safety.state,
+        safe_to_trade=safety.safe_to_trade,
+        established=safety.established,
+        reason=safety.reason,
+        source=safety.source,
+        updated_at=(
+            safety.updated_at.astimezone(UTC).isoformat() if safety.updated_at is not None else None
+        ),
+    )
+    if latest is None:
+        return (
+            arm,
+            live_safety.LiveReconciliationPanel(
+                available=False,
+                required_symbols=EQUITY_SYMBOLS,
+                detail="No real-money reconciliation run has completed in this store.",
+            ),
+            safety_panel,
+        )
+    return (
+        arm,
+        live_safety.LiveReconciliationPanel(
+            available=True,
+            status=latest.status,
+            safe_to_trade=latest.safe_to_trade,
+            completed_at=latest.completed_at.astimezone(UTC).isoformat(),
+            issues=latest.issues_count,
+            unresolved=latest.unresolved_count,
+            required_symbols=EQUITY_SYMBOLS,
+            positions_checked=latest.positions_checked,
+            coverage_complete=latest.positions_checked == len(EQUITY_SYMBOLS),
+        ),
+        safety_panel,
     )
 
 
@@ -227,7 +264,7 @@ def build_panel(now: datetime | None = None) -> live_safety.LiveSafetyPanel:
         except LiveActivityError:
             cash_flow_events = None
 
-    arm, reconciliation = _local_state()
+    arm, reconciliation, account_safety = _local_state()
     return live_safety.build_panel(
         now=moment,
         policy=allocation_policy_for(POLICY_LIVE_VALIDATION_100),
@@ -238,6 +275,7 @@ def build_panel(now: datetime | None = None) -> live_safety.LiveSafetyPanel:
         gross_exposure=gross_exposure,
         cash_flow_events=cash_flow_events,
         reconciliation=reconciliation,
+        account_safety=account_safety,
         service=_service_panel(),
         live_ready=configured_live_readiness(),
         code_sha=os.environ.get(DEPLOYED_SHA_ENV, "").strip() or None,

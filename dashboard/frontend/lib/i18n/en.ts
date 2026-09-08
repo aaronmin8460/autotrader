@@ -730,6 +730,7 @@ export const en = {
   // operations
   "live.ops": "Operations",
   "live.ops.reconciliation": "Reconciliation",
+  "live.ops.accountSafety": "Execution Account Safety",
   "live.ops.accountingStatus": "Accounting status",
   "live.ops.dataFreshness": "Accounting freshness",
   "live.ops.brokerFreshness": "Broker freshness",

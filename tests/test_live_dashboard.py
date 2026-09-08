@@ -34,7 +34,7 @@ from autotrader.execution.live import LiveReadOnlyClient
 from autotrader.live.armstate import ArmState
 from autotrader.live.budget import CashFlowEvent
 from autotrader.live.identity import account_fingerprint
-from autotrader.state.sqlite import initialize_database
+from autotrader.state.sqlite import connect, initialize_database, record_reconciliation_run
 
 PINNED = "a6bbf9c116a5679c58719d82d7e4b3e2"
 NOW = datetime(2026, 9, 8, 14, 5, tzinfo=UTC)
@@ -512,8 +512,41 @@ def test_the_real_panel_uses_broker_and_local_truth_without_a_mutation_surface(
     assert panel.risk.current_gross_exposure == "4.25"
     assert panel.risk.target_gross == "45.00"
     assert panel.deposit_day_guard.status == "INACTIVE"
+    assert panel.account_safety.available is True
+    assert panel.account_safety.state == "UNSAFE_RECONCILIATION"
+    assert panel.account_safety.source == "never-established"
+    assert panel.account_safety.established is False
     assert panel.service.state == "RUNNING"
     assert panel.code_sha == "d" * 40
+
+
+def test_clean_reconciliation_is_not_presented_as_execution_account_safety(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "live.db"
+    initialize_database(database)
+    with connect(database) as connection:
+        record_reconciliation_run(
+            connection,
+            started_at=NOW,
+            completed_at=NOW,
+            status="CLEAN",
+            safe_to_trade=True,
+            orders_checked=0,
+            positions_checked=len(live_api.EQUITY_SYMBOLS),
+            issues_count=0,
+            unresolved_count=0,
+        )
+    monkeypatch.setenv("AUTOTRADER_EQUITY_LIVE_DB", str(database))
+
+    _, reconciliation, safety = live_api._local_state()
+
+    assert reconciliation.status == "CLEAN"
+    assert reconciliation.coverage_complete is True
+    assert reconciliation.required_symbols == live_api.EQUITY_SYMBOLS
+    assert safety.state == "UNSAFE_RECONCILIATION"
+    assert safety.source == "never-established"
+    assert safety.safe_to_trade is False
 
 
 def test_the_live_read_facade_is_explicit_and_pages_with_a_bound() -> None:

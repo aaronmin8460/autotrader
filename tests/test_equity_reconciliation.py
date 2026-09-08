@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from autotrader.account import safety as account_safety
 from autotrader.equity import EQUITY_SYMBOLS
 from autotrader.execution.models import SUPPORTED_SYMBOLS, TRADABLE_SYMBOLS
 from autotrader.reconciliation import (
@@ -42,6 +43,7 @@ from autotrader.state.sqlite import (
     connect,
     get_position,
     initialize_database,
+    read_account_safety_state,
     record_order_intent,
     upsert_position,
 )
@@ -180,6 +182,106 @@ def test_an_empty_universe_is_refused(connection: sqlite3.Connection) -> None:
     """ "Nothing was checked" is not the same answer as "everything matched"."""
     with pytest.raises(ReconciliationInputError):
         run(connection, FakeTradingClient(), symbols=())
+
+
+# ======================================================== required safety scope ==
+
+
+def test_complete_live_equity_scope_establishes_durable_safe(
+    connection: sqlite3.Connection,
+) -> None:
+    result = run(
+        connection,
+        FakeTradingClient(),
+        symbols=EQUITY_SYMBOLS,
+        required_symbols=EQUITY_SYMBOLS,
+    )
+
+    safety = read_account_safety_state(connection)
+    assert result.safe_to_trade is True
+    assert safety.safe_to_trade is True
+    assert safety.established is True
+    assert "all 10 required symbols" in safety.reason
+
+
+def test_missing_required_live_equity_symbol_clears_a_stale_safe_state(
+    connection: sqlite3.Connection,
+) -> None:
+    run(
+        connection,
+        FakeTradingClient(),
+        symbols=EQUITY_SYMBOLS,
+        required_symbols=EQUITY_SYMBOLS,
+    )
+    assert read_account_safety_state(connection).safe_to_trade is True
+
+    result = run(
+        connection,
+        FakeTradingClient(),
+        symbols=EQUITY_SYMBOLS[:-1],
+        required_symbols=EQUITY_SYMBOLS,
+    )
+
+    safety = read_account_safety_state(connection)
+    assert result.safe_to_trade is True  # the inspected subset itself was clean
+    assert safety.safe_to_trade is False
+    assert safety.state == "UNSAFE_RECONCILIATION"
+    assert EQUITY_SYMBOLS[-1] in safety.reason
+
+
+@pytest.mark.parametrize("crypto_holding", [False, True])
+def test_crypto_presence_does_not_change_live_equity_scope_completeness(
+    connection: sqlite3.Connection,
+    crypto_holding: bool,
+) -> None:
+    positions = [crypto_position()] if crypto_holding else []
+    result = run(
+        connection,
+        FakeTradingClient(positions=positions),
+        symbols=EQUITY_SYMBOLS,
+        required_symbols=EQUITY_SYMBOLS,
+    )
+
+    assert result.safe_to_trade is True
+    assert read_account_safety_state(connection).safe_to_trade is True
+
+
+def test_legacy_shared_scope_is_not_weakened(connection: sqlite3.Connection) -> None:
+    run(connection, FakeTradingClient(), symbols=EQUITY_SYMBOLS)
+
+    safety = read_account_safety_state(connection)
+    assert safety.safe_to_trade is False
+    assert set(account_safety.missing_universe_symbols(
+        run(connection, FakeTradingClient(), symbols=EQUITY_SYMBOLS, dry_run=True)
+    )) == set(SUPPORTED_SYMBOLS)
+
+
+def test_required_scope_uses_symbol_identity_not_a_static_count(
+    connection: sqlite3.Connection,
+) -> None:
+    clean = run(
+        connection,
+        FakeTradingClient(),
+        symbols=EQUITY_SYMBOLS,
+        required_symbols=EQUITY_SYMBOLS,
+        dry_run=True,
+    )
+    future_scope = EQUITY_SYMBOLS + ("FUTURE_EQUITY",)
+
+    assert account_safety.missing_universe_symbols(
+        clean,
+        required_symbols=future_scope,
+    ) == ("FUTURE_EQUITY",)
+
+
+def test_empty_required_scope_is_refused(connection: sqlite3.Connection) -> None:
+    with pytest.raises(ReconciliationInputError, match="required_symbols"):
+        run(
+            connection,
+            FakeTradingClient(),
+            symbols=EQUITY_SYMBOLS,
+            required_symbols=(),
+        )
 
 
 # ==========================================================================

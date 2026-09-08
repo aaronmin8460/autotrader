@@ -321,6 +321,23 @@ class LiveReconciliationPanel:
     completed_at: str | None = None
     issues: int | None = None
     unresolved: int | None = None
+    required_symbols: tuple[str, ...] = ()
+    positions_checked: int | None = None
+    coverage_complete: bool | None = None
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveAccountSafetyPanel:
+    """The durable execution gate, never inferred from reconciliation alone."""
+
+    available: bool
+    state: str | None = None
+    safe_to_trade: bool | None = None
+    established: bool = False
+    reason: str | None = None
+    source: str | None = None
+    updated_at: str | None = None
     detail: str | None = None
 
 
@@ -342,6 +359,7 @@ class LiveSafetyPanel:
     risk: LiveRiskEnvelope
     deposit_day_guard: DepositDayGuardPanel
     reconciliation: LiveReconciliationPanel
+    account_safety: LiveAccountSafetyPanel
     service: LiveServicePanel
     code_sha: str | None = None
     notices: tuple[str, ...] = ()
@@ -680,6 +698,7 @@ def build_panel(
     gross_exposure: Decimal | None = None,
     cash_flow_events: tuple[CashFlowEvent, ...] | list[CashFlowEvent] | None = None,
     reconciliation: LiveReconciliationPanel | None = None,
+    account_safety: LiveAccountSafetyPanel | None = None,
     service: LiveServicePanel | None = None,
     live_ready: bool | None = None,
     code_sha: str | None = None,
@@ -729,6 +748,11 @@ def build_panel(
             available=False,
             detail="No real-money reconciliation run has been recorded in this store.",
         ),
+        account_safety=account_safety
+        or LiveAccountSafetyPanel(
+            available=False,
+            detail="The durable execution account-safety state could not be read.",
+        ),
         service=service
         or LiveServicePanel(
             state=SERVICE_NOT_INSTALLED,
@@ -769,6 +793,7 @@ __all__ = [
     "SERVICE_UNKNOWN",
     "DepositDayGuardPanel",
     "LiveAccountFacts",
+    "LiveAccountSafetyPanel",
     "LiveArmPanel",
     "LiveIdentityPanel",
     "LiveReconciliationPanel",

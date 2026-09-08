@@ -95,6 +95,16 @@ export function LiveOpsCard({
             <Unknown />
           )}
         </Field>
+        <Field label={t("live.ops.accountSafety")}>
+          {panel?.account_safety.available ? (
+            <span className="inline-flex flex-wrap items-center gap-2">
+              <Identifier value={panel.account_safety.state} />
+              {panel.account_safety.established ? null : <Tag tone="ATTENTION">NOT ESTABLISHED</Tag>}
+            </span>
+          ) : (
+            <Unknown />
+          )}
+        </Field>
 
         <Field label={t("live.ops.lastCheckpoint")}>
           <span className="num">

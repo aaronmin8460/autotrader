@@ -727,6 +727,7 @@ export const ko: Messages = {
 
   "live.ops": "운영",
   "live.ops.reconciliation": "정합성 대조",
+  "live.ops.accountSafety": "실행 계정 안전 상태",
   "live.ops.accountingStatus": "회계 상태",
   "live.ops.dataFreshness": "회계 신선도",
   "live.ops.brokerFreshness": "브로커 신선도",

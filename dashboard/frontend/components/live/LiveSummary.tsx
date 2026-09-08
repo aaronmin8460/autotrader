@@ -111,6 +111,13 @@ export function LiveSummaryCard({
             <Unknown />
           )}
         </Field>
+        <Field label={t("live.ops.accountSafety")}>
+          {panel?.account_safety.available ? (
+            <Identifier value={panel.account_safety.state} />
+          ) : (
+            <Unknown />
+          )}
+        </Field>
         <Field label={t("live.ops.service")}>
           <Identifier value={panel?.service.state} />
         </Field>

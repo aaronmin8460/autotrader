@@ -742,6 +742,7 @@ def _finish(
     positions_checked: int,
     dry_run: bool,
     symbols: tuple[str, ...] = (),
+    required_symbols: tuple[str, ...] = TRADABLE_SYMBOLS,
 ) -> ReconciliationResult:
     """Assemble the result, record it, and move the shared account halt.
 
@@ -752,10 +753,10 @@ def _finish(
     **Every finished pass updates `account_safety_state`**, and it happens here
     rather than in each caller so that running a reconciliation and forgetting
     to act on it is not a thing a caller can do. What the update actually is -
-    clear the halt, raise one, or leave it alone because this pass was narrower
-    than the account - is decided by `account.safety`, which owns that policy;
-    this function only makes sure it is asked. A dry run asks and is told
-    nothing changes.
+    clear the halt or raise one because the pass failed or missed required
+    coverage - is decided by `account.safety`, which owns that policy; this
+    function only makes sure it is asked. A dry run asks and is told nothing
+    changes.
     """
     result = ReconciliationResult(
         status=_status_for(tuple(issues)),
@@ -792,6 +793,7 @@ def _finish(
                 dry_run=dry_run,
                 symbols=symbols,
             ),
+            required_symbols=required_symbols,
         )
     return _with_account_safety(
         connection,
@@ -806,11 +808,15 @@ def _finish(
             reconciliation_run_id=run_id,
             symbols=symbols,
         ),
+        required_symbols=required_symbols,
     )
 
 
 def _with_account_safety(
-    connection: sqlite3.Connection, result: ReconciliationResult
+    connection: sqlite3.Connection,
+    result: ReconciliationResult,
+    *,
+    required_symbols: tuple[str, ...] = TRADABLE_SYMBOLS,
 ) -> ReconciliationResult:
     """Hand a finished pass to the shared account halt, and return it unchanged.
 
@@ -820,7 +826,12 @@ def _with_account_safety(
     equity order. Letting the `StateError` out is the fail-closed answer: both
     runtimes already treat one as fatal.
     """
-    account_safety.apply_reconciliation_result(connection, result, now=result.completed_at)
+    account_safety.apply_reconciliation_result(
+        connection,
+        result,
+        required_symbols=required_symbols,
+        now=result.completed_at,
+    )
     return result
 
 
@@ -836,6 +847,7 @@ def reconcile_paper_state(
     now: datetime | None = None,
     dry_run: bool = False,
     symbols: tuple[str, ...] = TRADABLE_SYMBOLS,
+    required_symbols: tuple[str, ...] = TRADABLE_SYMBOLS,
     confirmations: int = NOT_FOUND_CONFIRMATIONS,
     recheck_delay_seconds: float = NOT_FOUND_RECHECK_DELAY_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
@@ -877,6 +889,14 @@ def reconcile_paper_state(
     a pass reports honestly on what it covered; what it may not do is clear the
     shared account halt, which `account.safety.apply_reconciliation_result`
     enforces by checking coverage rather than by trusting the caller.
+
+    `required_symbols` is the authoritative reconciliation scope against which
+    completeness is evaluated. It deliberately defaults independently to all
+    twelve legacy tracked symbols, preserving the shared Paper/Crypto policy.
+    Live Equity supplies `EQUITY_SYMBOLS` explicitly because it has a separate
+    real-money account and operational store. Keeping this separate from
+    `symbols` means an accidentally narrowed pass cannot declare itself
+    complete merely because it covered everything it chose to inspect.
 
     Step 4 - order intents - is deliberately **not** filtered by the universe: a
     `client_order_id` whose outcome is unknown blocks trading for the whole
@@ -923,6 +943,12 @@ def reconcile_paper_state(
             "position could only ever report that nothing was checked, which is not "
             "the same answer as everything matching."
         )
+    required_universe = tuple(required_symbols)
+    if not required_universe:
+        raise ReconciliationInputError(
+            "required_symbols must name at least one instrument. An empty safety "
+            "scope would make every reconciliation look complete."
+        )
 
     issues: list[ReconciliationIssue] = []
 
@@ -942,6 +968,7 @@ def reconcile_paper_state(
             # it names no covered symbol. Reporting the intended universe here
             # would let a failed pass look like full coverage.
             symbols=(),
+            required_symbols=required_universe,
         )
 
     try:
@@ -1079,6 +1106,7 @@ def reconcile_paper_state(
         positions_checked=len(universe),
         dry_run=dry_run,
         symbols=universe,
+        required_symbols=required_universe,
     )
 
 

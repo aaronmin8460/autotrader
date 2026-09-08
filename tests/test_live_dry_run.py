@@ -34,7 +34,7 @@ from autotrader.equity.live import (
     ReconciliationBlockedError,
     verify_live_startup,
 )
-from autotrader.execution.live import NotLiveEnvironmentError
+from autotrader.execution.live import NotLiveEnvironmentError, verify_live_environment
 from autotrader.execution.models import OrderSide
 from autotrader.execution.paper import (
     AmbiguousSubmissionError,
@@ -54,6 +54,7 @@ from autotrader.live.identity import (
     AccountIdentityError,
     account_fingerprint,
 )
+from autotrader.reconciliation.engine import reconcile_paper_state
 from autotrader.reconciliation.models import ReconciliationResult, ReconciliationStatus
 from autotrader.state import sqlite as state
 from autotrader.state.sqlite import connect, initialize_database
@@ -493,6 +494,67 @@ def test_startup_establishes_the_ceilings_from_the_settled_balance(
     assert report.ceilings.hard_gross == Decimal("47.50")
     assert report.ceilings.exposure_bound == Decimal("50.00")
     assert report.armed is False
+
+
+def test_live_startup_supplies_the_authoritative_equity_safety_scope(
+    store: sqlite3.Connection, pinned: str
+) -> None:
+    captured: dict[str, object] = {}
+
+    def capture(_connection=None, **kwargs):
+        captured.update(kwargs)
+        return clean_pass()
+
+    verify_live_startup(store, StartupClient(), policy=LIVE, now=T0, reconcile=capture)
+
+    assert captured["symbols"] == EQUITY_SYMBOLS
+    assert captured["required_symbols"] == EQUITY_SYMBOLS
+
+
+def test_execution_progresses_past_scope_established_safety_without_submitting(
+    store: sqlite3.Connection,
+    pinned: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from autotrader.execution.equity import MarketClosedError
+
+    store.execute("DELETE FROM account_safety_state")
+    client = StartupClient(is_open=False)
+    result = reconcile_paper_state(
+        store,
+        trading_client=client,  # type: ignore[arg-type]
+        now=T0,
+        symbols=EQUITY_SYMBOLS,
+        required_symbols=EQUITY_SYMBOLS,
+        confirmations=1,
+        recheck_delay_seconds=0,
+        sleep=lambda _seconds: None,
+        verify_environment=verify_live_environment,
+    )
+    assert result.safe_to_trade is True
+    assert state.read_account_safety_state(store).safe_to_trade is True
+
+    monkeypatch.setenv(LIVE_ARMED_ENV, "true")
+    arm_live_trading(store, now=T0, reason="test", confirmation=ARM_CONFIRMATION_TOKEN)
+    gateway = ArmedLiveGateway(
+        trading_client=client,
+        data_client=FakeDataClient(10.0),
+        policy=LIVE,
+        entry_guard=lambda _now: None,
+    )
+    with pytest.raises(MarketClosedError):
+        gateway.execute(
+            store,
+            symbol="SPY",
+            side=OrderSide.BUY,
+            requested_quantity=Decimal("0.4"),
+            now=T0,
+            strategy_run_id=None,
+        )
+
+    assert client.clock_calls == 1
+    assert client.submit_calls == []
+    assert state.list_order_intents(store) == []
 
 
 @pytest.mark.parametrize("status", [ReconciliationStatus.UNRESOLVED, ReconciliationStatus.FAILED])

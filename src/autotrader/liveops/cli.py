@@ -140,6 +140,7 @@ def reconcile(
                 now=datetime.now(UTC),
                 verify_environment=verify_live_environment,
                 symbols=EQUITY_SYMBOLS,
+                required_symbols=EQUITY_SYMBOLS,
             )
     except (ExecutionError, AccountIdentityError, StateError) as error:
         typer.secho(str(error), fg=typer.colors.RED, err=True)
