@@ -156,6 +156,10 @@ def test_the_expected_units_exist() -> None:
     assert set(DASHBOARD_UNITS) <= names
     assert {"autotrader-backup.service", "autotrader-backup.timer"} <= names
     assert LIVE_RUNTIME_UNIT in names
+    assert {
+        "autotrader-equity-live-reconcile.service",
+        "autotrader-equity-live-reconcile.timer",
+    } <= names
     assert set(LIVE_READER_UNITS) <= names
     assert {
         "autotrader-live-accounting-sync.service",
@@ -193,6 +197,23 @@ def test_live_automation_uses_systemd_calendar_and_idempotent_retries() -> None:
     assert len(close_times) == 3
     assert all(value.endswith("America/New_York") for value in close_times)
     assert one(close, "Timer", "Persistent") == "true"
+
+
+def test_live_reconciliation_is_recurring_read_only_and_never_loads_an_arm_gate() -> None:
+    service = parse_unit(SYSTEMD_ROOT / "autotrader-equity-live-reconcile.service")
+    timer = parse_unit(SYSTEMD_ROOT / "autotrader-equity-live-reconcile.timer")
+
+    assert one(service, "Service", "Type") == "oneshot"
+    assert one(service, "Service", "User") == "ateqlive"
+    assert "autotrader live reconcile --db ${AUTOTRADER_EQUITY_LIVE_DB}" in (
+        one(service, "Service", "ExecStart") or ""
+    )
+    assert one(service, "Service", "Restart") is None
+    environment_files = directive(service, "Service", "EnvironmentFile")
+    assert not any(".arm.env" in value for value in environment_files)
+    assert one(timer, "Timer", "OnCalendar") == "*-*-* *:01/15:30"
+    assert one(timer, "Timer", "Persistent") == "true"
+    assert one(timer, "Timer", "Unit") == "autotrader-equity-live-reconcile.service"
 
 
 def test_frontend_and_edge_proxy_carry_both_live_readers() -> None:
@@ -414,6 +435,7 @@ def test_no_unit_embeds_a_credential() -> None:
 def test_only_live_broker_readers_receive_the_live_secrets_file() -> None:
     expected = {
         LIVE_RUNTIME_UNIT,
+        "autotrader-equity-live-reconcile.service",
         "autotrader-live-accounting-sync.service",
         "autotrader-live-daily-close.service",
         "autotrader-live-safety-api.service",

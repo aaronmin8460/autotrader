@@ -28,12 +28,17 @@ $90.00/$95.00/$100.00/$11.00. The API must quote these from
 ### 1. Services and the absent environment ARM gate
 
 ```bash
-sudo systemctl --no-pager --full status autotrader-equity-live.service autotrader-live-accounting-api.service autotrader-live-safety-api.service autotrader-live-accounting-sync.timer autotrader-live-daily-close.timer
+sudo systemctl --no-pager --full status autotrader-equity-live.service autotrader-equity-live-reconcile.timer autotrader-live-accounting-api.service autotrader-live-safety-api.service autotrader-live-accounting-sync.timer autotrader-live-daily-close.timer
 sudo test ! -e /etc/autotrader/autotrader-equity-live.arm.env
 ```
 
-Stop unless the three services and two timers are active and the second command
+Stop unless the three services and three timers are active and the second command
 exits zero. During deployment and verification the ARM file must not exist.
+
+`autotrader-equity-live-reconcile.timer` is a broker-read-only, quarter-hourly
+convergence pass for the Live operational store. It loads no ARM gate and can
+therefore repair a durable local snapshot while Live is disarmed; it never
+submits, cancels, or replaces an order.
 
 ### 2. Authoritative Live status
 

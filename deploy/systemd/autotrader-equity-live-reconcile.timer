@@ -1,0 +1,16 @@
+# Every fifteen minutes, one minute clear of the EDA-1 bar boundary.  The
+# separate process is read-only at the broker; it converges an order accepted
+# just after startup or a previous pass without requiring a service restart.
+
+[Unit]
+Description=Quarter-hourly AutoTrader reconciliation (equity Live store)
+Documentation=file:/opt/autotrader-equity-live/app/docs/LIVE_FIRST_DAY_RUNBOOK.md
+
+[Timer]
+OnCalendar=*-*-* *:01/15:30
+RandomizedDelaySec=30
+Persistent=true
+Unit=autotrader-equity-live-reconcile.service
+
+[Install]
+WantedBy=timers.target

@@ -884,6 +884,63 @@ def test_accepted_locally_and_filled_at_the_broker_becomes_filled(
     assert client.submit_calls == []
 
 
+def test_post_startup_live_submission_race_converges_on_the_next_recurring_pass(
+    connection: sqlite3.Connection,
+) -> None:
+    """A fill after startup reconciliation needs no restart to become durable.
+
+    This is the production ordering: startup completes cleanly, an intent is
+    committed and Alpaca acknowledges it as pending_new, then it fills before
+    the next ordinary Live reconciliation timer fires.
+    """
+    client = FakeTradingClient()
+    startup = run(connection, client)
+    assert startup.status is ReconciliationStatus.CLEAN
+
+    client_order_id = "autotrader-live-1506b2d2e5e54c88aa043df672b45f6c"
+    intent_id = make_intent(
+        connection,
+        client_order_id=client_order_id,
+        status=INTENT_STATUS_SUBMITTED,
+        symbol="SPY",
+        approved="0.005859680",
+        created_at=T0 + timedelta(milliseconds=101),
+    )
+    store_snapshot(
+        connection,
+        intent_id,
+        client_order_id=client_order_id,
+        symbol="SPY",
+        quantity="0.005859680",
+        status="pending_new",
+    )
+    client._orders[client_order_id] = make_order(
+        client_order_id=client_order_id,
+        symbol="SPY",
+        qty="0.00585968",
+        filled_qty="0.00585968",
+        filled_avg_price="767.676",
+        status=OrderStatus.FILLED,
+        filled_at=T0 + timedelta(seconds=25),
+    )
+
+    next_pass = run(connection, client, now=T0 + timedelta(minutes=15))
+
+    intent = get_order_intent(connection, intent_id)
+    snapshot = get_broker_order_by_intent(connection, intent_id)
+    assert next_pass.status is ReconciliationStatus.REPAIRED
+    assert intent is not None and intent.status == INTENT_STATUS_SUBMITTED
+    assert intent.client_order_id == client_order_id
+    assert snapshot is not None
+    assert snapshot.status == "filled"
+    assert snapshot.broker_order_id == BROKER_ORDER_UUID
+    assert snapshot.filled_quantity == Decimal("0.00585968")
+    assert snapshot.filled_average_price == 767.676
+    assert snapshot.filled_at == T0 + timedelta(seconds=25)
+    assert client.lookup_calls == [client_order_id]
+    assert client.submit_calls == []
+
+
 def test_accepted_locally_and_partially_filled_at_the_broker_stays_partial(
     connection: sqlite3.Connection,
 ) -> None:

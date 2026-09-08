@@ -58,6 +58,7 @@ See [Publishing the dashboard](../docs/DEPLOYMENT.md#publishing-the-dashboard).
 | `autotrader-live-accounting-api.service` | `always` | `127.0.0.1:8005`, frozen contract, filesystem read-only, no broker credential |
 | `autotrader-live-safety-api.service` | `always` | `127.0.0.1:8006`, allowlisted real-broker reads only |
 | `autotrader-equity-live.service` | `on-failure`, never on exit 2 | Real money; separate identity/state/credentials; starts DISARMED |
+| `autotrader-equity-live-reconcile.timer` | — | quarter-hourly, broker-read-only convergence of the Live operational store |
 | `autotrader-live-accounting-sync.timer` | — | five-minute read-only broker sync into the dedicated accounting ledger |
 | `autotrader-live-daily-close.timer` | — | three idempotent same-evening attempts using the broker calendar and New York timezone |
 | `autotrader-backup.timer` | — | daily |
