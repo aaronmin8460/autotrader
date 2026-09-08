@@ -134,6 +134,7 @@ from autotrader.execution.paper import (
     require_confirmation,
     require_paper_trading_enabled,
 )
+from autotrader.liveaccounting.cli import live_accounting_app
 from autotrader.ml.cli import app as ml_app
 from autotrader.reconciliation import (
     ItemOutcome,
@@ -2074,6 +2075,12 @@ app.add_typer(research_app, name="research")
 # and writes it down, reaches no trading decision, and has no command that can
 # place, cancel or modify an order. Nothing in the trading path imports it.
 app.add_typer(accounting_app, name="equity-accounting")
+
+# Flow-adjusted performance accounting for the real-money book. A separate
+# sub-application from the one above because it describes a DIFFERENT
+# ACCOUNT: one paper, one real. Nothing here places an order, moves money or
+# authorizes a withdrawal, and no trading decision reads what it writes.
+app.add_typer(live_accounting_app, name="live-accounting")
 
 
 def main() -> None:
