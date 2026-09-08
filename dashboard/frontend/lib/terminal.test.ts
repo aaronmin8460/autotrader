@@ -52,6 +52,12 @@ test("Risk uses the server-selected largest position rather than row order", () 
   assert.doesNotMatch(source, /positions\.rows\[0\]/);
 });
 
+test("System identifies the unchanged trading hash as the Live runtime SHA", () => {
+  const source = readFileSync(join(here, "..", "components/terminal/OpsPages.tsx"), "utf8");
+  assert.match(source, /label: "Live runtime SHA"/);
+  assert.doesNotMatch(source, /label: "Production SHA"/);
+});
+
 test("Paper and Live values stay in separate columns and sources", () => {
   const source = readFileSync(join(here, "..", "components/terminal/OpsPages.tsx"), "utf8");
   assert.match(source, /PAPER · SIMULATED CAPITAL/);
