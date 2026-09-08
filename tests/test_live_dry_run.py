@@ -569,7 +569,12 @@ def test_a_disarmed_gateway_never_reaches_the_broker(
 ) -> None:
     """CRITICAL. DISARMED means zero broker mutation calls."""
     client = StartupClient()
-    gateway = ArmedLiveGateway(trading_client=client, data_client=FakeDataClient(10.0), policy=LIVE)
+    gateway = ArmedLiveGateway(
+        trading_client=client,
+        data_client=FakeDataClient(10.0),
+        policy=LIVE,
+        entry_guard=lambda _now: None,
+    )
     with pytest.raises(LiveDisarmedError):
         gateway.execute(
             store,
@@ -616,7 +621,12 @@ def test_disarming_mid_session_stops_the_very_next_order(
     monkeypatch.setenv(LIVE_ARMED_ENV, "true")
     arm_live_trading(store, now=T0, reason="first day", confirmation=ARM_CONFIRMATION_TOKEN)
     client = StartupClient()
-    gateway = ArmedLiveGateway(trading_client=client, data_client=FakeDataClient(10.0), policy=LIVE)
+    gateway = ArmedLiveGateway(
+        trading_client=client,
+        data_client=FakeDataClient(10.0),
+        policy=LIVE,
+        entry_guard=lambda _now: None,
+    )
 
     first = gateway.execute(
         store,

@@ -656,11 +656,16 @@ class AlpacaEquityPaperGateway:
         data_client: object | None = None,
         account_lock: object | None = None,
         policy: AllocationPolicy | None = None,
+        before_mutation: Callable[[sqlite3.Connection, object, OrderSide, datetime], None]
+        | None = None,
+        client_order_id_factory: Callable[[], str] | None = None,
     ) -> None:
         self._trading_client = trading_client
         self._data_client = data_client
         self._account_lock = account_lock
         self._policy = policy
+        self._before_mutation = before_mutation
+        self._client_order_id_factory = client_order_id_factory
 
     def execute(
         self,
@@ -676,6 +681,8 @@ class AlpacaEquityPaperGateway:
         kwargs: dict[str, object] = {}
         if self._policy is not None:
             kwargs["risk_policy"] = risk_policy_for(self._policy)
+        if self._client_order_id_factory is not None:
+            kwargs["client_order_id_factory"] = self._client_order_id_factory
         return execute_equity_paper_order(
             connection,
             symbol=symbol,
@@ -687,6 +694,7 @@ class AlpacaEquityPaperGateway:
             strategy_run_id=strategy_run_id,
             account_lock=self._account_lock,  # type: ignore[arg-type]
             fractional=fractional,
+            before_mutation=self._before_mutation,
             **kwargs,  # type: ignore[arg-type]
         )
 

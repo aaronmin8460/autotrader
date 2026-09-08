@@ -1,0 +1,49 @@
+# Real broker and operational-state reader on loopback. GET/HEAD only.
+
+[Unit]
+Description=AutoTrader Live safety API (read-only, 127.0.0.1:8006)
+Documentation=file:/opt/autotrader-equity-live/app/docs/LIVE_FIRST_DAY_RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/autotrader/autotrader-equity-live.env
+ConditionPathExists=/opt/autotrader-equity-live/venv/bin/python
+
+[Service]
+Type=simple
+User=ateqlive
+Group=ateqlive
+WorkingDirectory=/opt/autotrader-equity-live/app
+EnvironmentFile=/etc/autotrader/autotrader-equity-live.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-live.secrets.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-live.arm.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/autotrader-equity-live/venv/bin/python -m autotrader.dashboard.live_api
+Restart=always
+RestartSec=5
+StateDirectory=autotrader-equity-live
+StateDirectoryMode=0750
+ReadOnlyPaths=/var/lib/autotrader-equity-live
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-live-safety-api
+
+[Install]
+WantedBy=multi-user.target

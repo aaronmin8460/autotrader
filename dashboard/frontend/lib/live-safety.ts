@@ -49,6 +49,8 @@ export type LiveServiceState =
 export interface LiveArmPanel {
   state: string;
   armed: boolean | null;
+  durable_state?: string | null;
+  environment_gate_open?: boolean | null;
   reason: string | null;
   source: string | null;
   changed_at: string | null;

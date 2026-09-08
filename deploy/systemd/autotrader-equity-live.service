@@ -1,0 +1,67 @@
+# AutoTrader Equity EDA-1 — REAL MONEY, deployed DISARMED.
+# The optional ARM file must be absent during installation and this program.
+
+[Unit]
+Description=AutoTrader Equity EDA-1 LIVE — REAL MONEY (DISARMED by default)
+Documentation=file:/opt/autotrader-equity-live/app/docs/LIVE_FIRST_DAY_RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/autotrader/autotrader-equity-live.env
+ConditionPathExists=/opt/autotrader-equity-live/venv/bin/autotrader
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ateqlive
+Group=ateqlive
+SupplementaryGroups=atshadow
+WorkingDirectory=/opt/autotrader-equity-live/app
+
+# The last file is optional. Its absence preserves AUTOTRADER_LIVE_ARMED=false.
+EnvironmentFile=/etc/autotrader/autotrader-equity-live.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-live.secrets.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-live.arm.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+ExecStart=/opt/autotrader-equity-live/venv/bin/autotrader live run \
+  --db ${AUTOTRADER_EQUITY_LIVE_DB} \
+  --shadow-db ${AUTOTRADER_EQUITY_SHADOW_DB} \
+  --sizing-policy ${AUTOTRADER_EQUITY_LIVE_SIZING_POLICY} \
+  --stage ${AUTOTRADER_EQUITY_LIVE_STAGE} \
+  $AUTOTRADER_EQUITY_LIVE_ARGS
+
+# Exit 2 means reconciliation or broker outcome is unresolved; never restart it.
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=120
+
+StateDirectory=autotrader-equity-live
+StateDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-equity-live
+
+[Install]
+WantedBy=multi-user.target

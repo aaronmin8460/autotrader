@@ -135,6 +135,7 @@ from autotrader.execution.paper import (
     require_paper_trading_enabled,
 )
 from autotrader.liveaccounting.cli import live_accounting_app
+from autotrader.liveops.cli import live_app
 from autotrader.ml.cli import app as ml_app
 from autotrader.reconciliation import (
     ItemOutcome,
@@ -2081,6 +2082,11 @@ app.add_typer(accounting_app, name="equity-accounting")
 # ACCOUNT: one paper, one real. Nothing here places an order, moves money or
 # authorizes a withdrawal, and no trading decision reads what it writes.
 app.add_typer(live_accounting_app, name="live-accounting")
+
+# The isolated real-money operator surface. It starts DISARMED and its broker
+# writes remain behind Prompt 1's two arm gates, account pin, reconciliation,
+# deposit-day guard, and shared at-most-once boundary.
+app.add_typer(live_app, name="live")
 
 
 def main() -> None:

@@ -39,6 +39,7 @@ the next decision to see it, not the next restart.
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -55,7 +56,7 @@ from autotrader.execution.live import (
     require_live_submission_allowed,
     verify_live_environment,
 )
-from autotrader.execution.models import OrderSide
+from autotrader.execution.models import ExecutionError, OrderSide
 from autotrader.execution.paper import PaperExecutionResult
 from autotrader.live.armstate import LiveDisarmedError, read_arm_state
 from autotrader.live.budget import LiveExposureCeilings, effective_ceilings
@@ -70,6 +71,17 @@ EQUITY_LIVE_LOCK_SCOPE = "equity-live"
 
 #: The confirmation token the command line requires. It names what it starts.
 LIVE_RUNTIME_CONFIRMATION = "REAL-MONEY"
+
+#: Alpaca permits 48 characters. The prefix and UUID hex fill that allowance
+#: exactly, putting Live idempotency keys in a broker-visible namespace that
+#: can never collide with Paper's ``autotrader-<hyphenated UUID>`` namespace.
+LIVE_CLIENT_ORDER_ID_PREFIX = "autotrader-live-"
+
+
+def new_live_client_order_id() -> str:
+    """Mint one opaque idempotency key in the dedicated Live namespace."""
+    return f"{LIVE_CLIENT_ORDER_ID_PREFIX}{uuid.uuid4().hex}"
+
 
 #: Audit event types this startup writes.
 EVENT_LIVE_STARTUP_VERIFIED = "LIVE_STARTUP_VERIFIED"
@@ -88,6 +100,10 @@ class ReconciliationBlockedError(LiveStartupError):
     account, because that is the one an operator resolves by reconciling rather
     than by fixing configuration.
     """
+
+
+class LiveEntryGuardError(ExecutionError):
+    """A new entry was refused by the non-trade cash-movement guard."""
 
 
 @dataclass(frozen=True)
@@ -217,14 +233,37 @@ class ArmedLiveGateway:
         data_client: object | None = None,
         account_lock: object | None = None,
         policy: AllocationPolicy | None = None,
+        entry_guard: Callable[[datetime], str | None] | None = None,
     ) -> None:
         self._client = trading_client
+        self._entry_guard = entry_guard
         self._inner = AlpacaEquityPaperGateway(
             trading_client=trading_client,
             data_client=data_client,
             account_lock=account_lock,
             policy=policy,
+            before_mutation=self._require_mutation_allowed,
+            client_order_id_factory=new_live_client_order_id,
         )
+
+    def _require_mutation_allowed(
+        self,
+        connection: sqlite3.Connection,
+        client: object,
+        side: OrderSide,
+        now: datetime,
+    ) -> None:
+        require_live_submission_allowed(connection, client)  # type: ignore[arg-type]
+        if side is not OrderSide.BUY:
+            return
+        if self._entry_guard is None:
+            raise LiveEntryGuardError(
+                "The Live entry cash-flow guard is not configured. No new entry was "
+                "submitted; exits remain available."
+            )
+        reason = self._entry_guard(now)
+        if reason:
+            raise LiveEntryGuardError(reason)
 
     def execute(
         self,
@@ -238,7 +277,7 @@ class ArmedLiveGateway:
     ) -> PaperExecutionResult:
         # Raises LiveDisarmedError or AccountIdentityError before the inner
         # gateway - and therefore before the broker - is reached at all.
-        require_live_submission_allowed(connection, self._client)  # type: ignore[arg-type]
+        self._require_mutation_allowed(connection, self._client, side, now)
         return self._inner.execute(
             connection,
             symbol=symbol,
@@ -260,11 +299,14 @@ __all__ = [
     "EVENT_LIVE_STARTUP_REFUSED",
     "EVENT_LIVE_STARTUP_VERIFIED",
     "LIVE_RUNTIME_CONFIRMATION",
+    "LIVE_CLIENT_ORDER_ID_PREFIX",
     "AccountIdentityError",
     "ArmedLiveGateway",
     "LiveDisarmedError",
     "LiveStartupError",
+    "LiveEntryGuardError",
     "LiveStartupReport",
     "ReconciliationBlockedError",
     "verify_live_startup",
+    "new_live_client_order_id",
 ]

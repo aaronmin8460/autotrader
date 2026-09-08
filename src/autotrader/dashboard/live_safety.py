@@ -45,11 +45,16 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Protocol, runtime_checkable
 
-from autotrader.execution.live import live_credentials_configured
+from autotrader.execution.live import (
+    LiveReadOnlyClient,
+    create_live_read_only_client,
+    live_credentials_configured,
+)
 from autotrader.live.armstate import (
     STATE_ARMED,
     STATE_DISARMED,
     ArmState,
+    environment_arm_gate_open,
 )
 from autotrader.live.budget import (
     CashFlowEvent,
@@ -256,6 +261,8 @@ class LiveArmPanel:
 
     state: str
     armed: bool | None
+    durable_state: str | None = None
+    environment_gate_open: bool | None = None
     reason: str | None = None
     source: str | None = None
     changed_at: str | None = None
@@ -353,6 +360,16 @@ def live_credentials_present() -> bool:
     return live_credentials_configured()
 
 
+def create_live_read_broker() -> LiveReadOnlyClient | None:
+    """Construct the audited read facade, or report configuration as absent."""
+    if not live_credentials_present():
+        return None
+    try:
+        return create_live_read_only_client()
+    except Exception:  # noqa: BLE001 - the API reports unavailable without leaking detail
+        return None
+
+
 def configured_fingerprint() -> str | None:
     """The pinned account fingerprint, when one is configured.
 
@@ -418,14 +435,20 @@ def build_arm(state: ArmState | None) -> LiveArmPanel:
         return LiveArmPanel(
             state=ARM_UNKNOWN,
             armed=None,
+            durable_state=None,
+            environment_gate_open=environment_arm_gate_open(),
             reason=(
                 "The durable arm state could not be read. An unreadable arm switch is "
                 "not a disarmed one."
             ),
         )
+    environment_open = environment_arm_gate_open()
+    effectively_armed = state.armed and environment_open
     return LiveArmPanel(
-        state=STATE_ARMED if state.armed else STATE_DISARMED,
-        armed=state.armed,
+        state=STATE_ARMED if effectively_armed else STATE_DISARMED,
+        armed=effectively_armed,
+        durable_state=state.state,
+        environment_gate_open=environment_open,
         reason=state.reason,
         source=state.source,
         changed_at=_iso(state.changed_at),
@@ -603,6 +626,23 @@ def read_live_account(
     if account is None:
         return LiveAccountFacts(status=ACCOUNT_UNREADABLE)
 
+    return account_facts_from_broker(
+        account,
+        position_count=position_count,
+        open_order_count=open_order_count,
+        now=now,
+    )
+
+
+def account_facts_from_broker(
+    account: object,
+    *,
+    position_count: int | None = None,
+    open_order_count: int | None = None,
+    now: datetime | None = None,
+) -> LiveAccountFacts:
+    """Normalize one already-read broker account without another network call."""
+
     multiplier = _decimal_text(getattr(account, "multiplier", None))
     account_type: str | None = None
     if multiplier is not None:
@@ -655,17 +695,18 @@ def build_panel(
         expected_fingerprint=expected_fingerprint,
     )
     resolved_account = (
-        LiveAccountFacts(status=ACCOUNT_MISMATCH)
-        if identity.status == IDENTITY_MISMATCH
-        else account
+        account
+        if identity.status == IDENTITY_PINNED or account.status != ACCOUNT_OK
+        else LiveAccountFacts(status=ACCOUNT_MISMATCH)
     )
     risk = build_risk_envelope(policy, account=resolved_account, gross_exposure=gross_exposure)
     guard = build_deposit_day_guard(cash_flow_events, risk_day=now.astimezone(UTC).date())
 
     notices: list[str] = []
-    if identity.status == IDENTITY_MISMATCH:
+    if identity.status != IDENTITY_PINNED:
         notices.append(
-            "The account that answered is not the pinned account. No figure is shown for it."
+            "The broker account identity is not verified as the pinned account. "
+            "No account figure is shown."
         )
     if risk.status == CEILINGS_NOT_VERIFIED:
         notices.append(
@@ -735,12 +776,14 @@ __all__ = [
     "LiveSafetyPanel",
     "LiveServicePanel",
     "ReadableLiveBroker",
+    "account_facts_from_broker",
     "build_arm",
     "build_deposit_day_guard",
     "build_identity",
     "build_panel",
     "build_risk_envelope",
     "configured_fingerprint",
+    "create_live_read_broker",
     "live_credentials_present",
     "read_live_account",
 ]

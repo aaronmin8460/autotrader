@@ -99,12 +99,28 @@ def route_methods(application: FastAPI) -> set[str]:
     return methods
 
 
+app = create_app()
+
+
+def main() -> None:
+    """Run the loopback-only frozen accounting API."""
+    import uvicorn
+
+    uvicorn.run(app, host=DEFAULT_HOST, port=configured_port(), log_level="info")
+
+
 __all__ = [
     "ALLOWED_METHODS",
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "PORT_ENV",
+    "app",
     "configured_port",
     "create_app",
+    "main",
     "route_methods",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by the service manager
+    main()

@@ -1,159 +1,150 @@
-# LIVE FIRST DAY — RUNBOOK
+# LIVE FIRST DAY — PRODUCTION RUNBOOK
 
-Real money. Read the whole page before starting. Every step is a **stop point**:
-if a check does not read as written, stop and do not continue.
+Real money. Deployment, readiness, and a running process are not authorization
+to trade. Every check below is a stop point. The deployed first-month stack is
+expected to be **READY and DISARMED**, with zero Live broker mutations.
 
-The system is **DISARMED** and has placed **zero** orders. Nothing below happens
-by itself.
+## Fixed identities
 
----
-
-## Facts to check against
-
-| | |
+| Item | Expected |
 |---|---|
 | Account fingerprint | `a6bbf9c116a5679c58719d82d7e4b3e2` |
-| Account last four | `8990` |
+| Safe display | fingerprint `a6bbf9c1…`, account last four `8990` |
 | Policy | `LIVE_VALIDATION_100` |
 | Policy hash | `ecf003eb9a86814f2583c4e981bf39365e942e0e4dcc683c6c742fb3c00292d5` |
-| Code SHA | `30d43f9` (branch `ops/live-100-readiness`) |
-| Expected equity | ~$50 settled (or ~$100 after the second deposit) |
-| Ceilings at $50 | target $45.00 · hard $47.50 · bound $50.00 · per symbol $5.50 |
-| Ceilings at $100 | target $90.00 · hard $95.00 · bound $100.00 · per symbol $11.00 |
+| Runtime | `/opt/autotrader-equity-live/venv/bin/autotrader` |
+| Operational DB | `/var/lib/autotrader-equity-live/equity-live.db` |
+| Accounting DB | `/var/lib/autotrader-equity-live/live-accounting.db` |
+| Accounting API | `127.0.0.1:8005` |
+| Safety API | `127.0.0.1:8006` |
 
----
+At $50 verified broker equity, target/hard/absolute/per-symbol ceilings are
+$45.00/$47.50/$50.00/$5.50. At $100 or more they are capped at
+$90.00/$95.00/$100.00/$11.00. The API must quote these from
+`effective_ceilings`; never calculate them by hand to resolve a discrepancy.
 
-## Before the open
+## Exact production status sequence
 
-### 1 — Verify funding, positions and orders
-
-```bash
-cd /Volumes/AUTOTRADER_QA/worktrees/live-100-readiness && set -a && . ~/.config/autotrader/live.secrets.env && set +a && PYTHONPATH=src .venv/bin/python /Volumes/AUTOTRADER_QA/tmp/live_readonly_probe.py
-```
-
-**Stop unless:** fingerprint is `a6bbf9c1…`, `status ACTIVE`, `trading_blocked
-false`, `account_blocked false`, **0 positions**, **0 open orders**, and equity
-is the figure you expect. Do **not** count a deposit the broker has not settled.
-
-### 2 — Verify code and policy identity
+### 1. Services and the absent environment ARM gate
 
 ```bash
-git -C /Volumes/AUTOTRADER_QA/worktrees/live-100-readiness rev-parse --short HEAD
+sudo systemctl --no-pager --full status autotrader-equity-live.service autotrader-live-accounting-api.service autotrader-live-safety-api.service autotrader-live-accounting-sync.timer autotrader-live-daily-close.timer
+sudo test ! -e /etc/autotrader/autotrader-equity-live.arm.env
 ```
 
-**Stop unless** it is the SHA above, or a SHA you deliberately deployed.
+Stop unless the three services and two timers are active and the second command
+exits zero. During deployment and verification the ARM file must not exist.
 
-### 3 — Verify session status
-
-Market open 09:30 ET. The broker's own clock is the authority and the runtime
-reads it again immediately before every order. Do not start on a half day
-without checking the close time.
-
-### 4 — Run the DISARMED startup and read the ceilings
+### 2. Authoritative Live status
 
 ```bash
-cd /Volumes/AUTOTRADER_QA/worktrees/live-100-readiness && set -a && . ~/.config/autotrader/live.secrets.env && set +a && export AUTOTRADER_LIVE_ACCOUNT_FINGERPRINT=a6bbf9c116a5679c58719d82d7e4b3e2 && PYTHONPATH=src .venv/bin/python /Volumes/AUTOTRADER_QA/tmp/live_soak.py 1
+sudo -u ateqlive sh -c 'set -a; . /etc/autotrader/autotrader-equity-live.env; . /etc/autotrader/autotrader-equity-live.secrets.env; [ ! -r /etc/autotrader/autotrader-equity-live.arm.env ] || . /etc/autotrader/autotrader-equity-live.arm.env; set +a; exec /opt/autotrader-equity-live/venv/bin/autotrader live status'
 ```
 
-**Stop unless:** `result: VERIFIED`, `reconciliation_status: CLEAN`,
-`broker_mutation_attempts: 0`, `gateway: REFUSED_DISARMED`, and the ceilings
-match the equity you verified in step 1.
+Stop unless all of these are true: `live_ready=true`, effective arm state
+`DISARMED`, durable state `DISARMED`, environment gate false, account pin
+`PINNED`, account `ACTIVE`, account type `CASH`, multiplier `1`, shorting false,
+reconciliation `CLEAN` (or a reviewed `REPAIRED`), and every ceiling matches the
+current broker equity. `UNKNOWN`, a missing figure, or a mismatch is a stop.
 
----
+### 3. Reconciliation check
 
-## Arming
+```bash
+sudo -u ateqlive sh -c 'set -a; . /etc/autotrader/autotrader-equity-live.env; . /etc/autotrader/autotrader-equity-live.secrets.env; set +a; exec /opt/autotrader-equity-live/venv/bin/autotrader live reconcile --db /var/lib/autotrader-equity-live/equity-live.db'
+```
 
-### 5 — Arm the environment gate
+Stop unless `safe_to_trade=true`, status is `CLEAN` or explicitly reviewed
+`REPAIRED`, and issues/unresolved are zero. This command reads the broker and
+may repair only the dedicated local operational record; it cannot mutate the
+broker.
 
-Create `/etc/autotrader/autotrader-equity-live.arm.env` from the template, or
-export `AUTOTRADER_LIVE_ARMED=true` for a foreground run.
+### 4. Accounting status and frozen-contract contact
 
-### 6 — Arm the durable row
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8005/api/live-accounting/summary
+systemctl --no-pager --full status autotrader-live-accounting-sync.timer autotrader-live-daily-close.timer
+```
 
-Requires the exact token `ARM-LIVE-REAL-MONEY` and a recorded reason. **This is
-the moment real money becomes possible.**
+Stop unless the payload passes the frontend `parseSummary` validator,
+`accounting_status=CLEAN`, its account fingerprint matches, freshness is within
+the contract horizon, and withdrawal mode remains `OBSERVE_ONLY` with
+withdrawal authorization and automatic transfer both false. Broker
+withdrawable cash remains `NOT_EXPOSED_BY_BROKER`; do not substitute cash,
+equity, or buying power.
 
-Both gates are now open. Neither alone would have been enough.
+### 5. Dashboard and deployed identity
 
-### 7 — Start the runtime
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8006/api/live-safety/summary
+git -C /opt/autotrader-equity-live/app rev-parse HEAD
+```
 
-Watch the startup banner. **Stop and disarm unless** it reports the right
-account fingerprint, `LIVE_VALIDATION_100`, the policy hash above, and the
-ceilings from step 4.
+Open the authenticated `/live` page and verify `LIVE · REAL MONEY`, `READY`,
+`DISARMED`, the exact deployed SHA, current account figures, accounting figures,
+and freshness. Also smoke `/`, `/portfolio`, `/orders`, `/risk`, and `/system`.
+Unknown values must render as dashes/explanations, never fake zeros, `NaN`,
+`undefined`, or `null`.
 
----
+## Future ARM — not part of deployment
 
-## The first order is an operational test, not a trade
+Do not run this sequence merely because all checks pass. It belongs to a later,
+separately authorized first-Live session. Replace the reason with a dated,
+specific operator authorization before executing it.
 
-### 8 — Watch the first decision cycle
+First arm the durable row while the independent environment gate is still
+closed:
 
-Most cycles submit nothing. That is correct: EDA-1 holds a target, and a target
-that has not moved past the deadband is silence.
+```bash
+sudo -u ateqlive sh -c 'set -a; . /etc/autotrader/autotrader-equity-live.env; . /etc/autotrader/autotrader-equity-live.secrets.env; set +a; exec /opt/autotrader-equity-live/venv/bin/autotrader live arm --db /var/lib/autotrader-equity-live/equity-live.db --reason "FIRST LIVE SESSION APPROVED YYYY-MM-DD" --confirm ARM-LIVE-REAL-MONEY'
+```
 
-### 9 — When the first order goes out, verify every one of these
+Then, and only in that authorized session, open the environment gate and reload
+the process:
 
-| Check | Expect |
-|---|---|
-| Symbol | one of the ten |
-| Side | **BUY** or **SELL** — never anything else |
-| Quantity | fractional, and **≤ the slot** ($4.50 at $50) |
-| Notional | ≤ per-symbol ceiling ($5.50 at $50) |
-| Target allocation | matches the logged `target_weight` × equity |
-| Reference price | close to the current market |
-| `client_order_id` | starts `autotrader-` |
-| Broker order ID | present |
-| Status | `accepted` / `new` / `filled` |
-| Fill quantity | **may be 0 — accepted is not filled** |
-| Fill price | close to the reference price |
-| Remaining quantity | consistent with the fill |
-| Local ledger entry | one `order_intents` row, status `SUBMITTED` |
-| Position after fill | matches the broker exactly |
-| Cash after fill | reduced by roughly the notional |
-| **Gross after fill** | **≤ hard ceiling** ($47.50 at $50) |
+```bash
+sudo install -o root -g ateqlive -m 0640 /opt/autotrader-equity-live/app/deploy/env/autotrader-equity-live.arm.env.example /etc/autotrader/autotrader-equity-live.arm.env
+sudo systemctl restart autotrader-equity-live.service autotrader-live-accounting-api.service autotrader-live-safety-api.service
+```
 
-### 10 — Do not scale on success
+Repeat the full status sequence. Both gates must be visible. The runtime still
+requires account pinning, startup reconciliation, broker calendar/clock, cash
+settlement protection, deposit-day guard, risk approval, durable intent, and
+duplicate preflight before any one order can reach the broker.
 
-A first order that works proves connectivity, not edge. Nothing about the
-ceilings changes today, this week, or on the strength of a profitable day.
+## Emergency DISARM — fastest action
 
----
+The durable row is read immediately before each mutation, so write it first:
 
-## STOP CONDITIONS — disarm immediately
+```bash
+sudo -u ateqlive /opt/autotrader-equity-live/venv/bin/autotrader live disarm --db /var/lib/autotrader-equity-live/equity-live.db --reason "EMERGENCY OPERATOR DISARM"
+```
 
-Disarm on **any** of these. Do not wait to see whether the next cycle fixes it.
+Then remove the environment authorization and restart so the process-level
+gate is also closed:
 
-- wrong account fingerprint
-- wrong symbol, wrong side, or wrong quantity
-- gross above the hard ceiling
-- any leverage, any short position
-- a duplicate order
-- an unexplained position mismatch
-- reconciliation failure
-- a broker timeout with an ambiguous order state
-- a local ledger discrepancy
-- an unexpected extended-hours order
-- a strategy or policy SHA mismatch
-- a risk-policy mismatch
-- stale data or a clock/calendar anomaly
-- **a cash deposit or withdrawal settling mid-session** — the daily-loss halt is
-  measuring the transfer, not the trading, and the system blocks new entries for
-  that day by design
+```bash
+sudo rm -f /etc/autotrader/autotrader-equity-live.arm.env
+sudo systemctl restart autotrader-equity-live.service autotrader-live-accounting-api.service autotrader-live-safety-api.service
+```
 
-### How to disarm
+Removing the file does not change an already-running process's environment;
+the restart is required for that half. The durable DISARM takes effect without
+a restart. Neither action cancels, replaces, liquidates, transfers, or
+withdraws. Existing positions remain at the broker and require separate manual
+operator judgment.
 
-Delete the arm file, **or** write the durable DISARMED row. Either alone stops
-submission. Both are instant, neither cancels or flattens anything, and neither
-deletes any state.
+## Immediate stop conditions
 
-Disarming stops the system **adding**. Existing positions stay exactly as they
-are, and the runtime keeps observing so you can see what is happening.
+Stop and DISARM on a wrong fingerprint, non-cash or leveraged account, short
+position, unexplained order/position, unresolved reconciliation, unknown cash
+flow, stale or rejected accounting payload, risk mismatch, policy/SHA mismatch,
+broker ambiguity, duplicate order, extended-hours anomaly, deposit or
+withdrawal settling during the session, or any unexpected broker mutation.
 
----
+The authorized sequence is always:
 
-## Two things this system will not do for you
-
-1. **It never cancels or liquidates.** There is no cancel, replace or close call
-   anywhere in the repository. If you need a position closed today and the
-   system is disarmed, close it yourself at the broker.
-2. **It never moves money.** No transfer, ACH or withdrawal call exists. Profit
-   reserve and withdrawal accounting are Prompt 2.
+```text
+STATUS → READY=YES → ARMED=NO → PIN=PASS → RECONCILIATION=CLEAN
+→ ACCOUNTING=CLEAN → BALANCE/CAPS VERIFIED
+→ later, separately authorized session only: ARM
+```

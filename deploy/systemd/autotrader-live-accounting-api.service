@@ -1,0 +1,47 @@
+# Frozen-contract accounting reader on loopback. No broker credential, no ARM file.
+
+[Unit]
+Description=AutoTrader Live accounting API (read-only, 127.0.0.1:8005)
+Documentation=file:/opt/autotrader-equity-live/app/docs/LIVE_ACCOUNTING_API_CONTRACT.md
+After=network.target
+ConditionPathExists=/etc/autotrader/autotrader-equity-live.env
+ConditionPathExists=/opt/autotrader-equity-live/venv/bin/python
+
+[Service]
+Type=simple
+User=ateqlive
+Group=ateqlive
+WorkingDirectory=/opt/autotrader-equity-live/app
+EnvironmentFile=/etc/autotrader/autotrader-equity-live.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-live.arm.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/autotrader-equity-live/venv/bin/python -m autotrader.dashboard.live_accounting_api
+Restart=always
+RestartSec=5
+StateDirectory=autotrader-equity-live
+StateDirectoryMode=0750
+ReadOnlyPaths=/var/lib/autotrader-equity-live
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-live-accounting-api
+
+[Install]
+WantedBy=multi-user.target

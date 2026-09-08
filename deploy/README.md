@@ -55,12 +55,21 @@ See [Publishing the dashboard](../docs/DEPLOYMENT.md#publishing-the-dashboard).
 | `autotrader-equity-paper-api.service` | `always` | `127.0.0.1:8002`, read-only, `ateqpaper`; drop-in `10-dashboard-venv.conf` runs it from `/opt/autotrader-dashboard/venv` |
 | `autotrader-equity-a1b-shadow-api.service` | `always` | `127.0.0.1:8003`, read-only, `ata1bshadow`, from `/opt/autotrader-dashboard/venv` |
 | `autotrader-market-charts-api.service` | `always` | `127.0.0.1:8004`, provider bars only, no store, `ateqpaper`, from `/opt/autotrader-dashboard/venv` |
+| `autotrader-live-accounting-api.service` | `always` | `127.0.0.1:8005`, frozen contract, filesystem read-only, no broker credential |
+| `autotrader-live-safety-api.service` | `always` | `127.0.0.1:8006`, allowlisted real-broker reads only |
+| `autotrader-equity-live.service` | `on-failure`, never on exit 2 | Real money; separate identity/state/credentials; starts DISARMED |
+| `autotrader-live-accounting-sync.timer` | — | five-minute read-only broker sync into the dedicated accounting ledger |
+| `autotrader-live-daily-close.timer` | — | three idempotent same-evening attempts using the broker calendar and New York timezone |
 | `autotrader-backup.timer` | — | daily |
 
 `autotrader-dashboard-web.service.d/*.conf` are drop-ins that move the frontend
 build and hand it the loopback API origins; `30-dashboard-v2.conf` adds the two
 Dashboard V2 origins (`:8003`, `:8004`). None of the dashboard units is ordered
 before, after, bound to, or required by a trading or observing unit.
+`40-live.conf` adds the two isolated Live readers (`:8005`, `:8006`). The Live
+ARM file is optional and must remain absent during deployment; the base config
+sets both effective mutation gates closed while still permitting the Live
+runtime to observe.
 
 `caddy.service.d/10-autotrader-web.conf` is a drop-in for the Caddy package's
 own unit, not an `autotrader-*` unit. It adds one `EnvironmentFile` and is

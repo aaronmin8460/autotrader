@@ -38,6 +38,11 @@ BIN_ROOT = DEPLOY_ROOT / "bin"
 
 TRADING_UNITS = ("autotrader-crypto.service", "autotrader-equity.service")
 DASHBOARD_UNITS = ("autotrader-dashboard-api.service", "autotrader-dashboard-web.service")
+LIVE_RUNTIME_UNIT = "autotrader-equity-live.service"
+LIVE_READER_UNITS = (
+    "autotrader-live-accounting-api.service",
+    "autotrader-live-safety-api.service",
+)
 
 BASH_SCRIPTS = (
     "autotrader-deploy",
@@ -150,6 +155,53 @@ def test_the_expected_units_exist() -> None:
     assert set(TRADING_UNITS) <= names
     assert set(DASHBOARD_UNITS) <= names
     assert {"autotrader-backup.service", "autotrader-backup.timer"} <= names
+    assert LIVE_RUNTIME_UNIT in names
+    assert set(LIVE_READER_UNITS) <= names
+    assert {
+        "autotrader-live-accounting-sync.service",
+        "autotrader-live-accounting-sync.timer",
+        "autotrader-live-daily-close.service",
+        "autotrader-live-daily-close.timer",
+    } <= names
+
+
+def test_the_live_runtime_loads_the_arm_file_last_and_optionally() -> None:
+    unit = parse_unit(SYSTEMD_ROOT / LIVE_RUNTIME_UNIT)
+    files = directive(unit, "Service", "EnvironmentFile")
+    assert files[-1] == "-/etc/autotrader/autotrader-equity-live.arm.env"
+    assert one(unit, "Service", "Restart") == "on-failure"
+    assert "2" in (one(unit, "Service", "RestartPreventExitStatus") or "").split()
+    assert one(unit, "Service", "User") == "ateqlive"
+    assert "autotrader-equity-live/venv/bin/autotrader live run" in (
+        one(unit, "Service", "ExecStart") or ""
+    )
+
+
+@pytest.mark.parametrize("name", LIVE_READER_UNITS)
+def test_live_api_processes_are_filesystem_read_only(name: str) -> None:
+    unit = parse_unit(SYSTEMD_ROOT / name)
+    assert one(unit, "Service", "User") == "ateqlive"
+    assert one(unit, "Service", "ReadOnlyPaths") == "/var/lib/autotrader-equity-live"
+    assert "127.0.0.1" in (one(unit, "Unit", "Description") or "")
+
+
+def test_live_automation_uses_systemd_calendar_and_idempotent_retries() -> None:
+    sync = parse_unit(SYSTEMD_ROOT / "autotrader-live-accounting-sync.timer")
+    close = parse_unit(SYSTEMD_ROOT / "autotrader-live-daily-close.timer")
+    assert directive(sync, "Timer", "OnCalendar") == ["*-*-* *:03/5:30"]
+    close_times = directive(close, "Timer", "OnCalendar")
+    assert len(close_times) == 3
+    assert all(value.endswith("America/New_York") for value in close_times)
+    assert one(close, "Timer", "Persistent") == "true"
+
+
+def test_frontend_and_edge_proxy_carry_both_live_readers() -> None:
+    drop_in = (SYSTEMD_ROOT / "autotrader-dashboard-web.service.d/40-live.conf").read_text()
+    caddy = (DEPLOY_ROOT / "caddy/Caddyfile").read_text()
+    assert "LIVE_ACCOUNTING_API_ORIGIN=http://127.0.0.1:8005" in drop_in
+    assert "LIVE_SAFETY_API_ORIGIN=http://127.0.0.1:8006" in drop_in
+    assert "/api/live-accounting/*" in caddy
+    assert "/api/live-safety/*" in caddy
 
 
 @pytest.mark.parametrize("path", unit_files(), ids=lambda p: p.name)
@@ -349,7 +401,29 @@ def test_no_unit_embeds_a_credential() -> None:
     for path in unit_files():
         unit = parse_unit(path)
         for value in directive(unit, "Service", "Environment"):
-            assert not value.startswith(("ALPACA_API_KEY", "ALPACA_SECRET_KEY")), path.name
+            assert not value.startswith(
+                (
+                    "ALPACA_API_KEY",
+                    "ALPACA_SECRET_KEY",
+                    "ALPACA_LIVE_API_KEY",
+                    "ALPACA_LIVE_SECRET_KEY",
+                )
+            ), path.name
+
+
+def test_only_live_broker_readers_receive_the_live_secrets_file() -> None:
+    expected = {
+        LIVE_RUNTIME_UNIT,
+        "autotrader-live-accounting-sync.service",
+        "autotrader-live-daily-close.service",
+        "autotrader-live-safety-api.service",
+    }
+    actual = set()
+    for path in SYSTEMD_ROOT.glob("*.service"):
+        files = " ".join(directive(parse_unit(path), "Service", "EnvironmentFile"))
+        if "autotrader-equity-live.secrets.env" in files:
+            actual.add(path.name)
+    assert actual == expected
 
 
 def test_the_units_that_need_credentials_reference_the_secrets_file() -> None:
@@ -400,7 +474,15 @@ def test_the_real_money_default_posture_is_disarmed() -> None:
     text = (ENV_ROOT / "autotrader-equity-live.env.example").read_text()
     assert "AUTOTRADER_LIVE_ARMED=false" in text
     assert "AUTOTRADER_LIVE_ARMED=true" not in text
-    assert "AUTOTRADER_EQUITY_LIVE_ARGS=\n" in text
+    assert "AUTOTRADER_EQUITY_LIVE_ARGS=--confirm-runtime-environment REAL-MONEY" in text
+    assert "AUTOTRADER_LIVE_READY=false" in text
+    # Runtime/environment acknowledgement lets an observer start; only the
+    # independent literal ARM variable authorizes mutation.
+    args = next(
+        line for line in text.splitlines() if line.startswith("AUTOTRADER_EQUITY_LIVE_ARGS=")
+    )
+    assert "ARM-LIVE-REAL-MONEY" not in args
+    assert "AUTOTRADER_LIVE_ARMED" not in args
 
 
 def test_the_real_money_account_pin_ships_unset() -> None:

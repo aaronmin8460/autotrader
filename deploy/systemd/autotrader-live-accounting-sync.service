@@ -1,0 +1,38 @@
+# Read broker activity/account state; write only the dedicated accounting SQLite ledger.
+
+[Unit]
+Description=AutoTrader Live flow-adjusted accounting synchronization
+Documentation=file:/opt/autotrader-equity-live/app/docs/LIVE_ACCOUNTING_API_CONTRACT.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/autotrader/autotrader-equity-live.env
+ConditionPathExists=/opt/autotrader-equity-live/venv/bin/autotrader
+
+[Service]
+Type=oneshot
+User=ateqlive
+Group=ateqlive
+WorkingDirectory=/opt/autotrader-equity-live/app
+EnvironmentFile=/etc/autotrader/autotrader-equity-live.env
+EnvironmentFile=-/etc/autotrader/autotrader-equity-live.secrets.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/autotrader-equity-live/venv/bin/autotrader live accounting-sync --db ${AUTOTRADER_LIVE_ACCOUNTING_DB}
+TimeoutStartSec=180
+StateDirectory=autotrader-equity-live
+StateDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autotrader-live-accounting-sync

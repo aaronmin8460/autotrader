@@ -15,6 +15,7 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+from autotrader.live.readiness import configured_live_readiness
 from autotrader.liveaccounting import readmodel, store
 from autotrader.liveaccounting.models import (
     STATUS_BROKER_UNAVAILABLE,
@@ -29,6 +30,9 @@ DEFAULT_DATABASE = "data/live_accounting.db"
 
 #: The pinned account, read from the same variable the live runtime pins to.
 FINGERPRINT_ENV = "AUTOTRADER_LIVE_ACCOUNT_FINGERPRINT"
+
+# The dedicated operational store that owns the durable arm row.
+LIVE_DATABASE_ENV = "AUTOTRADER_EQUITY_LIVE_DB"
 
 
 def database_path() -> Path:
@@ -99,11 +103,16 @@ def read_safety_state() -> readmodel.LiveSafetyState:
     most dangerous substitution this dashboard could make, so it is not made:
     unknown stays unknown all the way to the screen.
     """
-    from autotrader.live.armstate import STATE_ARMED, read_arm_state
+    from autotrader.live.armstate import (
+        STATE_ARMED,
+        environment_arm_gate_open,
+        read_arm_state,
+    )
 
-    path = os.environ.get("AUTOTRADER_LIVE_DB", "").strip()
+    readiness = configured_live_readiness()
+    path = os.environ.get(LIVE_DATABASE_ENV, "").strip()
     if not path or not Path(path).exists():
-        return readmodel.LiveSafetyState(live_ready=None, live_armed=None)
+        return readmodel.LiveSafetyState(live_ready=readiness, live_armed=None)
     try:
         import sqlite3
 
@@ -115,9 +124,10 @@ def read_safety_state() -> readmodel.LiveSafetyState:
         finally:
             connection.close()
     except Exception:  # noqa: BLE001
-        return readmodel.LiveSafetyState(live_ready=None, live_armed=None)
+        return readmodel.LiveSafetyState(live_ready=readiness, live_armed=None)
     return readmodel.LiveSafetyState(
-        live_ready=True, live_armed=getattr(state, "state", None) == STATE_ARMED
+        live_ready=readiness,
+        live_armed=(getattr(state, "state", None) == STATE_ARMED and environment_arm_gate_open()),
     )
 
 
@@ -125,6 +135,7 @@ __all__ = [
     "DATABASE_ENV",
     "DEFAULT_DATABASE",
     "FINGERPRINT_ENV",
+    "LIVE_DATABASE_ENV",
     "STATUS_BROKER_UNAVAILABLE",
     "build_summary",
     "database_path",

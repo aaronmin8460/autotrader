@@ -30,8 +30,11 @@ from autotrader.equity.allocation import (
     POLICY_LIVE_VALIDATION_100,
     allocation_policy_for,
 )
+from autotrader.execution.live import LiveReadOnlyClient
 from autotrader.live.armstate import ArmState
 from autotrader.live.budget import CashFlowEvent
+from autotrader.live.identity import account_fingerprint
+from autotrader.state.sqlite import initialize_database
 
 PINNED = "a6bbf9c116a5679c58719d82d7e4b3e2"
 NOW = datetime(2026, 9, 8, 14, 5, tzinfo=UTC)
@@ -183,6 +186,29 @@ def test_anything_that_is_not_the_literal_armed_string_is_not_armed() -> None:
     assert live_safety.build_arm(state).armed is False
 
 
+def test_both_arm_gates_are_required_for_the_dashboard_to_say_armed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    durable = ArmState(
+        state="ARMED",
+        reason="operator authorized a later session",
+        source="operator",
+        changed_at=NOW,
+    )
+    monkeypatch.setenv("AUTOTRADER_LIVE_ARMED", "false")
+    closed = live_safety.build_arm(durable)
+    assert closed.durable_state == "ARMED"
+    assert closed.environment_gate_open is False
+    assert closed.state == "DISARMED"
+    assert closed.armed is False
+
+    monkeypatch.setenv("AUTOTRADER_LIVE_ARMED", "true")
+    opened = live_safety.build_arm(durable)
+    assert opened.environment_gate_open is True
+    assert opened.state == "ARMED"
+    assert opened.armed is True
+
+
 # --------------------------------------------------------------- identity --
 
 
@@ -214,6 +240,21 @@ def test_an_unpinned_deployment_says_so_rather_than_claiming_a_match() -> None:
     panel = live_safety.build_identity(observed_fingerprint=PINNED, expected_fingerprint=None)
     assert panel.status == live_safety.IDENTITY_NOT_PINNED
     assert panel.detail is not None
+
+
+def test_an_unpinned_deployment_hides_readable_account_figures(policy) -> None:
+    panel = live_safety.build_panel(
+        now=NOW,
+        policy=policy,
+        account=account(equity="1000.00"),
+        arm_state=None,
+        observed_fingerprint=PINNED,
+        expected_fingerprint=None,
+    )
+    assert panel.identity.status == live_safety.IDENTITY_NOT_PINNED
+    assert panel.account.status == live_safety.ACCOUNT_MISMATCH
+    assert panel.account.equity is None
+    assert panel.risk.status == live_safety.CEILINGS_NOT_VERIFIED
 
 
 # ------------------------------------------------------- deposit-day guard --
@@ -405,6 +446,107 @@ def test_a_write_to_any_route_is_refused() -> None:
     for method in ("post", "put", "patch", "delete"):
         response = getattr(client, method)("/api/live-safety/summary")
         assert response.status_code in {404, 405}
+
+
+def test_the_real_panel_uses_broker_and_local_truth_without_a_mutation_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BrokerAccount:
+        account_number = "LIVE-TEST-8990"
+        equity = "50.00"
+        cash = "50.00"
+        buying_power = "50.00"
+        status = "ACTIVE"
+        multiplier = "1"
+        shorting_enabled = False
+        trading_blocked = False
+        account_blocked = False
+        transfers_blocked = False
+
+    class Position:
+        market_value = "4.25"
+
+    class Reader:
+        def get_account(self):
+            return BrokerAccount()
+
+        def get_all_positions(self):
+            return [Position()]
+
+        def get_orders(self, request=None):
+            return []
+
+        def get_account_activities(self, activity_type, after=None):
+            return []
+
+    database = tmp_path / "live.db"
+    initialize_database(database)
+    monkeypatch.setenv("AUTOTRADER_EQUITY_LIVE_DB", str(database))
+    monkeypatch.setenv("AUTOTRADER_LIVE_READY", "true")
+    monkeypatch.setenv("AUTOTRADER_LIVE_ARMED", "false")
+    monkeypatch.setenv("AUTOTRADER_DEPLOYED_SHA", "d" * 40)
+    monkeypatch.setenv(
+        "AUTOTRADER_LIVE_ACCOUNT_FINGERPRINT",
+        account_fingerprint(BrokerAccount.account_number),
+    )
+    monkeypatch.setattr(live_safety, "create_live_read_broker", lambda: Reader())
+    monkeypatch.setattr(
+        live_api,
+        "read_unit_properties",
+        lambda unit: {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "UnitFileState": "enabled",
+        },
+    )
+
+    panel = live_api.build_panel(now=NOW)
+    assert panel.live_ready is True
+    assert panel.arm.state == "DISARMED"
+    assert panel.arm.environment_gate_open is False
+    assert panel.identity.status == "PINNED"
+    assert panel.account.account_type == "CASH"
+    assert panel.account.position_count == 1
+    assert panel.account.open_order_count == 0
+    assert panel.risk.current_gross_exposure == "4.25"
+    assert panel.risk.target_gross == "45.00"
+    assert panel.deposit_day_guard.status == "INACTIVE"
+    assert panel.service.state == "RUNNING"
+    assert panel.code_sha == "d" * 40
+
+
+def test_the_live_read_facade_is_explicit_and_pages_with_a_bound() -> None:
+    class RawClient:
+        _base_url = "live"
+        _sandbox = False
+
+        def __init__(self):
+            self.requests = []
+
+        def get(self, path, params):
+            self.requests.append((path, params))
+            if len(self.requests) == 1:
+                return [
+                    {"id": "one", "activity_type": "CSD"},
+                    {"id": "two", "activity_type": "CSD"},
+                ]
+            return []
+
+    raw = RawClient()
+    reader = LiveReadOnlyClient(raw)  # type: ignore[arg-type]
+    rows = reader.get_account_activities("CSD", NOW, page_size=2)
+    assert [row["id"] for row in rows] == ["one", "two"]
+    assert reader.read_count == 2
+    assert raw.requests[1][1]["page_token"] == "two"
+    for forbidden in (
+        "submit_order",
+        "cancel_order",
+        "replace_order",
+        "close_position",
+        "create_transfer",
+    ):
+        assert not hasattr(reader, forbidden)
 
 
 # ------------------------------------------------------- structural safety --

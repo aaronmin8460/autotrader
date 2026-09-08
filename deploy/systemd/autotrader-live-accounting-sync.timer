@@ -1,0 +1,11 @@
+[Unit]
+Description=Five-minute AutoTrader Live accounting synchronization
+
+[Timer]
+OnCalendar=*-*-* *:03/5:30
+RandomizedDelaySec=15
+Persistent=true
+Unit=autotrader-live-accounting-sync.service
+
+[Install]
+WantedBy=timers.target

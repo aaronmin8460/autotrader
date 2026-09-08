@@ -697,7 +697,13 @@ def test_the_accounting_package_is_not_imported_by_any_trading_path() -> None:
     )
     offenders = [name for name in consumers if name.startswith(deciding)]
     assert offenders == [], offenders
-    assert set(consumers) <= {"cli/__init__.py", "dashboard/live_accounting.py"}, consumers
+    assert set(consumers) <= {
+        "cli/__init__.py",
+        "dashboard/live_accounting.py",
+        # Production orchestration writes the dedicated ledger from read-only
+        # broker observations; no strategy or risk path imports this module.
+        "liveops/operations.py",
+    }, consumers
 
 
 # ==========================================================================

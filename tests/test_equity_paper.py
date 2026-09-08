@@ -435,13 +435,17 @@ def test_the_live_boundary_cannot_submit_cancel_or_transfer() -> None:
 #: `tests/test_live_dashboard.py` asserts it reaches no mutation entry point and
 #: names no credential variable. Its API serves `{GET, HEAD}` only.
 #:
-#: All three are named rather than pattern-matched, so a fourth module acquiring
+#: `liveops/cli.py` is the production orchestrator: the only command surface
+#: allowed to construct the isolated client and hand it to those audited gates.
+#:
+#: All four are named rather than pattern-matched, so a fifth module acquiring
 #: a route to real money fails this test rather than joining a wildcard. Growing
 #: this set is a deliberate act that shows up in a diff.
 REAL_MONEY_MODULES = {
     ("execution", "live.py"),
     ("equity", "live.py"),
     ("dashboard", "live_safety.py"),
+    ("liveops", "cli.py"),
 }
 
 

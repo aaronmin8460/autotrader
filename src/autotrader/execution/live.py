@@ -58,9 +58,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import UTC, datetime
 from enum import Enum
+from typing import Any
 
 from alpaca.common.enums import BaseURL
+from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
 
 from autotrader.execution.models import ExecutionError
@@ -165,6 +168,116 @@ def create_live_trading_client() -> TradingClient:
     return client
 
 
+def create_live_market_data_client() -> StockHistoricalDataClient:
+    """Build a stock-data reader from the isolated Live credential pair."""
+    api_key, secret_key = _require_live_credentials()
+    return StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
+
+
+class LiveReadOnlyClient:
+    """An allowlisted read facade over a real-money trading client.
+
+    Observer processes receive this object rather than the SDK client it
+    contains. There is no generic attribute forwarding and no generic request
+    method, so every capability is visible in this class.
+    """
+
+    def __init__(self, client: TradingClient) -> None:
+        self.__client = client
+        self.read_count = 0
+
+    @property
+    def _base_url(self) -> object:
+        return getattr(self.__client, "_base_url", None)
+
+    @property
+    def _sandbox(self) -> object:
+        return getattr(self.__client, "_sandbox", None)
+
+    def get_account(self) -> object:
+        self.read_count += 1
+        return self.__client.get_account()
+
+    def get_all_positions(self) -> object:
+        self.read_count += 1
+        return self.__client.get_all_positions()
+
+    def get_orders(self, request: object | None = None) -> object:
+        self.read_count += 1
+        return self.__client.get_orders(request)  # type: ignore[arg-type]
+
+    def get_order_by_client_id(self, client_order_id: str) -> object:
+        self.read_count += 1
+        return self.__client.get_order_by_client_id(client_order_id)
+
+    def get_clock(self) -> object:
+        self.read_count += 1
+        return self.__client.get_clock()
+
+    def get_asset(self, symbol: str) -> object:
+        self.read_count += 1
+        return self.__client.get_asset(symbol)
+
+    def get_calendar(self, request: object) -> object:
+        self.read_count += 1
+        return self.__client.get_calendar(request)  # type: ignore[arg-type]
+
+    def get_account_activities(
+        self,
+        activity_type: str,
+        after: datetime | None = None,
+        *,
+        max_requests: int = 20,
+        page_size: int = 100,
+    ) -> tuple[dict[str, Any], ...]:
+        """Read one account-activity type completely, with bounded paging."""
+        kind = str(activity_type).strip().upper()
+        if not kind or not kind.isalnum():
+            raise ValueError("activity_type must be a non-empty alphanumeric broker type")
+        if max_requests < 1 or page_size < 1:
+            raise ValueError("activity pagination bounds must be positive")
+
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        page_token: str | None = None
+        for _ in range(max_requests):
+            params: dict[str, object] = {"direction": "asc", "page_size": page_size}
+            if after is not None:
+                params["after"] = after.astimezone(UTC).isoformat()
+            if page_token is not None:
+                params["page_token"] = page_token
+            self.read_count += 1
+            payload = self.__client.get(f"/account/activities/{kind}", params)
+            if payload is None:
+                return tuple(rows)
+            if not isinstance(payload, list):
+                raise RuntimeError("the broker returned account activities in an unknown shape")
+            if not payload:
+                return tuple(rows)
+            fresh = 0
+            for item in payload:
+                if not isinstance(item, dict):
+                    raise RuntimeError(
+                        "the broker returned an account activity in an unknown shape"
+                    )
+                identity = str(item.get("id", "")).strip()
+                if identity and identity in seen:
+                    continue
+                if identity:
+                    seen.add(identity)
+                rows.append(item)
+                fresh += 1
+            page_token = str(payload[-1].get("id", "")).strip() or None
+            if fresh == 0 or page_token is None or len(payload) < page_size:
+                return tuple(rows)
+        raise RuntimeError(f"the account activity record did not end within {max_requests} reads")
+
+
+def create_live_read_only_client() -> LiveReadOnlyClient:
+    """Build the allowlisted facade used by Live observer processes."""
+    return LiveReadOnlyClient(create_live_trading_client())
+
+
 def verify_live_environment(client: TradingClient) -> str:
     """Return the real-money base URL, or raise unless `client` provably reaches it.
 
@@ -232,8 +345,11 @@ __all__ = [
     "LIVE_API_KEY_ENV",
     "LIVE_SECRET_KEY_ENV",
     "LIVE_TRADING_BASE_URL",
+    "LiveReadOnlyClient",
     "MissingLiveCredentialsError",
     "NotLiveEnvironmentError",
+    "create_live_market_data_client",
+    "create_live_read_only_client",
     "create_live_trading_client",
     "live_credentials_configured",
     "require_live_submission_allowed",

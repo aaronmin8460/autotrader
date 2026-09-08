@@ -1,0 +1,16 @@
+# Three same-evening attempts. The broker calendar selects holidays and early
+# closes; the ledger's unique daily-close key makes repeats no-ops.
+
+[Unit]
+Description=AutoTrader Live broker-calendar daily-close schedule
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:10:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 16:40:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 17:10:00 America/New_York
+RandomizedDelaySec=30
+Persistent=true
+Unit=autotrader-live-daily-close.service
+
+[Install]
+WantedBy=timers.target

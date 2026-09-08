@@ -54,6 +54,7 @@ shorts, no extended hours, and no streaming.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
@@ -89,6 +90,7 @@ from autotrader.execution.models import (
     OrderIntent,
     OrderSide,
     format_quantity,
+    new_client_order_id,
     normalize_side,
     require_quantity,
     require_reference_price,
@@ -657,6 +659,9 @@ def execute_equity_paper_order(
     account_lock: AccountExecutionLock | CompositeAccountLock | None = None,
     risk_policy: RiskPolicy = DEFAULT_POLICY,
     fractional: bool = False,
+    before_mutation: Callable[[sqlite3.Connection, object, OrderSide, datetime], None]
+    | None = None,
+    client_order_id_factory: Callable[[], str] = new_client_order_id,
 ) -> PaperExecutionResult:
     """Run the full paper execution pipeline for one equity order.
 
@@ -713,7 +718,7 @@ def execute_equity_paper_order(
     order_side = normalize_side(side)
     quantity = require_quantity(requested_quantity, "requested_quantity")
 
-    if not dry_run:
+    if not dry_run and before_mutation is None:
         require_paper_trading_enabled()
 
     client = trading_client if trading_client is not None else create_paper_trading_client()
@@ -827,6 +832,7 @@ def execute_equity_paper_order(
             reference_price=reference_price,
             risk_reason_code=decision.reason_code,
             created_at=moment,
+            client_order_id=client_order_id_factory(),
             strategy_run_id=strategy_run_id,
         )
 
@@ -841,6 +847,14 @@ def execute_equity_paper_order(
             )
 
         require_market_open(client)
+
+        # A real-money caller supplies its own fail-closed gate. Ask it after
+        # every potentially slow read and immediately before the durable intent
+        # and broker request, so a mid-cycle DISARM affects this mutation.
+        # Paper retains its existing gate at function entry when this callback
+        # is absent.
+        if before_mutation is not None:
+            before_mutation(connection, client, order_side, moment)
 
         order_intent_id = state.record_order_intent(
             connection,
