@@ -474,7 +474,10 @@ def test_the_real_money_default_posture_is_disarmed() -> None:
     text = (ENV_ROOT / "autotrader-equity-live.env.example").read_text()
     assert "AUTOTRADER_LIVE_ARMED=false" in text
     assert "AUTOTRADER_LIVE_ARMED=true" not in text
-    assert "AUTOTRADER_EQUITY_LIVE_ARGS=--confirm-runtime-environment REAL-MONEY" in text
+    assert (
+        'AUTOTRADER_EQUITY_LIVE_ARGS="--confirm-runtime-environment REAL-MONEY '
+        '--safety-delay 120"' in text
+    )
     assert "AUTOTRADER_LIVE_READY=false" in text
     # Runtime/environment acknowledgement lets an observer start; only the
     # independent literal ARM variable authorizes mutation.
@@ -483,6 +486,26 @@ def test_the_real_money_default_posture_is_disarmed() -> None:
     )
     assert "ARM-LIVE-REAL-MONEY" not in args
     assert "AUTOTRADER_LIVE_ARMED" not in args
+
+
+def test_the_live_environment_is_safe_to_source_in_operator_shell_commands() -> None:
+    """The runbook sources this file, so spaces must not become commands."""
+    path = ENV_ROOT / "autotrader-equity-live.env.example"
+    result = subprocess.run(
+        [
+            "sh",
+            "-c",
+            '. "$1"; printf "%s" "$AUTOTRADER_EQUITY_LIVE_ARGS"',
+            "sh",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout == "--confirm-runtime-environment REAL-MONEY --safety-delay 120"
 
 
 def test_the_real_money_account_pin_ships_unset() -> None:
