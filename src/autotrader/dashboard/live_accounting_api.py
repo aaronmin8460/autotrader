@@ -23,7 +23,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from autotrader.dashboard import live_accounting
+from autotrader.dashboard import live_accounting, live_history
 
 #: Loopback only, and not configurable here.
 DEFAULT_HOST = "127.0.0.1"
@@ -81,6 +81,11 @@ def create_app() -> FastAPI:
     def summary() -> dict[str, Any]:
         """The frozen contract payload."""
         return live_accounting.build_summary()
+
+    @application.get(f"{_API_PREFIX}/history", tags=["live-accounting"])
+    def history() -> dict[str, Any]:
+        """Authoritative checkpoint series and external-flow markers."""
+        return live_history.build_history()
 
     @application.middleware("http")
     async def _no_store(request, call_next):  # type: ignore[no-untyped-def]

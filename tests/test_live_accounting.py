@@ -700,6 +700,10 @@ def test_the_accounting_package_is_not_imported_by_any_trading_path() -> None:
     assert set(consumers) <= {
         "cli/__init__.py",
         "dashboard/live_accounting.py",
+        # Terminal V4 history is a second display-only dashboard consumer. It
+        # delegates the frozen formulas to liveaccounting and cannot feed a
+        # strategy, allocator, risk, execution, or reconciliation path.
+        "dashboard/live_history.py",
         # Production orchestration writes the dedicated ledger from read-only
         # broker observations; no strategy or risk path imports this module.
         "liveops/operations.py",

@@ -4,6 +4,7 @@ import { AppShell } from "@/components/shell/AppShell";
 import { DashboardProvider } from "@/lib/dashboard";
 import { I18nProvider } from "@/lib/i18n";
 import { BOOTSTRAP_SCRIPT } from "@/lib/i18n/locale";
+import { TerminalProvider } from "@/lib/terminal";
 
 import "./globals.css";
 
@@ -45,7 +46,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className="min-h-full antialiased">
         <I18nProvider>
           <DashboardProvider>
-            <AppShell>{children}</AppShell>
+            <TerminalProvider>
+              <AppShell>{children}</AppShell>
+            </TerminalProvider>
           </DashboardProvider>
         </I18nProvider>
       </body>

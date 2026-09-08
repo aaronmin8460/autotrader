@@ -45,7 +45,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from autotrader.dashboard import live_safety
+from autotrader.dashboard import live_safety, live_terminal
 from autotrader.dashboard.service_units import read_unit_properties
 from autotrader.execution.equity import fetch_open_paper_orders
 from autotrader.live.activity import LiveActivityError, read_cash_flow_events
@@ -278,6 +278,11 @@ def create_app() -> FastAPI:
     def summary() -> live_safety.LiveSafetyPanel:
         """The whole Live safety panel: arm, identity, account, ceilings, guard."""
         return build_panel()
+
+    @application.get(f"{_API_PREFIX}/terminal", tags=["live-safety"])
+    def terminal() -> dict[str, Any]:
+        """Live positions, recorded decisions/orders, metrics, and event tape."""
+        return live_terminal.build_terminal(path=_live_database_path())
 
     @application.middleware("http")
     async def _no_store(request, call_next):  # type: ignore[no-untyped-def]
