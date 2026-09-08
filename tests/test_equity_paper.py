@@ -429,9 +429,20 @@ def test_the_live_boundary_cannot_submit_cancel_or_transfer() -> None:
 #:
 #: `execution/live.py` is the boundary itself; `equity/live.py` is the
 #: real-money startup sequence, which is the only thing that legitimately needs
-#: it. Both are named rather than pattern-matched, so a third module acquiring
-#: a route to real money fails this test rather than joining a wildcard.
-REAL_MONEY_MODULES = {("execution", "live.py"), ("equity", "live.py")}
+#: it. `dashboard/live_safety.py` is the read-only safety panel: it asks the
+#: boundary one question - whether real-money read credentials are configured -
+#: precisely so that it does not answer that question a second time itself, and
+#: `tests/test_live_dashboard.py` asserts it reaches no mutation entry point and
+#: names no credential variable. Its API serves `{GET, HEAD}` only.
+#:
+#: All three are named rather than pattern-matched, so a fourth module acquiring
+#: a route to real money fails this test rather than joining a wildcard. Growing
+#: this set is a deliberate act that shows up in a diff.
+REAL_MONEY_MODULES = {
+    ("execution", "live.py"),
+    ("equity", "live.py"),
+    ("dashboard", "live_safety.py"),
+}
 
 
 def test_nothing_on_the_paper_path_can_reach_the_real_money_boundary() -> None:

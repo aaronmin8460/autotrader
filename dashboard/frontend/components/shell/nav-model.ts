@@ -1,5 +1,5 @@
 /**
- * The navigation model: eight destinations, four of them new in V3.
+ * The navigation model: nine destinations, one of them real money.
  *
  * **Every route that existed at Dashboard V2 keeps its exact path.** `/`,
  * `/equity-paper` and `/shadows` are the deployed, documented, bookmarked
@@ -17,6 +17,7 @@ export type SectionKey =
   | "portfolio"
   | "strategies"
   | "equityPaper"
+  | "live"
   | "shadows"
   | "orders"
   | "risk"
@@ -31,6 +32,15 @@ export interface NavItem {
   child?: boolean;
   /** Observation-only destinations carry the violet accent. */
   observe?: boolean;
+  /**
+   * The real-money destination.
+   *
+   * Exactly one item may carry this, and it is the only place in the
+   * navigation where an order can reach a real broker. It is marked here
+   * rather than inferred from the path so the distinction survives a rename,
+   * and so `Sidebar` never has to know which string means real money.
+   */
+  live?: boolean;
 }
 
 export const NAV_ITEMS: ReadonlyArray<NavItem> = [
@@ -43,6 +53,14 @@ export const NAV_ITEMS: ReadonlyArray<NavItem> = [
     labelKey: "nav.equityPaper",
     detailKey: "nav.detail.equityPaper",
     child: true,
+  },
+  {
+    key: "live",
+    href: "/live",
+    labelKey: "nav.live",
+    detailKey: "nav.detail.live",
+    child: true,
+    live: true,
   },
   {
     key: "shadows",

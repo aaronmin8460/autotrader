@@ -15,26 +15,39 @@
  * legacy one.
  *
  * The dashboard API table below is a description of this deployment, not a
- * probe: it lists the five loopback processes, their prefixes, their identities
- * and their poll intervals. No credential appears anywhere on this page.
+ * probe: it lists the seven loopback processes, their prefixes, their
+ * identities and their poll intervals. No credential appears anywhere on this
+ * page.
+ *
+ * **The Live unit has five states and NOT INSTALLED is one of them.** Prompt 1
+ * prepared the real-money unit and deliberately left installing it as the first
+ * step of the first-day runbook, so before the first Live day `NOT INSTALLED`
+ * is correct rather than broken. It is drawn muted and says so. `DISABLED`,
+ * `STOPPED`, `RUNNING` and `UNKNOWN` are kept distinct from it because an
+ * operator does something different about each.
  */
 
+import { LiveTag } from "@/components/live/atoms";
 import { AccountSafety } from "@/components/AccountSafety";
 import { Reconciliation, SystemHealth } from "@/components/SystemHealth";
 import { Runtimes } from "@/components/Runtime";
 import { PageHeader } from "@/components/shell/PageHeader";
-import { Card, DataTable, FreshnessIndicator, SectionHeader, Td, Th, Tr, freshnessOf } from "@/components/ui";
+import { Card, DataTable, FreshnessIndicator, SectionHeader, Status, Td, Th, Tr, freshnessOf } from "@/components/ui";
+import { serviceView, useLiveSafety } from "@/lib/live";
 import { PAPER_POLL_INTERVAL_MS } from "@/lib/paper";
 import { useDashboard } from "@/lib/dashboard";
 import { useI18n } from "@/lib/i18n";
 import { useFormat } from "@/lib/i18n/useFormat";
 
 /**
- * The five read models this dashboard is built from.
+ * The seven read models this dashboard is built from.
  *
  * Static because it describes the deployment's shape rather than its state:
- * five processes, five identities, five records, every route a GET. The live
- * part — whether each answered — is the freshness column beside it.
+ * seven processes, seven identities, seven records, every route a GET. The
+ * live part — whether each answered — is the freshness column beside it.
+ *
+ * The last two are real money and run as their own identity, so a real-money
+ * credential never sits in a process that holds a paper one.
  */
 const RECORDS = [
   {
@@ -67,6 +80,18 @@ const RECORDS = [
     prefix: "/api/market-charts/*",
     identity: "ateqpaper",
   },
+  {
+    key: "live-accounting",
+    record: "REAL MONEY · flows, flow-adjusted equity, HWM, profit reserve",
+    prefix: "/api/live-accounting/*",
+    identity: "ateqlive",
+  },
+  {
+    key: "live-safety",
+    record: "REAL MONEY · arm switch, account pin, exposure ceilings",
+    prefix: "/api/live-safety/*",
+    identity: "ateqlive",
+  },
 ] as const;
 
 export default function SystemPage() {
@@ -74,6 +99,8 @@ export default function SystemPage() {
   const format = useFormat();
   const { account, paper, services, accountIntervalMs } = useDashboard();
   const data = account.data;
+  const liveSafety = useLiveSafety();
+  const liveService = serviceView(liveSafety.data);
 
   const paperFreshness = freshnessOf(
     paper.data?.generated_at ?? null,
@@ -157,6 +184,29 @@ export default function SystemPage() {
           <div className="border-t border-subtle px-4 py-3.5">
             <p className="text-meta leading-snug text-ink-3">{t("system.accessNote")}</p>
           </div>
+        </Card>
+      </div>
+
+      {/* ---- The real-money unit. Five states, NOT INSTALLED among them. ---- */}
+      <div className="space-y-2">
+        <SectionHeader
+          title={`${t("env.live.realMoney")} · ${t("live.ops.service")}`}
+          meta={<LiveTag />}
+        />
+        <Card title={t("live.ops.service")} meta={<span className="num text-meta text-ink-3">{liveService.unit}</span>}>
+          <Status tone={liveService.tone} size="md">
+            {t(liveService.labelKey)}
+          </Status>
+          {liveService.state === "NOT_INSTALLED" ? (
+            <p className="mt-2 max-w-[92ch] text-meta leading-relaxed text-ink-3">
+              {t("live.service.notInstalledIsExpected")}
+            </p>
+          ) : null}
+          {liveService.detail ? (
+            <p className="mt-2 max-w-[92ch] text-meta leading-relaxed text-ink-3">
+              {liveService.detail}
+            </p>
+          ) : null}
         </Card>
       </div>
 

@@ -20,6 +20,12 @@
  *   8. recent orders              the merged stream, newest eight
  *   9. shadows                    what the observers observe, in violet
  *
+ * **Every account figure on this page is the PAPER account.** That was true at
+ * V2 and was left implicit; it is stated now, because a real-money account
+ * exists beside it. The Live summary card sits directly under the banner,
+ * carries its own REAL MONEY label, and shares no figure with anything below
+ * it - the two accounts are never added together, anywhere.
+ *
  * **Four records, one page.** The operational API describes the broker account
  * and the crypto store's trail; the paper API describes the deployed policy,
  * the regime and the merged order list; the chart process supplies price series
@@ -37,6 +43,7 @@
 import Link from "next/link";
 import { useCallback, useMemo, useState } from "react";
 
+import { LiveSummaryCard } from "@/components/live/LiveSummary";
 import { AccountOrders } from "@/components/AccountOrders";
 import { AccountSummary } from "@/components/AccountSummary";
 import { Attention } from "@/components/Attention";
@@ -47,10 +54,17 @@ import { Risk } from "@/components/Risk";
 import { ShadowSummary } from "@/components/Shadows";
 import { SymbolDetail } from "@/components/SymbolDetail";
 import { PageHeader } from "@/components/shell/PageHeader";
-import { ErrorState, SectionHeader, Surface } from "@/components/ui";
+import { ErrorState, SectionHeader, Surface, Tag } from "@/components/ui";
 import { useChartBatch, type ChartRange } from "@/lib/charts";
 import { useDashboard } from "@/lib/dashboard";
 import { useI18n } from "@/lib/i18n";
+import {
+  accountingView,
+  readinessView,
+  useLiveAccounting,
+  useLiveSafety,
+  validated,
+} from "@/lib/live";
 import { useAccountOrders } from "@/lib/orders";
 import { equityOf, targetVsActual } from "@/lib/portfolio";
 import { useRealizedPnl } from "@/lib/realized";
@@ -125,6 +139,19 @@ export default function OverviewPage() {
     return out;
   }, [targetRows]);
   const { data: realized } = useRealizedPnl();
+
+  // The real-money record, polled beside the paper one and never merged with
+  // it. `validated` refuses a payload that does not satisfy the frozen
+  // contract, so a drifted payload renders no figure here at all.
+  const liveAccounting = useLiveAccounting();
+  const liveSafety = useLiveSafety();
+  const live = useMemo(() => validated(liveAccounting.data), [liveAccounting.data]);
+  const liveReadiness = useMemo(
+    () => readinessView(liveSafety.data, live.summary),
+    [liveSafety.data, live.summary],
+  );
+  const liveAccountingView = useMemo(() => accountingView(live.summary), [live.summary]);
+  const liveSuppressed = live.summary !== null && !liveAccountingView.derivedTrustworthy;
   // Equity-book unrealized only: the realized figure beside it is the equity
   // ledger's, and pairing an account-wide unrealized with an equity-only
   // realized would invite exactly the arithmetic the strip says not to do.
@@ -137,13 +164,51 @@ export default function OverviewPage() {
   }, [data]);
   const close = useCallback(() => setSelected(null), []);
 
-  if (!loading && !data) return <Unreachable />;
+  // The real-money card is rendered from its OWN two services and is placed
+  // above the paper-API guard deliberately: an operational API that cannot be
+  // reached says nothing about the Live account, and hiding real-money state
+  // because an unrelated paper service is down would be the worst possible
+  // moment to stop showing it.
+  const liveCard = (
+    <LiveSummaryCard
+      panel={liveSafety.data}
+      summary={live.summary}
+      readiness={liveReadiness}
+      accounting={liveAccountingView}
+      suppressed={liveSuppressed}
+    />
+  );
+
+  if (!loading && !data) {
+    return (
+      <div className="space-y-5">
+        <PageHeader title={t("nav.overview")} context={t("nav.detail.overview")} />
+        {liveCard}
+        <SectionHeader
+          title={t("account.title")}
+          meta={<Tag title={t("env.scopeHint")}>{t("env.paper.simulated")}</Tag>}
+        />
+        <Unreachable />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5">
-      <PageHeader title={t("nav.overview")} context={t("nav.detail.overview")} />
+      <PageHeader
+        title={t("nav.overview")}
+        context={t("nav.detail.overview")}
+        actions={<Tag title={t("env.scopeHint")}>{t("env.paper.simulated")}</Tag>}
+      />
 
       {data ? <Attention overview={data} /> : null}
+
+      {liveCard}
+
+      <SectionHeader
+        title={t("account.title")}
+        meta={<Tag title={t("env.scopeHint")}>{t("env.paper.simulated")}</Tag>}
+      />
 
       <AccountSummary metrics={data?.metrics ?? null} risk={risk} loading={loading} />
 

@@ -16,13 +16,27 @@
  * A guard runs beside the panel: if the view ever carries a figure the
  * fractional policy retired while claiming to be that policy, the page says so
  * rather than drawing it.
+ *
+ * **Two policies, two sections, never one table.** Everything above the Live
+ * heading is the PAPER book under `EDA1_FRACTIONAL_RESERVED_90`, expressed as
+ * percentages of a paper balance. Below it is `LIVE_VALIDATION_100`, expressed
+ * in dollars against a verified real-money balance. Merging them into one
+ * limits table would produce rows that look comparable and are not - a 90%
+ * target on paper and a $45.00 target on $50 of real money are the same
+ * percentage and completely different consequences.
+ *
+ * Nothing on this page can change a limit. Both halves are rendered from what
+ * the backends report, and neither backend has a write route.
  */
 
+import { LiveRiskCard } from "@/components/live/LiveAccount";
+import { LiveTag, Statement } from "@/components/live/atoms";
 import { AccountSafety } from "@/components/AccountSafety";
 import { MarketState } from "@/components/MarketState";
 import { Risk } from "@/components/Risk";
 import { PageHeader } from "@/components/shell/PageHeader";
 import { Card, Field, SectionHeader, Status, Tag } from "@/components/ui";
+import { guardView, serviceView, useLiveSafety } from "@/lib/live";
 import { useDashboard } from "@/lib/dashboard";
 import { useI18n } from "@/lib/i18n";
 import { percent } from "@/lib/format";
@@ -32,6 +46,7 @@ import { useMemo } from "react";
 export default function RiskPage() {
   const { t } = useI18n();
   const { account, paper } = useDashboard();
+  const liveSafety = useLiveSafety();
   const data = account.data;
   const policy = paper.data?.policy ?? null;
   const exposure = paper.data?.exposure ?? null;
@@ -47,10 +62,16 @@ export default function RiskPage() {
     [data, policy],
   );
   const stale = carriesStaleLegacyLimit(view);
+  const liveGuard = useMemo(() => guardView(liveSafety.data), [liveSafety.data]);
+  const liveService = useMemo(() => serviceView(liveSafety.data), [liveSafety.data]);
 
   return (
     <div className="space-y-5">
-      <PageHeader title={t("risk.title")} context={t("nav.detail.risk")} />
+      <PageHeader
+        title={t("risk.title")}
+        context={t("nav.detail.risk")}
+        actions={<Tag title={t("env.scopeHint")}>{t("env.paper.simulated")}</Tag>}
+      />
 
       {stale ? (
         <Card title={t("risk.limits")}>
@@ -112,6 +133,42 @@ export default function RiskPage() {
           {policy?.note ? (
             <p className="mt-4 max-w-[94ch] text-meta leading-relaxed text-ink-3">{policy.note}</p>
           ) : null}
+        </Card>
+      </div>
+
+      {/* ---- LIVE. A separate heading, a separate policy, separate units. ---- */}
+      <div className="space-y-2">
+        <SectionHeader
+          title={`${t("env.live.realMoney")} · ${t("live.risk")}`}
+          meta={<LiveTag />}
+        />
+        <LiveRiskCard panel={liveSafety.data} />
+
+        <Card title={t("live.guard")} meta={<LiveTag />}>
+          <div className="space-y-2">
+            <Statement tone={liveGuard.tone}>{t(liveGuard.labelKey)}</Statement>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+              {liveGuard.riskDay ? (
+                <span className="text-meta text-ink-3">
+                  {t("live.guard.riskDay")} <span className="num">{liveGuard.riskDay}</span>
+                </span>
+              ) : null}
+              <Status tone={liveService.tone}>{t(liveService.labelKey)}</Status>
+            </div>
+          </div>
+          {liveGuard.status === "ACTIVE" ? (
+            <p className="mt-2 max-w-[92ch] text-meta leading-relaxed text-ink-3">
+              {t("live.guard.exitsAvailable")}
+            </p>
+          ) : null}
+          {liveGuard.reason ? (
+            <p className="mt-2 max-w-[92ch] text-meta leading-relaxed text-ink-3">
+              {liveGuard.reason}
+            </p>
+          ) : null}
+          <p className="mt-2 max-w-[92ch] text-meta leading-relaxed text-ink-3">
+            {t("live.account.cashSettlement")}
+          </p>
         </Card>
       </div>
 

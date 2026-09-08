@@ -15,6 +15,13 @@
  * The panel a portfolio page would normally lead with, an account-equity
  * curve, is present as an explicit `Not tracked` statement: no runtime
  * persists that series and no endpoint serves it. See `components/Portfolio`.
+ *
+ * **This page is the PAPER account, and now says so.** Both records it joins
+ * are paper: the operational API reads the paper broker and the paper API
+ * records the paper runtime's decisions. The real-money account's positions
+ * are on `/live` and are never mixed in here - a portfolio that silently
+ * concatenated simulated and real holdings would be the worst defect this
+ * application could ship.
  */
 
 import { useCallback, useMemo, useState } from "react";
@@ -25,6 +32,7 @@ import { Positions } from "@/components/Positions";
 import { RealizedStrip } from "@/components/RealizedPnl";
 import { SymbolDetail } from "@/components/SymbolDetail";
 import { PageHeader } from "@/components/shell/PageHeader";
+import { Tag } from "@/components/ui";
 import { useChartBatch, type ChartRange } from "@/lib/charts";
 import { useDashboard } from "@/lib/dashboard";
 import { useI18n } from "@/lib/i18n";
@@ -69,7 +77,11 @@ export default function PortfolioPage() {
 
   return (
     <div className="space-y-5">
-      <PageHeader title={t("portfolio.title")} context={t("nav.detail.portfolio")} />
+      <PageHeader
+        title={t("portfolio.title")}
+        context={t("nav.detail.portfolio")}
+        actions={<Tag title={t("env.scopeHint")}>{t("env.paper.simulated")}</Tag>}
+      />
 
       <RealizedStrip
         panel={realized}
