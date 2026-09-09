@@ -124,14 +124,14 @@ body { background: var(--tv4-canvas); color: var(--tv4-ink); }
 .tv4-grid.two { grid-template-columns: repeat(2, minmax(0,1fr)); }
 .tv4-grid.three { grid-template-columns: repeat(3, minmax(0,1fr)); }
 .tv4-grid.four { grid-template-columns: repeat(4, minmax(0,1fr)); }
-.tv4-stack { display: grid; gap: 12px; }
+.tv4-stack { display: grid; min-width: 0; gap: 12px; }
 .tv4-metric-strip { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); margin-bottom: 12px; border: 1px solid var(--tv4-line); border-radius: 6px; background: var(--tv4-panel); }
 .tv4-metric { min-width: 0; padding: 12px 14px 11px; border-right: 1px solid var(--tv4-line); }
 .tv4-metric:last-child { border-right: 0; }
 .tv4-metric:nth-child(5n) { border-right: 0; }
 .tv4-metric:nth-child(n+6) { border-top: 1px solid var(--tv4-line); }
 .tv4-metric-label, .tv4-field dt { color: var(--tv4-ink-3); font: 550 8px/1.15 var(--tv4-mono); letter-spacing: .08em; text-transform: uppercase; }
-.tv4-metric-value { display: block; margin-top: 7px; color: var(--tv4-ink); font: 620 clamp(18px, 1.7vw, 25px)/1 var(--tv4-mono); letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
+.tv4-metric-value { display: block; min-width: 0; margin-top: 7px; overflow: hidden; color: var(--tv4-ink); font: 620 clamp(18px, 1.7vw, 25px)/1 var(--tv4-mono); letter-spacing: -.04em; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .tv4-metric-value.positive, .tv4-value.positive { color: var(--tv4-green); }
 .tv4-metric-value.negative, .tv4-value.negative { color: var(--tv4-red); }
 .tv4-metric-value.warning, .tv4-value.warning { color: var(--tv4-amber); }
@@ -161,7 +161,7 @@ body { background: var(--tv4-canvas); color: var(--tv4-ink); }
 .tv4-empty p { max-width: 420px; margin: 8px auto 0; color: var(--tv4-ink-3); font-size: 10px; line-height: 1.5; }
 
 /* Tables and tapes */
-.tv4-table-wrap { overflow: auto; }
+.tv4-table-wrap { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; overflow-y: auto; overscroll-behavior-inline: contain; }
 .tv4-table { width: 100%; border-collapse: collapse; font: 500 10.5px/1.25 var(--tv4-mono); font-variant-numeric: tabular-nums; }
 .tv4-table th { position: sticky; z-index: 2; top: 0; height: 31px; padding: 0 10px; background: var(--tv4-panel); color: var(--tv4-ink-3); font-size: 7.5px; font-weight: 600; letter-spacing: .07em; text-align: right; white-space: nowrap; }
 .tv4-table th:first-child, .tv4-table td:first-child { text-align: left; }
