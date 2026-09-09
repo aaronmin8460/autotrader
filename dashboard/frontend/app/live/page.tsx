@@ -1,3 +1,3 @@
-import { LivePortfolioPage } from "@/components/terminal/CorePages";
+import { LiveTradingPage } from "@/components/terminal/TradingPages";
 
-export default LivePortfolioPage;
+export default LiveTradingPage;

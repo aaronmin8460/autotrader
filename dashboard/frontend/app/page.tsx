@@ -1,3 +1,3 @@
-import { CommandCenterPage } from "@/components/terminal/CorePages";
+import { LiveTradingPage } from "@/components/terminal/TradingPages";
 
-export default CommandCenterPage;
+export default LiveTradingPage;
