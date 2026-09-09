@@ -68,8 +68,9 @@ Screenshots are in `reports/terminal-v5/screenshots/`.
 - ESLint: passed.
 - Frontend unit/contract suite: 163/163 passed.
 - Visual/routing/responsive checks: all passes, zero failures.
-- Production build: recorded after final candidate build.
-- Secret scan and protected-path diff: recorded after candidate finalization.
+- Production build: passed; all 25 application routes statically generated.
+- Secret scan: passed for the V5 frontend/report delta.
+- Protected-path diff against production `3d03968…`: empty for `src/`, `tests/`, and `deploy/`.
 
 ## Promotion state
 

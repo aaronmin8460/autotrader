@@ -311,20 +311,8 @@ export function LiveTradingPage() {
         </div>
         <StatusFact
           label="Account Safety"
-          value={
-            live?.live_ready
-              ? "SAFE"
-              : live?.live_ready === false
-                ? "UNSAFE"
-                : "UNKNOWN"
-          }
-          tone={
-            live?.live_ready
-              ? "good"
-              : live?.live_ready === false
-                ? "danger"
-                : "unknown"
-          }
+          value={live?.account_safety.state ?? "UNKNOWN"}
+          tone={live?.account_safety.state === "SAFE" ? "good" : live?.account_safety.state ? "danger" : "unknown"}
         />
         <StatusFact
           label="Reconciliation"
@@ -473,6 +461,11 @@ export function LiveTradingPage() {
               <StatusFact
                 label="Account Pin"
                 value={live?.identity.status ?? "UNKNOWN"}
+              />
+              <StatusFact
+                label="Safety Source"
+                value={live?.account_safety.source ?? "UNKNOWN"}
+                tone={live?.account_safety.state === "SAFE" ? "good" : "unknown"}
               />
             </div>
           </Panel>
