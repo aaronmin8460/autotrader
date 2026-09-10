@@ -20,6 +20,7 @@ import {
 
 import {
   Badge,
+  CashHistoryChart,
   Empty,
   EquityChart,
   EventTape,
@@ -27,6 +28,15 @@ import {
   Panel,
   toneFor,
 } from "./TerminalUI";
+
+function UnavailableChart({ title, detail }: { title: string; detail: string }) {
+  return (
+    <div className="v6-unavailable-chart" role="img" aria-label={`${title}. ${detail}`}>
+      <div className="v6-unavailable-grid" aria-hidden />
+      <Empty title={title} detail={detail} />
+    </div>
+  );
+}
 
 function pnlClass(value: string | null | undefined) {
   const tone = contractTone(value);
@@ -78,12 +88,10 @@ function LivePositions({ rows }: { rows: TerminalPosition[] }) {
           <tr>
             <th>SYMBOL</th>
             <th>QTY</th>
-            <th>AVG PRICE</th>
             <th>PRICE</th>
             <th>MARKET VALUE</th>
             <th>UNREALIZED P&amp;L</th>
             <th>DAY P&amp;L</th>
-            <th>% EQUITY</th>
             <th>TARGET</th>
             <th>DELTA</th>
             <th>STANCE</th>
@@ -94,7 +102,6 @@ function LivePositions({ rows }: { rows: TerminalPosition[] }) {
             <tr key={row.symbol}>
               <td className="symbol">{row.symbol}</td>
               <td>{quantity(row.quantity)}</td>
-              <td>{contractMoney(row.average_cost)}</td>
               <td>{contractMoney(row.price)}</td>
               <td>{contractMoney(row.market_value)}</td>
               <td className={pnlClass(row.unrealized_pnl)}>
@@ -103,7 +110,6 @@ function LivePositions({ rows }: { rows: TerminalPosition[] }) {
               <td className={pnlClass(row.day_pnl)}>
                 {contractSignedMoney(row.day_pnl)}
               </td>
-              <td>{contractPercent(row.actual_weight)}</td>
               <td>{contractPercent(row.target_weight)}</td>
               <td className={pnlClass(row.drift)}>
                 {contractSignedPercent(row.drift)}
@@ -140,8 +146,7 @@ function LiveOrders({ rows }: { rows: TerminalOrder[] }) {
             <th>QTY</th>
             <th>AVG FILL</th>
             <th>STATUS</th>
-            <th>CLIENT ORDER ID</th>
-            <th>BROKER ORDER ID</th>
+            <th>RISK</th>
           </tr>
         </thead>
         <tbody>
@@ -157,12 +162,7 @@ function LiveOrders({ rows }: { rows: TerminalOrder[] }) {
                   {row.status.replaceAll("_", " ")}
                 </Badge>
               </td>
-              <td title={row.client_order_id}>
-                {row.client_order_id.slice(0, 16)}
-              </td>
-              <td title={row.broker_order_id}>
-                {row.broker_order_id.slice(0, 16)}
-              </td>
+              <td>{row.risk_reason_code ?? "—"}</td>
             </tr>
           ))}
         </tbody>
@@ -261,7 +261,7 @@ export function LiveTradingPage() {
       <PageHead
         title="Live Trading"
         description="REAL CAPITAL TRADING"
-        kicker="AUTOTRADER TERMINAL V5"
+        kicker="AUTOTRADER TERMINAL V6"
         meta={
           <>
             <Badge tone={auth === "ARMED" ? "danger" : toneFor(auth)}>
@@ -330,14 +330,14 @@ export function LiveTradingPage() {
       </section>
       <div className="v5-main-grid">
         <div className="tv4-stack">
-          <Panel
-            title="Equity Curve"
-            meta={<small>AUTHORITATIVE CHECKPOINTS · USD</small>}
-          >
+          <Panel title="Live Capital & Performance" meta={<small>BROKER EQUITY · FLOW-ADJUSTED EQUITY · EXTERNAL CASH FLOW</small>}>
             <EquityChart
               points={history?.points ?? []}
               flows={history?.flows ?? []}
             />
+          </Panel>
+          <Panel title="Liquidity & Exposure History" meta={<small>AUTHORITATIVE SERIES ONLY · USD</small>}>
+            <CashHistoryChart points={history?.points ?? []} />
           </Panel>
           <Panel
             title={`Positions (${rows.length})`}
@@ -348,6 +348,21 @@ export function LiveTradingPage() {
           </Panel>
         </div>
         <aside className="tv4-stack">
+          <Panel title="Performance Summary" body={false}>
+            <div className="v6-earned-callout">
+              <span>Trading P&amp;L</span>
+              <strong className={pnlClass(summary?.trading_pnl_since_inception)}>{contractSignedMoney(summary?.trading_pnl_since_inception)}</strong>
+              <small>Accounting-defined performance since inception, net of confirmed external capital flows.</small>
+            </div>
+            <dl className="v5-summary-list">
+              <div><dt>Realized P&amp;L</dt><dd className={pnlClass(summary?.realized_pnl)}>{contractSignedMoney(summary?.realized_pnl)}</dd></div>
+              <div><dt>Unrealized P&amp;L</dt><dd className={pnlClass(summary?.unrealized_pnl)}>{contractSignedMoney(summary?.unrealized_pnl)}</dd></div>
+              <div><dt>Net External Flows</dt><dd>{contractSignedMoney(summary?.net_external_flows)}</dd></div>
+              <div><dt>Flow-Adjusted Equity</dt><dd>{contractMoney(summary?.flow_adjusted_equity)}</dd></div>
+              <div><dt>TWR</dt><dd>{contractSignedPercent(summary?.time_weighted_return)}</dd></div>
+              <div><dt>Realized basis</dt><dd>{summary?.realized_pnl_basis_status ?? "—"}</dd></div>
+            </dl>
+          </Panel>
           <Panel title="Account Summary" body={false}>
             <dl className="v5-summary-list">
               <div>
@@ -366,22 +381,7 @@ export function LiveTradingPage() {
                 <dt>Gross Exposure</dt>
                 <dd>{contractMoney(live?.risk.current_gross_exposure)}</dd>
               </div>
-              <div>
-                <dt>Unrealized P&amp;L</dt>
-                <dd className={pnlClass(summary?.unrealized_pnl)}>
-                  {contractSignedMoney(summary?.unrealized_pnl)}
-                </dd>
-              </div>
-              <div>
-                <dt>Trading P&amp;L</dt>
-                <dd className={pnlClass(summary?.trading_pnl_since_inception)}>
-                  {contractSignedMoney(summary?.trading_pnl_since_inception)}
-                </dd>
-              </div>
-              <div>
-                <dt>TWR</dt>
-                <dd>{contractSignedPercent(summary?.time_weighted_return)}</dd>
-              </div>
+              <div><dt>Withdrawable Cash</dt><dd>{contractMoney(summary?.broker_withdrawable_cash)}</dd></div>
             </dl>
           </Panel>
           <Panel
@@ -486,6 +486,21 @@ export function LiveTradingPage() {
           <DayPnl rows={rows} />
         </Panel>
       </div>
+      <div className="v5-bottom-grid">
+        <Panel title="Decision · Target · Delta · Stance" meta={<small>RECORDED DECISIONS · NO CLIENT DERIVATION</small>} body={false}>
+          {rows.length ? <div className="tv4-table-wrap"><table className="tv4-table v6-decision-table"><thead><tr><th>SYMBOL</th><th>STANCE</th><th>ACTUAL</th><th>TARGET</th><th>DELTA</th><th>LAST DECISION</th></tr></thead><tbody>{rows.map((row) => <tr key={row.symbol}><td className="symbol">{row.symbol}</td><td><Badge tone={row.stance === "LONG" ? "good" : "unknown"}>{row.stance ?? "—"}</Badge></td><td>{contractPercent(row.actual_weight)}</td><td>{contractPercent(row.target_weight)}</td><td className={pnlClass(row.drift)}>{contractSignedPercent(row.drift)}</td><td>{stampUtc(row.last_decision_at)}</td></tr>)}</tbody></table></div> : <Empty title="DECISIONS UNAVAILABLE" detail="No broker positions with recorded targets were returned." />}
+        </Panel>
+        <Panel title="Reconciliation & Lifecycle" body={false}>
+          <dl className="v5-summary-list">
+            <div><dt>Reconciliation</dt><dd>{live?.reconciliation.status ?? "UNKNOWN"}</dd></div>
+            <div><dt>Safe to trade</dt><dd>{live?.reconciliation.safe_to_trade === true ? "YES" : live?.reconciliation.safe_to_trade === false ? "NO" : "UNKNOWN"}</dd></div>
+            <div><dt>Issues / unresolved</dt><dd>{live ? `${live.reconciliation.issues} / ${live.reconciliation.unresolved}` : "—"}</dd></div>
+            <div><dt>Orders / fills</dt><dd>{terminal ? `${terminal.execution.order_count} / ${terminal.execution.fill_count}` : "—"}</dd></div>
+            <div><dt>At-most-once</dt><dd>{terminal?.execution.at_most_once_status ?? "—"}</dd></div>
+            <div><dt>Last completed</dt><dd>{stampUtc(live?.reconciliation.completed_at)}</dd></div>
+          </dl>
+        </Panel>
+      </div>
       <Panel
         title="Operational Events"
         meta={<small>RECORDED SYSTEM EVENTS</small>}
@@ -512,7 +527,7 @@ export function PaperTradingPage() {
       <PageHead
         title="Paper Trading"
         description="SIMULATED TRADING · NO REAL CAPITAL"
-        kicker="AUTOTRADER TERMINAL V5"
+        kicker="AUTOTRADER TERMINAL V6"
         scope="paper"
         meta={
           <>
@@ -584,6 +599,12 @@ export function PaperTradingPage() {
       </section>
       <div className="v5-main-grid">
         <div className="tv4-stack">
+          <Panel title="Paper Equity Curve" meta={<small>SIMULATED ACCOUNT · AUTHORITATIVE HISTORY ONLY</small>}>
+            <UnavailableChart title="PAPER EQUITY HISTORY NOT RECORDED" detail="The Paper read model exposes current equity but no historical equity series. No flat or synthetic curve is drawn." />
+          </Panel>
+          <Panel title="Paper Exposure & Cash History" meta={<small>SIMULATED ACCOUNT · AUTHORITATIVE HISTORY ONLY</small>}>
+            <UnavailableChart title="PAPER EXPOSURE / CASH HISTORY NOT RECORDED" detail="Only current simulated exposure and cash are available. Historical values remain explicitly unavailable." />
+          </Panel>
           <Panel
             title={`Paper Positions (${positions.length})`}
             meta={<small>SIMULATED ACCOUNT ONLY</small>}
@@ -596,11 +617,9 @@ export function PaperTradingPage() {
                     <tr>
                       <th>SYMBOL</th>
                       <th>QTY</th>
-                      <th>AVG PRICE</th>
                       <th>PRICE</th>
                       <th>MARKET VALUE</th>
                       <th>UNREALIZED P&amp;L</th>
-                      <th>UPDATED</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -608,7 +627,6 @@ export function PaperTradingPage() {
                       <tr key={row.symbol}>
                         <td className="symbol">{row.symbol}</td>
                         <td>{quantity(row.quantity)}</td>
-                        <td>{money(row.average_entry_price)}</td>
                         <td>{money(row.price)}</td>
                         <td>{money(row.market_value)}</td>
                         <td
@@ -620,7 +638,6 @@ export function PaperTradingPage() {
                         >
                           {signedMoney(row.unrealized_pnl)}
                         </td>
-                        <td>{stampUtc(row.updated_at)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -649,7 +666,7 @@ export function PaperTradingPage() {
                       <th>QTY</th>
                       <th>AVG FILL</th>
                       <th>STATUS</th>
-                      <th>CLIENT ORDER ID</th>
+                      <th>RISK</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -671,7 +688,7 @@ export function PaperTradingPage() {
                             {row.broker_status ?? row.status}
                           </Badge>
                         </td>
-                        <td>{row.client_order_id.slice(0, 18)}</td>
+                        <td>{row.risk_reason_code}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -686,6 +703,21 @@ export function PaperTradingPage() {
           </Panel>
         </div>
         <aside className="tv4-stack">
+          <Panel title="Paper Performance Summary" body={false}>
+            <div className="v6-earned-callout paper-earned">
+              <span>Today&apos;s Trading P&amp;L</span>
+              <strong className={metrics?.daily_pnl.value && metrics.daily_pnl.value < 0 ? "negative" : "positive"}>{signedMoney(metrics?.daily_pnl.value)}</strong>
+              <small>Change from the Paper account&apos;s authoritative daily baseline; not a realized-cash measure.</small>
+            </div>
+            <dl className="v5-summary-list">
+              <div><dt>Cash Performance / Cash Earned</dt><dd>NOT EXPOSED</dd></div>
+              <div><dt>Realized P&amp;L</dt><dd>NOT EXPOSED</dd></div>
+              <div><dt>Unrealized P&amp;L total</dt><dd>NOT EXPOSED</dd></div>
+              <div><dt>Daily baseline</dt><dd>{money(metrics?.daily_pnl_baseline.value)}</dd></div>
+              <div><dt>Baseline date</dt><dd>{metrics?.daily_pnl_baseline_date ?? "—"}</dd></div>
+              <div><dt>TWR</dt><dd>NOT RECORDED</dd></div>
+            </dl>
+          </Panel>
           <Panel title="Paper Account Summary" body={false}>
             <dl className="v5-summary-list">
               <div>
@@ -779,6 +811,9 @@ export function PaperTradingPage() {
           </Panel>
         </aside>
       </div>
+      <Panel title="Paper Performance Details" meta={<small>SIMULATED · EXACT VALUES PRESERVED</small>} body={false}>
+        {snapshot?.targets.length ? <div className="tv4-table-wrap"><table className="tv4-table"><thead><tr><th>SYMBOL</th><th>STANCE</th><th>TARGET</th><th>ACTUAL QTY</th><th>ACTION</th><th>DECIDED</th></tr></thead><tbody>{snapshot.targets.map((row) => <tr key={row.symbol}><td className="symbol">{row.symbol}</td><td>{row.stance_label ?? row.eda1_signal ?? "—"}</td><td>{percent(row.target_weight)}</td><td>{quantity(row.actual_quantity)}</td><td>{row.action ?? "—"}</td><td>{stampUtc(row.target_decided_at)}</td></tr>)}</tbody></table></div> : <Empty title="PAPER PERFORMANCE DETAILS UNAVAILABLE" detail="No authoritative Paper target or decision rows are recorded." />}
+      </Panel>
     </div>
   );
 }

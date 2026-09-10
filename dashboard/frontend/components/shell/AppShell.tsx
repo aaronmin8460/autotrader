@@ -330,7 +330,7 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         <span className="tv4-brand-mark">AT</span>
         <span>
           <strong>AUTOTRADER</strong>
-          <small>TERMINAL V5</small>
+          <small>TERMINAL V6</small>
         </span>
       </Link>
       <nav className="tv4-nav" aria-label="Terminal workspaces">
@@ -469,7 +469,7 @@ function MobileBar({
         </button>
         <Link href="/live">
           <strong>AT</strong>
-          <span>TERMINAL V5</span>
+          <span>TERMINAL V6</span>
         </Link>
         <button
           type="button"

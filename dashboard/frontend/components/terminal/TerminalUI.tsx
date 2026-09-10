@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
 
 import { clockUtc, stampUtc } from "@/lib/format";
 import { contractMoney } from "@/lib/live-decimal";
@@ -75,7 +81,7 @@ export function Badge({
 export function PageHead({
   title,
   description,
-  kicker = "AUTOTRADER TERMINAL V5",
+  kicker = "AUTOTRADER TERMINAL V6",
   meta,
   scope = "live",
 }: {
@@ -344,6 +350,20 @@ function pathFor(
     .join(" ");
 }
 
+function chartDate(iso: string | undefined): string {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+  }).format(date);
+}
+
 export function EquityChart({
   points,
   flows = [],
@@ -354,6 +374,7 @@ export function EquityChart({
   mode?: "equity" | "drawdown";
 }) {
   const [range, setRange] = useState<ChartRange>("ALL");
+  const [cursor, setCursor] = useState<number | null>(null);
   const historyDays =
     points.length > 1
       ? (Date.parse(points.at(-1)?.taken_at ?? "") -
@@ -387,124 +408,112 @@ export function EquityChart({
   const adjustedPath = pathFor(adjusted, low, span);
   const first = shown[0];
   const last = shown[shown.length - 1];
+  const lastIndex = shown.length - 1;
+  const activeIndex = cursor ?? lastIndex;
+  const activePoint = shown[activeIndex];
+  const adjustedCurrent = adjusted.at(-1) ?? null;
+  const ticks = Array.from({ length: 5 }, (_, index) => high - (span * index) / 4);
+  const onMove = (event: MouseEvent<SVGSVGElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+    setCursor(Math.round(fraction * lastIndex));
+  };
   return (
-    <div className="tv4-chart">
-      <div className="tv4-range" aria-label="Chart range">
-        {(["1D", "1W", "1M", "3M", "1Y", "ALL"] as const).map((item) => {
-          const disabled = item !== "ALL" && historyDays < RANGE_DAYS[item];
-          return (
-            <button
-              key={item}
-              type="button"
-              onClick={() => setRange(item)}
-              className={range === item ? "active" : ""}
-              disabled={disabled}
-              title={disabled ? `${item} authoritative history is unavailable` : `Show ${item} history`}
-            >
-              {item}
-            </button>
-          );
-        })}
-      </div>
-      <div className="tv4-chart-scale">
-        <span>
-          {mode === "drawdown"
-            ? `${(high * 100).toFixed(2)}%`
-            : contractMoney(String(high))}
-        </span>
-        <span>
-          {mode === "drawdown"
-            ? `${(low * 100).toFixed(2)}%`
-            : contractMoney(String(low))}
+    <div className="tv4-chart v6-equity-chart">
+      <div className="v6-chart-toolbar">
+        <div className="tv4-range" aria-label="Chart range">
+          {(["1D", "1W", "1M", "3M", "1Y", "ALL"] as const).map((item) => {
+            const disabled = item !== "ALL" && historyDays < RANGE_DAYS[item];
+            return (
+              <button
+                key={item}
+                type="button"
+                onClick={() => setRange(item)}
+                className={range === item ? "active" : ""}
+                disabled={disabled}
+                title={disabled ? `${item} authoritative history is unavailable` : `Show ${item} history`}
+              >
+                {item}
+              </button>
+            );
+          })}
+        </div>
+        <span className="v6-range-context">
+          RANGE {contractMoney(String(low))}–{contractMoney(String(high))} · SPAN {contractMoney(String(span))}
         </span>
       </div>
-      <svg
-        viewBox="0 0 100 100"
-        preserveAspectRatio="none"
-        role="img"
-        aria-label={
-          mode === "drawdown"
-            ? "Authoritative drawdown history"
-            : "Authoritative broker and flow-adjusted equity history"
-        }
-      >
-        {[12, 32, 52, 72, 92].map((y) => (
-          <line
-            key={y}
-            className="tv4-chart-grid"
-            x1="0"
-            y1={y}
-            x2="100"
-            y2={y}
-          />
-        ))}
-        {mode === "equity" && brokerPath ? (
-          <path className="tv4-series-broker" d={brokerPath} />
+      {mode === "drawdown" ? (
+        <div className="v6-chart-series-summary single" aria-label="Drawdown legend and values">
+          <div className="drawdown"><span>Drawdown from Adjusted HWM</span><strong>{adjustedCurrent === null ? "—" : `${(adjustedCurrent * 100).toFixed(2)}%`}</strong><small>Authoritative accounting series</small></div>
+        </div>
+      ) : (
+        <div className="v6-chart-series-summary" aria-label="Chart legend and values">
+          <div className="broker"><span>Broker Equity</span><strong>{contractMoney(last?.broker_equity)}</strong><small>{range} start {contractMoney(first?.broker_equity)} → current</small></div>
+          <div className="adjusted"><span>Flow-Adjusted Equity</span><strong>{contractMoney(last?.flow_adjusted_equity)}</strong><small>{range} start {contractMoney(first?.flow_adjusted_equity)} → current</small></div>
+          <div className="flow"><span>External Cash Flow</span><strong>{flows.length ? `${flows.length} event${flows.length === 1 ? "" : "s"}` : "No events"}</strong><small>Authoritative event markers</small></div>
+        </div>
+      )}
+      <div className="v6-chart-stage">
+        <div className="tv4-chart-scale">
+          {ticks.map((value) => <span key={value}>{mode === "drawdown" ? `${(value * 100).toFixed(2)}%` : contractMoney(String(value))}</span>)}
+        </div>
+        <svg
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          role="img"
+          aria-label={mode === "drawdown" ? "Authoritative drawdown history" : "Authoritative broker equity, flow-adjusted equity, and external cash-flow events"}
+          onMouseMove={onMove}
+          onMouseLeave={() => setCursor(null)}
+        >
+          {[12, 32, 52, 72, 92].map((y) => <line key={y} className="tv4-chart-grid" x1="0" y1={y} x2="100" y2={y} />)}
+          {mode === "equity" && brokerPath ? <path className="tv4-series-broker" d={brokerPath} /> : null}
+          {adjustedPath ? <path className={mode === "drawdown" ? "tv4-series-drawdown" : "tv4-series-adjusted"} d={adjustedPath} /> : null}
+          {mode === "equity" ? flows.filter((flow) => shown.some((point) => point.taken_at >= flow.settle_at)).map((flow, index) => {
+            const flowAt = Date.parse(flow.settle_at);
+            const firstAt = Date.parse(first?.taken_at ?? "");
+            const lastAt = Date.parse(last?.taken_at ?? "");
+            const x = lastAt === firstAt ? 50 : Math.max(0, Math.min(100, ((flowAt - firstAt) / (lastAt - firstAt)) * 100));
+            return <g key={`${flow.settle_at}-${index}`}><title>{`${flow.classification} · ${contractMoney(flow.amount)} · ${flow.confirmation}`}</title><line x1={x} x2={x} y1="11" y2="92" stroke="var(--tv4-amber)" strokeWidth=".8" strokeDasharray="2 2" vectorEffect="non-scaling-stroke" /><circle cx={x} cy="11" r="1.4" fill="var(--tv4-amber)" /></g>;
+          }) : null}
+          {activePoint ? <line className="v6-chart-cursor" x1={(activeIndex / Math.max(lastIndex, 1)) * 100} x2={(activeIndex / Math.max(lastIndex, 1)) * 100} y1="12" y2="92" /> : null}
+        </svg>
+        {activePoint && mode === "equity" ? (
+          <div className="v6-chart-tooltip" aria-live="polite">
+            <time>{chartDate(activePoint.taken_at)} UTC</time>
+            <span><i className="broker" />Broker {contractMoney(activePoint.broker_equity)}</span>
+            <span><i className="adjusted" />Flow-adjusted {contractMoney(activePoint.flow_adjusted_equity)}</span>
+          </div>
         ) : null}
-        {adjustedPath ? (
-          <path
-            className={
-              mode === "drawdown"
-                ? "tv4-series-drawdown"
-                : "tv4-series-adjusted"
-            }
-            d={adjustedPath}
-          />
-        ) : null}
-        {mode === "equity"
-          ? flows
-              .filter((flow) =>
-                shown.some((point) => point.taken_at >= flow.settle_at),
-              )
-              .map((flow, index) => {
-                const flowAt = Date.parse(flow.settle_at);
-                const firstAt = Date.parse(first?.taken_at ?? "");
-                const lastAt = Date.parse(last?.taken_at ?? "");
-                const x =
-                  lastAt === firstAt
-                    ? 50
-                    : Math.max(
-                        0,
-                        Math.min(
-                          100,
-                          ((flowAt - firstAt) / (lastAt - firstAt)) * 100,
-                        ),
-                      );
-                return (
-                  <g key={`${flow.settle_at}-${index}`}>
-                    <line
-                      x1={x}
-                      x2={x}
-                      y1="11"
-                      y2="92"
-                      stroke="var(--tv4-amber)"
-                      strokeWidth=".55"
-                      strokeDasharray="2 2"
-                      vectorEffect="non-scaling-stroke"
-                    />
-                    <circle cx={x} cy="11" r="1.2" fill="var(--tv4-amber)" />
-                  </g>
-                );
-              })
-          : null}
-      </svg>
-      <div className="tv4-chart-legend">
-        {mode === "equity" ? (
-          <>
-            <span>Broker equity</span>
-            <span className="adjusted">Flow-adjusted equity</span>
-            {flows.length ? (
-              <span className="warning">External capital flow</span>
-            ) : null}
-          </>
-        ) : (
-          <span className="negative">Drawdown from adjusted HWM</span>
-        )}
       </div>
       <p className="tv4-note">
         {stampUtc(first?.taken_at)} — {stampUtc(last?.taken_at)} UTC ·{" "}
         {shown.length} authoritative checkpoint{shown.length === 1 ? "" : "s"}
       </p>
+    </div>
+  );
+}
+
+export function CashHistoryChart({ points }: { points: HistoryPoint[] }) {
+  const values = points.map((point) => toFinite(point.broker_cash));
+  const finite = values.filter((value): value is number => value !== null);
+  if (points.length < 2 || finite.length < 2) {
+    return <Empty title="CASH HISTORY UNAVAILABLE" detail="The authoritative accounting history does not contain enough cash checkpoints. Exposure and buying-power history are not exposed." />;
+  }
+  const low = Math.min(...finite);
+  const high = Math.max(...finite);
+  const span = high === low ? Math.max(Math.abs(high) * 0.02, 1) : high - low;
+  const path = pathFor(values, low, span);
+  const firstPoint = points.find((point) => point.broker_cash !== null);
+  const lastPoint = [...points].reverse().find((point) => point.broker_cash !== null);
+  return (
+    <div className="v6-liquidity-chart">
+      <div className="v6-chart-series-summary single" aria-label="Cash history legend and values">
+        <div className="cash"><span>Cash</span><strong>{contractMoney(lastPoint?.broker_cash)}</strong><small>Start {contractMoney(firstPoint?.broker_cash)} → current</small></div>
+        <div className="unavailable"><span>Gross Exposure</span><strong>Unavailable</strong><small>No authoritative history series</small></div>
+        <div className="unavailable"><span>Buying Power</span><strong>Unavailable</strong><small>No authoritative history series</small></div>
+      </div>
+      <div className="v6-chart-stage compact"><div className="tv4-chart-scale"><span>{contractMoney(String(high))}</span><span>{contractMoney(String(low))}</span></div><svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="Authoritative broker cash history; gross exposure and buying power history unavailable"><line className="tv4-chart-grid" x1="0" y1="12" x2="100" y2="12" /><line className="tv4-chart-grid" x1="0" y1="52" x2="100" y2="52" /><line className="tv4-chart-grid" x1="0" y1="92" x2="100" y2="92" /><path className="v6-series-cash" d={path} /></svg></div>
+      <p className="tv4-note">{points.length} authoritative cash checkpoints · No exposure or buying-power series inferred</p>
     </div>
   );
 }

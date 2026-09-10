@@ -9,7 +9,7 @@ import { TerminalProvider } from "@/lib/terminal";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AutoTrader Terminal V5",
+  title: "AutoTrader Terminal V6",
   description:
     "Read-only institutional operations terminal with strictly separated Live and Paper trading views.",
   robots: { index: false, follow: false },
